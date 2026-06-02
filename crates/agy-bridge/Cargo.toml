@@ -1,0 +1,148 @@
+[package]
+name = "agy-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Rust bridge for the Google Antigravity SDK (Python) via PyO3"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/domenukk/agy-bridge"
+readme = "README.md"
+keywords = ["gemini", "agent", "pyo3", "antigravity", "llm"]
+categories = ["api-bindings", "asynchronous"]
+exclude = [
+  "AGENTS.md",
+  ".agents/",
+  ".recovered/",
+  "blank.png",
+  ".markdownlint.jsonc",
+]
+
+[dependencies]
+llm-tool-macros.workspace = true
+llm-tool.workspace = true
+pyo3.workspace = true
+pyo3-async-runtimes.workspace = true
+tokio.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = true
+typed-builder.workspace = true
+futures.workspace = true
+fastrand.workspace = true
+tokio-stream.workspace = true
+pythonize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+
+[[example]]
+name = "getting_started_hello_world"
+path = "examples/getting_started/hello_world.rs"
+
+[[example]]
+name = "getting_started_streaming"
+path = "examples/getting_started/streaming.rs"
+
+[[example]]
+name = "getting_started_observability"
+path = "examples/getting_started/observability.rs"
+
+[[example]]
+name = "getting_started_persistence"
+path = "examples/getting_started/persistence.rs"
+
+[[example]]
+name = "getting_started_multimodal"
+path = "examples/getting_started/multimodal.rs"
+
+[[example]]
+name = "getting_started_agent_skills"
+path = "examples/getting_started/agent_skills.rs"
+
+[[example]]
+name = "getting_started_app_data_dir_override"
+path = "examples/getting_started/app_data_dir_override.rs"
+
+[[example]]
+name = "getting_started_autonomous_shell"
+path = "examples/getting_started/autonomous_shell.rs"
+
+[[example]]
+name = "getting_started_custom_tools"
+path = "examples/getting_started/custom_tools.rs"
+
+[[example]]
+name = "getting_started_error_handler"
+path = "examples/getting_started/error_handler.rs"
+
+[[example]]
+name = "getting_started_persona_config"
+path = "examples/getting_started/persona_config.rs"
+
+[[example]]
+name = "getting_started_policies"
+path = "examples/getting_started/policies.rs"
+
+[[example]]
+name = "getting_started_human_in_the_loop"
+path = "examples/getting_started/human_in_the_loop.rs"
+
+[[example]]
+name = "getting_started_structured_output"
+path = "examples/getting_started/structured_output.rs"
+
+[[example]]
+name = "getting_started_mcp_tools"
+path = "examples/getting_started/mcp_tools.rs"
+
+[[example]]
+name = "getting_started_subagents"
+path = "examples/getting_started/subagents.rs"
+
+[[example]]
+name = "getting_started_hooks"
+path = "examples/getting_started/hooks.rs"
+
+[[example]]
+name = "getting_started_triggers"
+path = "examples/getting_started/triggers.rs"
+
+[[example]]
+name = "deep_dives_agent_middleware"
+path = "examples/deep_dives/agent_middleware.rs"
+
+[[example]]
+name = "deep_dives_async_chat"
+path = "examples/deep_dives/async_chat.rs"
+
+[[example]]
+name = "deep_dives_doc_maintenance_agent"
+path = "examples/deep_dives/doc_maintenance_agent.rs"
+
+[[example]]
+name = "deep_dives_docstring_maintenance_agent"
+path = "examples/deep_dives/docstring_maintenance_agent.rs"
+
+[[example]]
+name = "deep_dives_host_tool_hooks"
+path = "examples/deep_dives/host_tool_hooks.rs"
+
+[[example]]
+name = "deep_dives_interactive_cli"
+path = "examples/deep_dives/interactive_cli.rs"
+
+[[example]]
+name = "deep_dives_multimodal_pipeline"
+path = "examples/deep_dives/multimodal_pipeline.rs"
+
+[[example]]
+name = "deep_dives_round_based_chat"
+path = "examples/deep_dives/round_based_chat.rs"

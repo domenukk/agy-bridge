@@ -1,0 +1,1023 @@
+//! Core types for the agent SDK bridge.
+//!
+//! This module defines the data structures that model an agent's execution
+//! trajectory: individual [`Step`](crate::types::Step)s,
+//! [`ToolCallInfo`](crate::types::ToolCallInfo) requests,
+//! [`ToolResult`](crate::types::ToolResult) responses, and
+//! [`UsageMetadata`](crate::types::UsageMetadata) for token accounting. All types derive
+//! `Serialize`/`Deserialize` for JSON interchange with the Python SDK.
+
+use std::{fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Step / ToolCall / ToolResult types (§1.6)
+// =============================================================================
+
+/// Define an SDK enum with `SCREAMING_SNAKE_CASE` serde rename and auto-generated
+/// `Display` and `FromStr` impls.
+///
+/// Each variant maps to a wire-format string. Unrecognized strings parse as `Err`
+/// via `FromStr` — they never panic.
+///
+/// # Syntax
+///
+/// ```text
+/// define_sdk_enum! {
+///     /// Doc comment for the enum.
+///     EnumName {
+///         Variant1 => "WIRE_STRING_1",
+///         Variant2 => "WIRE_STRING_2",
+///         #[default]
+///         Unknown => "UNKNOWN",
+///     }
+/// }
+/// ```
+macro_rules! define_sdk_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident => $wire:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        pub enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant,
+            )+
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let s = match self {
+                    $( Self::$variant => $wire, )+
+                };
+                f.write_str(s)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $( $wire => Ok(Self::$variant), )+
+                    other => Err(format!(concat!("Unrecognized ", stringify!($name), ": {:?}"), other)),
+                }
+            }
+        }
+    };
+}
+
+/// Like [`define_sdk_enum!`] but for enums where the serde wire format uses
+/// per-variant `#[serde(rename = "...")]` instead of `rename_all`.
+///
+/// This is needed for [`StepTarget`] whose SDK strings have a `TARGET_` prefix
+/// that doesn't match the `SCREAMING_SNAKE_CASE` of the enum name.
+macro_rules! define_sdk_enum_custom_serde {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident => $wire:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+        pub enum $name {
+            $(
+                $(#[$vmeta])*
+                #[serde(rename = $wire)]
+                $variant,
+            )+
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let s = match self {
+                    $( Self::$variant => $wire, )+
+                };
+                f.write_str(s)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $( $wire => Ok(Self::$variant), )+
+                    other => Err(format!(concat!("Unrecognized ", stringify!($name), ": {:?}"), other)),
+                }
+            }
+        }
+    };
+}
+
+define_sdk_enum! {
+    /// The high-level type of a step in the agent trajectory.
+    StepType {
+        TextResponse => "TEXT_RESPONSE",
+        ToolCall => "TOOL_CALL",
+        SystemMessage => "SYSTEM_MESSAGE",
+        Compaction => "COMPACTION",
+        Finish => "FINISH",
+        #[default]
+        Unknown => "UNKNOWN",
+    }
+}
+
+define_sdk_enum! {
+    /// The source that generated a step.
+    StepSource {
+        System => "SYSTEM",
+        User => "USER",
+        Model => "MODEL",
+        #[default]
+        Unknown => "UNKNOWN",
+    }
+}
+
+define_sdk_enum! {
+    /// The execution status of a step.
+    StepStatus {
+        Active => "ACTIVE",
+        Done => "DONE",
+        WaitingForUser => "WAITING_FOR_USER",
+        Error => "ERROR",
+        Canceled => "CANCELED",
+        #[default]
+        Unknown => "UNKNOWN",
+    }
+}
+
+define_sdk_enum_custom_serde! {
+    /// Target of a step interaction, mirroring the Python SDK's `StepTarget`.
+    ///
+    /// The Python SDK uses `TARGET_` prefixed strings (e.g. `TARGET_USER`).
+    /// Uses per-variant `#[serde(rename)]` because the SDK's wire format has a
+    /// `TARGET_` prefix that doesn't follow `SCREAMING_SNAKE_CASE` of the enum name.
+    StepTarget {
+        /// Step is directed at the model.
+        Model => "TARGET_MODEL",
+        /// Step is directed at the user.
+        User => "TARGET_USER",
+        /// Step is directed at the environment (tool execution).
+        Environment => "TARGET_ENVIRONMENT",
+        /// Target is unspecified.
+        Unspecified => "TARGET_UNSPECIFIED",
+        /// Unknown target (fallback).
+        #[default]
+        Unknown => "UNKNOWN",
+    }
+}
+
+/// A tool call from the model, mirroring the Python SDK's `ToolCall`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallInfo {
+    /// Tool name — either a `BuiltinTools` string or a custom tool name.
+    pub name: String,
+    /// Arguments as a JSON value (typically an object/dict).
+    #[serde(default)]
+    pub args: serde_json::Value,
+    /// Optional unique identifier for the call.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Optional normalized filesystem path for file-related tools.
+    #[serde(default)]
+    pub canonical_path: Option<String>,
+}
+
+/// Result of a single tool execution, mirroring the Python SDK's `ToolResult`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    /// The name of the tool that was executed.
+    pub name: String,
+    /// Optional identifier correlating this result with a `ToolCallInfo.id`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The tool's return value (any JSON-serializable value).
+    #[serde(default)]
+    pub result: serde_json::Value,
+    /// An error message if execution failed, or `None` on success.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Token usage metadata from the model API, mirroring the SDK's `UsageMetadata`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UsageMetadata {
+    /// Number of tokens in the prompt.
+    #[serde(default)]
+    pub prompt_token_count: Option<u64>,
+    /// Number of tokens from cached content (subset of prompt tokens).
+    #[serde(default)]
+    pub cached_content_token_count: Option<u64>,
+    /// Number of tokens in the generated candidates (excluding thinking).
+    #[serde(default)]
+    pub candidates_token_count: Option<u64>,
+    /// Number of tokens used for thinking/reasoning.
+    #[serde(default)]
+    pub thoughts_token_count: Option<u64>,
+    /// Sum of prompt + candidates + thinking tokens.
+    #[serde(default)]
+    pub total_token_count: Option<u64>,
+}
+
+/// The role of a message author in the conversation.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum MessageRole {
+    /// A user-authored message.
+    #[default]
+    User,
+    /// A model-generated message.
+    Model,
+    /// A system-level message.
+    System,
+    /// An unrecognized role — preserves the original string for forward
+    /// compatibility with new SDK roles.
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl std::fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User => f.write_str("user"),
+            Self::Model => f.write_str("model"),
+            Self::System => f.write_str("system"),
+            Self::Unknown(s) => f.write_str(s),
+        }
+    }
+}
+
+/// A single message in the conversation history, mirroring the Python SDK's
+/// `ConversationMessage`.
+///
+/// Each message has a [`MessageRole`] and textual `content`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    /// The role of the message author.
+    #[serde(default)]
+    pub role: MessageRole,
+    /// The textual content of the message.
+    #[serde(default)]
+    pub content: String,
+}
+
+/// A single step in the agent trajectory, mirroring the SDK's `Step`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Step {
+    /// Unique string identifier for the step.
+    #[serde(default)]
+    pub id: String,
+    /// Integer index of the step in the trajectory.
+    #[serde(default)]
+    pub step_index: u32,
+    /// The high-level type of the step.
+    #[serde(default, rename = "type")]
+    pub step_type: StepType,
+    /// The source that generated the step.
+    #[serde(default)]
+    pub source: StepSource,
+    /// The target of the step interaction.
+    #[serde(default)]
+    pub target: StepTarget,
+    /// The status of the step.
+    #[serde(default)]
+    pub status: StepStatus,
+    /// The text content/output of the step.
+    #[serde(default)]
+    pub content: String,
+    /// Incremental text content added since the last update for this step.
+    #[serde(default)]
+    pub content_delta: String,
+    /// Full model reasoning/thinking text for planner responses.
+    #[serde(default)]
+    pub thinking: String,
+    /// Incremental thinking text added since the last update for this step.
+    #[serde(default)]
+    pub thinking_delta: String,
+    /// List of tool calls associated with the step.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallInfo>,
+    /// Short error message if the step failed.
+    #[serde(default)]
+    pub error: String,
+    /// Whether this step is a completed model response directed at the user.
+    ///
+    /// Multiple steps per turn may have this flag set; consumers wanting only
+    /// the last response should iterate fully.
+    #[serde(default)]
+    pub is_complete_response: Option<bool>,
+    /// Structured output payload extracted from the FINISH step.
+    ///
+    /// This is `serde_json::Value` because it contains user-defined schema data
+    /// whose shape is not known at compile time.
+    #[serde(default)]
+    pub structured_output: Option<serde_json::Value>,
+    /// Token usage for this step's model invocation.
+    #[serde(default)]
+    pub usage_metadata: Option<UsageMetadata>,
+}
+
+macro_rules! impl_from_py_object {
+    ($($t:ty),+) => {
+        $(
+            impl<'py> pyo3::FromPyObject<'py> for $t {
+                fn extract_bound(ob: &pyo3::Bound<'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+                    pythonize::depythonize(ob).map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Failed to deserialize {} from Python dict: {}",
+                            stringify!($t),
+                            e
+                        ))
+                    })
+                }
+            }
+        )+
+    };
+}
+
+impl_from_py_object!(
+    StepType,
+    StepSource,
+    StepStatus,
+    StepTarget,
+    ToolCallInfo,
+    ToolResult,
+    UsageMetadata,
+    MessageRole,
+    ConversationMessage,
+    Step
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Step / ToolCall / ToolResult tests
+    // =========================================================================
+
+    #[test]
+    fn test_step_type_roundtrip() {
+        for (variant, expected_str) in [
+            (StepType::TextResponse, "\"TEXT_RESPONSE\""),
+            (StepType::ToolCall, "\"TOOL_CALL\""),
+            (StepType::SystemMessage, "\"SYSTEM_MESSAGE\""),
+            (StepType::Compaction, "\"COMPACTION\""),
+            (StepType::Finish, "\"FINISH\""),
+            (StepType::Unknown, "\"UNKNOWN\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(
+                json, expected_str,
+                "StepType serialization mismatch for {variant:?}"
+            );
+            let parsed: StepType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn test_step_type_parse() {
+        assert_eq!(
+            "TEXT_RESPONSE".parse::<StepType>().unwrap(),
+            StepType::TextResponse
+        );
+        assert_eq!("TOOL_CALL".parse::<StepType>().unwrap(), StepType::ToolCall);
+        assert_eq!(
+            "SYSTEM_MESSAGE".parse::<StepType>().unwrap(),
+            StepType::SystemMessage
+        );
+        assert_eq!(
+            "COMPACTION".parse::<StepType>().unwrap(),
+            StepType::Compaction
+        );
+        assert_eq!("FINISH".parse::<StepType>().unwrap(), StepType::Finish);
+    }
+
+    #[test]
+    fn test_step_source_roundtrip() {
+        for (variant, expected_str) in [
+            (StepSource::System, "\"SYSTEM\""),
+            (StepSource::User, "\"USER\""),
+            (StepSource::Model, "\"MODEL\""),
+            (StepSource::Unknown, "\"UNKNOWN\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str);
+            let parsed: StepSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn test_step_source_parse() {
+        assert_eq!("SYSTEM".parse::<StepSource>().unwrap(), StepSource::System);
+        assert_eq!("USER".parse::<StepSource>().unwrap(), StepSource::User);
+        assert_eq!("MODEL".parse::<StepSource>().unwrap(), StepSource::Model);
+    }
+
+    #[test]
+    fn test_step_status_roundtrip() {
+        for (variant, expected_str) in [
+            (StepStatus::Active, "\"ACTIVE\""),
+            (StepStatus::Done, "\"DONE\""),
+            (StepStatus::WaitingForUser, "\"WAITING_FOR_USER\""),
+            (StepStatus::Error, "\"ERROR\""),
+            (StepStatus::Canceled, "\"CANCELED\""),
+            (StepStatus::Unknown, "\"UNKNOWN\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str);
+            let parsed: StepStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn test_step_status_parse() {
+        assert_eq!("ACTIVE".parse::<StepStatus>().unwrap(), StepStatus::Active);
+        assert_eq!("DONE".parse::<StepStatus>().unwrap(), StepStatus::Done);
+        assert_eq!(
+            "WAITING_FOR_USER".parse::<StepStatus>().unwrap(),
+            StepStatus::WaitingForUser
+        );
+        assert_eq!("ERROR".parse::<StepStatus>().unwrap(), StepStatus::Error);
+        assert_eq!(
+            "CANCELED".parse::<StepStatus>().unwrap(),
+            StepStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn test_step_type_parse_returns_err_for_unrecognized() {
+        assert!("NONEXISTENT".parse::<StepType>().is_err());
+    }
+
+    #[test]
+    fn test_step_source_parse_returns_err_for_unrecognized() {
+        assert!("???".parse::<StepSource>().is_err());
+    }
+
+    #[test]
+    fn test_step_status_parse_returns_err_for_unrecognized() {
+        assert!("nope".parse::<StepStatus>().is_err());
+    }
+
+    #[test]
+    fn test_tool_call_info_roundtrip() {
+        let tc = ToolCallInfo {
+            name: "view_file".to_string(),
+            args: serde_json::json!({"path": "/tmp/foo.rs", "line": 42}),
+            id: Some("call_123".to_string()),
+            canonical_path: Some("/tmp/foo.rs".to_string()),
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        let parsed: ToolCallInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, tc);
+    }
+
+    #[test]
+    fn test_tool_call_info_minimal() {
+        let json = r#"{"name":"custom_tool"}"#;
+        let parsed: ToolCallInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.name, "custom_tool");
+        assert_eq!(parsed.args, serde_json::Value::Null);
+        assert!(parsed.id.is_none());
+        assert!(parsed.canonical_path.is_none());
+    }
+
+    #[test]
+    fn test_tool_result_roundtrip() {
+        let tr = ToolResult {
+            name: "run_command".to_string(),
+            id: Some("result_456".to_string()),
+            result: serde_json::json!({"output": "hello world"}),
+            error: None,
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        let parsed: ToolResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, tr);
+    }
+
+    #[test]
+    fn test_tool_result_with_error() {
+        let tr = ToolResult {
+            name: "create_file".to_string(),
+            id: None,
+            result: serde_json::Value::Null,
+            error: Some("permission denied".to_string()),
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        let parsed: ToolResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.error.as_deref(), Some("permission denied"));
+    }
+
+    #[test]
+    fn test_usage_metadata_roundtrip() {
+        let um = UsageMetadata {
+            prompt_token_count: Some(100),
+            cached_content_token_count: Some(20),
+            candidates_token_count: Some(50),
+            thoughts_token_count: Some(30),
+            total_token_count: Some(180),
+        };
+        let json = serde_json::to_string(&um).unwrap();
+        let parsed: UsageMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, um);
+    }
+
+    #[test]
+    fn test_usage_metadata_defaults() {
+        let um: UsageMetadata = serde_json::from_str("{}").unwrap();
+        assert!(um.prompt_token_count.is_none());
+        assert!(um.total_token_count.is_none());
+    }
+
+    #[test]
+    fn test_step_full_roundtrip() {
+        let step = Step {
+            id: "traj:0".to_string(),
+            step_index: 3,
+            step_type: StepType::ToolCall,
+            source: StepSource::Model,
+            target: StepTarget::Environment,
+            status: StepStatus::Done,
+            content: "Running command...".to_string(),
+            content_delta: "Running".to_string(),
+            thinking: "I should run the command".to_string(),
+            thinking_delta: "I should".to_string(),
+            tool_calls: vec![ToolCallInfo {
+                name: "run_command".to_string(),
+                args: serde_json::json!({"command": "ls -la"}),
+                id: Some("call_1".to_string()),
+                canonical_path: None,
+            }],
+            error: String::new(),
+            is_complete_response: Some(false),
+            structured_output: None,
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(500),
+                cached_content_token_count: None,
+                candidates_token_count: Some(100),
+                thoughts_token_count: Some(50),
+                total_token_count: Some(650),
+            }),
+        };
+
+        let json = serde_json::to_string_pretty(&step).unwrap();
+        let parsed: Step = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, step);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "run_command");
+    }
+
+    #[test]
+    fn test_step_minimal_deserialization() {
+        // Should deserialize with all defaults.
+        let json = r#"{"id":"s1"}"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.id, "s1");
+        assert_eq!(step.step_index, 0);
+        assert_eq!(step.step_type, StepType::Unknown);
+        assert_eq!(step.source, StepSource::Unknown);
+        assert_eq!(step.target, StepTarget::Unknown);
+        assert_eq!(step.status, StepStatus::Unknown);
+        assert!(step.content.is_empty());
+        assert!(step.content_delta.is_empty());
+        assert!(step.thinking.is_empty());
+        assert!(step.thinking_delta.is_empty());
+        assert!(step.tool_calls.is_empty());
+        assert!(step.error.is_empty());
+        assert!(step.is_complete_response.is_none());
+        assert!(step.structured_output.is_none());
+        assert!(step.usage_metadata.is_none());
+    }
+
+    // =========================================================================
+    // Step with multiple tool calls
+    // =========================================================================
+
+    #[test]
+    fn step_with_multiple_tool_calls() {
+        let step = Step {
+            id: "multi-tc".to_string(),
+            step_index: 7,
+            step_type: StepType::ToolCall,
+            source: StepSource::Model,
+            target: StepTarget::Environment,
+            status: StepStatus::Done,
+            content: String::new(),
+            content_delta: String::new(),
+            thinking: String::new(),
+            thinking_delta: String::new(),
+            tool_calls: vec![
+                ToolCallInfo {
+                    name: "view_file".to_string(),
+                    args: serde_json::json!({"path": "/a.rs"}),
+                    id: Some("tc1".to_string()),
+                    canonical_path: Some("/a.rs".to_string()),
+                },
+                ToolCallInfo {
+                    name: "run_command".to_string(),
+                    args: serde_json::json!({"command": "cargo test"}),
+                    id: Some("tc2".to_string()),
+                    canonical_path: None,
+                },
+            ],
+            error: String::new(),
+            is_complete_response: None,
+            structured_output: None,
+            usage_metadata: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let parsed: Step = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 2);
+        assert_eq!(parsed.tool_calls[0].name, "view_file");
+        assert_eq!(parsed.tool_calls[1].name, "run_command");
+        assert_eq!(
+            parsed.tool_calls[0].canonical_path.as_deref(),
+            Some("/a.rs")
+        );
+        assert!(parsed.tool_calls[1].canonical_path.is_none());
+    }
+
+    // =========================================================================
+    // ToolCallInfo / ToolResult edge cases
+    // =========================================================================
+
+    #[test]
+    fn tool_call_info_with_complex_args() {
+        let tc = ToolCallInfo {
+            name: "run_command".to_string(),
+            args: serde_json::json!({
+                "command": "cargo test",
+                "env": {"RUST_LOG": "debug"},
+                "timeout": 300,
+                "nested": [1, 2, {"deep": true}]
+            }),
+            id: None,
+            canonical_path: None,
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        let parsed: ToolCallInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.args["env"]["RUST_LOG"], "debug");
+        assert_eq!(parsed.args["nested"][2]["deep"], true);
+    }
+
+    #[test]
+    fn tool_result_with_complex_result() {
+        let tr = ToolResult {
+            name: "search_dir".to_string(),
+            id: Some("r1".to_string()),
+            result: serde_json::json!({
+                "matches": [
+                    {"file": "/src/main.rs", "line": 42},
+                    {"file": "/src/lib.rs", "line": 10},
+                ],
+                "total": 2
+            }),
+            error: None,
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        let parsed: ToolResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.result["total"], 2);
+        assert_eq!(parsed.result["matches"][0]["line"], 42);
+    }
+
+    // =========================================================================
+    // UsageMetadata partial fields
+    // =========================================================================
+
+    #[test]
+    fn usage_metadata_partial_fields() {
+        let json = r#"{"prompt_token_count":100,"total_token_count":200}"#;
+        let um: UsageMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(um.prompt_token_count, Some(100));
+        assert!(um.cached_content_token_count.is_none());
+        assert!(um.candidates_token_count.is_none());
+        assert!(um.thoughts_token_count.is_none());
+        assert_eq!(um.total_token_count, Some(200));
+    }
+
+    // =========================================================================
+    // StepTarget tests
+    // =========================================================================
+
+    #[test]
+    fn test_step_target_roundtrip() {
+        for (variant, expected_str) in [
+            (StepTarget::User, "\"TARGET_USER\""),
+            (StepTarget::Environment, "\"TARGET_ENVIRONMENT\""),
+            (StepTarget::Unspecified, "\"TARGET_UNSPECIFIED\""),
+            (StepTarget::Unknown, "\"UNKNOWN\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(
+                json, expected_str,
+                "StepTarget serialization mismatch for {variant:?}"
+            );
+            let parsed: StepTarget = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn test_step_target_parse() {
+        assert_eq!(
+            "TARGET_MODEL".parse::<StepTarget>().unwrap(),
+            StepTarget::Model
+        );
+        assert_eq!(
+            "TARGET_USER".parse::<StepTarget>().unwrap(),
+            StepTarget::User
+        );
+        assert_eq!(
+            "TARGET_ENVIRONMENT".parse::<StepTarget>().unwrap(),
+            StepTarget::Environment
+        );
+        assert_eq!(
+            "TARGET_UNSPECIFIED".parse::<StepTarget>().unwrap(),
+            StepTarget::Unspecified
+        );
+        assert_eq!(
+            "UNKNOWN".parse::<StepTarget>().unwrap(),
+            StepTarget::Unknown
+        );
+    }
+
+    #[test]
+    fn test_step_target_parse_returns_err_for_unrecognized() {
+        assert!("INVALID_TARGET".parse::<StepTarget>().is_err());
+    }
+
+    // =========================================================================
+    // Display trait tests
+    // =========================================================================
+
+    #[test]
+    fn test_step_type_display() {
+        assert_eq!(StepType::TextResponse.to_string(), "TEXT_RESPONSE");
+        assert_eq!(StepType::ToolCall.to_string(), "TOOL_CALL");
+        assert_eq!(StepType::SystemMessage.to_string(), "SYSTEM_MESSAGE");
+        assert_eq!(StepType::Compaction.to_string(), "COMPACTION");
+        assert_eq!(StepType::Finish.to_string(), "FINISH");
+        assert_eq!(StepType::Unknown.to_string(), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_step_source_display() {
+        assert_eq!(StepSource::System.to_string(), "SYSTEM");
+        assert_eq!(StepSource::User.to_string(), "USER");
+        assert_eq!(StepSource::Model.to_string(), "MODEL");
+        assert_eq!(StepSource::Unknown.to_string(), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_step_status_display() {
+        assert_eq!(StepStatus::Active.to_string(), "ACTIVE");
+        assert_eq!(StepStatus::Done.to_string(), "DONE");
+        assert_eq!(StepStatus::WaitingForUser.to_string(), "WAITING_FOR_USER");
+        assert_eq!(StepStatus::Error.to_string(), "ERROR");
+        assert_eq!(StepStatus::Canceled.to_string(), "CANCELED");
+        assert_eq!(StepStatus::Unknown.to_string(), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_step_target_display() {
+        assert_eq!(StepTarget::User.to_string(), "TARGET_USER");
+        assert_eq!(StepTarget::Environment.to_string(), "TARGET_ENVIRONMENT");
+        assert_eq!(StepTarget::Unspecified.to_string(), "TARGET_UNSPECIFIED");
+        assert_eq!(StepTarget::Unknown.to_string(), "UNKNOWN");
+    }
+
+    // =========================================================================
+    // Display → FromStr roundtrip tests
+    // =========================================================================
+
+    #[test]
+    fn test_step_type_display_from_str_roundtrip() {
+        for variant in [
+            StepType::TextResponse,
+            StepType::ToolCall,
+            StepType::SystemMessage,
+            StepType::Compaction,
+            StepType::Finish,
+            StepType::Unknown,
+        ] {
+            let s = variant.to_string();
+            let parsed: StepType = s.parse().unwrap();
+            assert_eq!(parsed, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn test_step_source_display_from_str_roundtrip() {
+        for variant in [
+            StepSource::System,
+            StepSource::User,
+            StepSource::Model,
+            StepSource::Unknown,
+        ] {
+            let s = variant.to_string();
+            let parsed: StepSource = s.parse().unwrap();
+            assert_eq!(parsed, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn test_step_status_display_from_str_roundtrip() {
+        for variant in [
+            StepStatus::Active,
+            StepStatus::Done,
+            StepStatus::WaitingForUser,
+            StepStatus::Error,
+            StepStatus::Canceled,
+            StepStatus::Unknown,
+        ] {
+            let s = variant.to_string();
+            let parsed: StepStatus = s.parse().unwrap();
+            assert_eq!(parsed, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn test_step_target_display_from_str_roundtrip() {
+        for variant in [
+            StepTarget::Model,
+            StepTarget::User,
+            StepTarget::Environment,
+            StepTarget::Unspecified,
+            StepTarget::Unknown,
+        ] {
+            let s = variant.to_string();
+            let parsed: StepTarget = s.parse().unwrap();
+            assert_eq!(parsed, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    // =========================================================================
+    // FromStr with garbage input tests
+    // =========================================================================
+
+    #[test]
+    fn test_from_str_garbage_returns_err() {
+        assert!("xyzzy".parse::<StepType>().is_err());
+        assert!("xyzzy".parse::<StepSource>().is_err());
+        assert!("xyzzy".parse::<StepStatus>().is_err());
+        assert!("xyzzy".parse::<StepTarget>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_empty_returns_err() {
+        assert!("".parse::<StepType>().is_err());
+        assert!("".parse::<StepSource>().is_err());
+        assert!("".parse::<StepStatus>().is_err());
+        assert!("".parse::<StepTarget>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_case_sensitive() {
+        // SDK strings are case-sensitive — lowercase should return Err.
+        assert!("text_response".parse::<StepType>().is_err());
+        assert!("system".parse::<StepSource>().is_err());
+        assert!("active".parse::<StepStatus>().is_err());
+        assert!("target_user".parse::<StepTarget>().is_err());
+    }
+
+    // =========================================================================
+    // MessageRole / ConversationMessage Tests
+    // =========================================================================
+
+    #[test]
+    fn test_message_role_roundtrip() {
+        for (variant, expected_str) in [
+            (MessageRole::User, "\"user\""),
+            (MessageRole::Model, "\"model\""),
+            (MessageRole::System, "\"system\""),
+            (MessageRole::Unknown("custom".to_string()), "\"custom\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str);
+            let parsed: MessageRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn test_conversation_message_roundtrip() {
+        let msg = ConversationMessage {
+            role: MessageRole::Model,
+            content: "Hello!".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ConversationMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    // =========================================================================
+    // PyO3 Extract Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pyo3_extract_roundtrip() {
+        use pyo3::{prelude::*, types::PyDictMethods};
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", "step-1").unwrap();
+            dict.set_item("step_index", 42).unwrap();
+            dict.set_item("type", "TEXT_RESPONSE").unwrap();
+            dict.set_item("source", "MODEL").unwrap();
+            dict.set_item("target", "TARGET_USER").unwrap();
+            dict.set_item("status", "DONE").unwrap();
+
+            let step: Step = dict.extract().expect("failed to extract Step");
+            assert_eq!(step.id, "step-1");
+            assert_eq!(step.step_index, 42);
+            assert_eq!(step.step_type, StepType::TextResponse);
+            assert_eq!(step.source, StepSource::Model);
+            assert_eq!(step.target, StepTarget::User);
+            assert_eq!(step.status, StepStatus::Done);
+
+            // Now test an enum
+            let s = pyo3::types::PyString::new_bound(py, "SYSTEM_MESSAGE");
+            let st: StepType = s.extract().unwrap();
+            assert_eq!(st, StepType::SystemMessage);
+        });
+    }
+
+    // =========================================================================
+    // Step new fields tests
+    // =========================================================================
+
+    #[test]
+    fn step_with_deltas_and_thinking() {
+        let step = Step {
+            id: "s2".to_string(),
+            step_index: 1,
+            step_type: StepType::TextResponse,
+            source: StepSource::Model,
+            target: StepTarget::User,
+            status: StepStatus::Active,
+            content: "Hello world".to_string(),
+            content_delta: "world".to_string(),
+            thinking: "The user said hi".to_string(),
+            thinking_delta: "said hi".to_string(),
+            tool_calls: vec![],
+            error: String::new(),
+            is_complete_response: Some(true),
+            structured_output: None,
+            usage_metadata: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let parsed: Step = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.content_delta, "world");
+        assert_eq!(parsed.thinking, "The user said hi");
+        assert_eq!(parsed.thinking_delta, "said hi");
+        assert_eq!(parsed.is_complete_response, Some(true));
+        assert_eq!(parsed.target, StepTarget::User);
+    }
+
+    #[test]
+    fn step_with_structured_output() {
+        let payload = serde_json::json!({"answer": 42, "valid": true});
+        let step = Step {
+            id: "finish-1".to_string(),
+            step_index: 5,
+            step_type: StepType::Finish,
+            source: StepSource::Model,
+            target: StepTarget::User,
+            status: StepStatus::Done,
+            content: String::new(),
+            content_delta: String::new(),
+            thinking: String::new(),
+            thinking_delta: String::new(),
+            tool_calls: vec![],
+            error: String::new(),
+            is_complete_response: Some(true),
+            structured_output: Some(payload.clone()),
+            usage_metadata: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let parsed: Step = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.structured_output, Some(payload));
+        assert_eq!(parsed.step_type, StepType::Finish);
+    }
+}

@@ -1,0 +1,9 @@
+{
+  "config": {
+    "MD013": {
+      "tables": false,
+      "code_blocks": false
+    }
+  },
+  "ignores": ["target/**", ".venv/**"]
+}
