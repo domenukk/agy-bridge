@@ -36,7 +36,7 @@ use syn::{FnArg, GenericArgument, ItemFn, Pat, PatType, PathArguments, Type, par
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```
 /// use llm_tool::{RustTool, ToolContext, ToolRegistry};
 ///
 /// /// Adds two numbers together (with a twist).

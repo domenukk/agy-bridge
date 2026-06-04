@@ -1,6 +1,6 @@
 [package]
 name = "llm-tool-macros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Proc macros for llm-tool (#[llm_tool] attribute)"
@@ -21,3 +21,8 @@ convert_case.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+llm-tool = { path = "../llm-tool" }
+schemars.workspace = true
+serde.workspace = true

@@ -5,5 +5,5 @@
       "code_blocks": false
     }
   },
-  "ignores": ["target/**", ".venv/**"]
+  "ignores": ["target/**", ".venv/**", ".agents/**"]
 }

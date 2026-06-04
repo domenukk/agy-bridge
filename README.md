@@ -12,7 +12,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.1.0"
+agy-bridge = "0.1.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -22,18 +22,6 @@ Install the Python SDK:
 pip install google-antigravity watchfiles
 ```
 
-### Optional Python Dependencies
-
-Some features require additional Python packages:
-
-| Package      | Required for                               | Install                  |
-| ------------ | ------------------------------------------ | ------------------------ |
-| `watchfiles` | `TriggerConfig::on_file_change()` triggers | `pip install watchfiles` |
-
-The `every()` timer trigger works out of the box. File-change triggers
-lazily import `watchfiles` at runtime and raise a clear `ImportError` if
-it is missing.
-
 ## Quick Start
 
 ```rust
@@ -41,7 +29,7 @@ use agy_bridge::AgyBridge;
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
 
@@ -61,11 +49,9 @@ use agy_bridge::{AgyBridge, config::AgentConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
-    // bridge.agent() returns an AgentBuilder — chain .tools() / .hooks()
-    // before .await, or .await directly for a bare agent.
     let agent = bridge
         .agent(
             AgentConfig::builder()
@@ -102,7 +88,7 @@ use agy_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
 
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
@@ -143,7 +129,7 @@ fn get_weather(
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
     let mut registry = ToolRegistry::new();

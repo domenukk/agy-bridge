@@ -14,6 +14,13 @@ use super::{
 pub(super) const HANDLER_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Compile a Python helper function once, caching the result in a `OnceLock`.
+///
+/// The script is executed with a single dict as **both** `globals` and `locals`.
+/// This ensures that sibling helper functions defined in the same script
+/// (e.g. `_decode_content`, `_decode_prompt`) are visible to the target
+/// function at call time — Python sets a function's `__globals__` to the
+/// `globals` dict passed to `exec()`, so if we let it default to `__main__`
+/// the siblings would be missing and produce `NameError`.
 pub(crate) fn get_or_compile_py_helper(
     cache: &'static std::sync::OnceLock<PyObject>,
     script: &str,
@@ -24,7 +31,7 @@ pub(crate) fn get_or_compile_py_helper(
     }
     Python::with_gil(|py| {
         let locals = pyo3::types::PyDict::new_bound(py);
-        py.run_bound(script, None, Some(&locals))
+        py.run_bound(script, Some(&locals), Some(&locals))
             .map_err(|e| e.to_string())?;
         let fn_obj = locals
             .get_item(fn_name)
