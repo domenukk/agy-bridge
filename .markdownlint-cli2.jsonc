@@ -1,9 +1,15 @@
 {
   "config": {
-    "MD013": {
-      "tables": false,
-      "code_blocks": false
-    }
+    "MD013": false,
+    "MD033": false
   },
-  "ignores": ["target/**", ".venv/**", ".agents/**"]
+  "ignores": [
+    ".venv",
+    "target",
+    "**/node_modules",
+    ".agents",
+    "ORIGINAL_REQUEST.md",
+    "PROJECT.md",
+    "**/*.tmpl.md"
+  ]
 }

@@ -1,10 +1,14 @@
 # agy-bridge
 
+Build LLM agents in Rust — with tools, hooks, streaming, and multimodal input.
+
 Rust bridge for the
 [Google Antigravity SDK](https://github.com/Google-Antigravity/antigravity-sdk-python)
 via [PyO3](https://pyo3.rs).
 
-This is not a Google product. Use at your own risk.
+> Rust's compile-time checks make it a natural fit for vibe coding agents —
+> schema mismatches, missing parameters, and typos in tool definitions
+> (via [`#[llm_tool]`](#custom-tools)) are caught at build time, not at runtime.
 
 ## Installation
 
@@ -12,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.1.1"
+agy-bridge = "0.1.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -22,6 +26,9 @@ Install the Python SDK:
 pip install google-antigravity watchfiles
 ```
 
+> `watchfiles` is only needed for file-change triggers; timer triggers
+> work without it.
+
 ## Quick Start
 
 ```rust
@@ -29,11 +36,11 @@ use agy_bridge::AgyBridge;
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    agy_bridge::load_dotenv();
+    # agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
 
-    // One-liner: send a message and get the full text back.
+    // Send a message and get the full reply text.
     let text = agent.chat("Hello!").await?.text().await?;
     println!("{text}");
 
@@ -49,9 +56,11 @@ use agy_bridge::{AgyBridge, config::AgentConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    agy_bridge::load_dotenv();
+    # agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
+    // bridge.agent() returns an AgentBuilder — chain .tools() / .hooks()
+    // before .await, or .await directly for a bare agent.
     let agent = bridge
         .agent(
             AgentConfig::builder()
@@ -88,7 +97,7 @@ use agy_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    agy_bridge::load_dotenv();
+    # agy_bridge::load_dotenv();
 
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
@@ -129,7 +138,7 @@ fn get_weather(
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    agy_bridge::load_dotenv();
+    # agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
     let mut registry = ToolRegistry::new();
@@ -281,7 +290,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
     let file_watch = TriggerEntry {
         name: "watch_workspace".into(),
-        config: TriggerConfig::on_file_change("/tmp/workspace"),
+        config: TriggerConfig::on_file_change(std::env::current_dir()?),
         message_template: "Files changed: {changes}".into(),
     };
 
@@ -392,3 +401,7 @@ Licensed under either of:
 - [MIT License](LICENSE-MIT)
 
 at your option.
+
+---
+
+_This is not a Google product. Use at your own risk._

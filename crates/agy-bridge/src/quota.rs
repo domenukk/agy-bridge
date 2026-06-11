@@ -6,8 +6,15 @@ use std::{
     time::Duration,
 };
 
+use fast_rands::Rand;
+
 /// Maximum number of per-key quota entries before pruning idle ones.
 const MAX_QUOTA_ENTRIES: usize = 100;
+
+/// Minimum per-agent jitter added to backoff, in milliseconds.
+const MIN_PER_AGENT_JITTER_MS: u64 = 500;
+/// Maximum per-agent jitter added to backoff, in milliseconds.
+const MAX_PER_AGENT_JITTER_MS: u64 = 2000;
 
 /// Per-runtime registry of per-API-key [`QuotaState`] instances.
 ///
@@ -183,15 +190,23 @@ impl QuotaState {
             let now = tokio::time::Instant::now();
             if until > now {
                 let wait = until - now;
+                // Per-call jitter so agents sharing the same deadline don't
+                // wake simultaneously (thundering-herd mitigation).
+                let min_val = usize::try_from(MIN_PER_AGENT_JITTER_MS).unwrap_or(usize::MAX);
+                let max_val = usize::try_from(MAX_PER_AGENT_JITTER_MS).unwrap_or(usize::MAX);
+                let per_agent_jitter = Duration::from_millis(
+                    fast_rands::StdRand::new().between(min_val, max_val) as u64,
+                );
+                let total_wait = wait + per_agent_jitter;
                 tracing::warn!(
-                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or_else(|e| {
+                    wait_ms = u64::try_from(total_wait.as_millis()).unwrap_or_else(|e| {
                         tracing::warn!("Int conversion failed: {}", e);
                         u64::MAX
                     }),
                     consecutive_429s = count,
                     "Quota backoff — waiting"
                 );
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(total_wait).await;
                 tracing::info!("Quota backoff complete — resuming operations");
             }
         }
@@ -242,14 +257,15 @@ impl QuotaState {
 
 use crate::error::MAX_BACKOFF_SECS;
 /// Maximum jitter added to backoff, in milliseconds.
-const MAX_JITTER_MS: u64 = 500;
+const MAX_JITTER_MS: u64 = 5000;
 
 /// Return a random jitter value in the range `[0, MAX_JITTER_MS)`.
 ///
 /// Uses `fastrand` for non-deterministic jitter, preventing thundering-herd
 /// effects when multiple clients back off from the same attempt count.
 fn jitter_ms() -> u64 {
-    fastrand::u64(0..MAX_JITTER_MS)
+    let max_val = usize::try_from(MAX_JITTER_MS - 1).unwrap_or(usize::MAX);
+    fast_rands::StdRand::new().between(0, max_val) as u64
 }
 
 /// Compute exponential backoff with jitter: `min(2^n, MAX_BACKOFF_SECS)` seconds + jitter.
@@ -306,8 +322,8 @@ mod tests {
         // Verify backoff_until is set.
         assert!(state.inner.lock().unwrap().backoff_until.is_some());
 
-        // Advance time past the backoff.
-        tokio::time::advance(Duration::from_secs(3)).await;
+        // Advance time past the backoff (base 2s + up to 5s jitter + up to 3s per-agent jitter).
+        tokio::time::advance(Duration::from_secs(11)).await;
         state.wait_for_quota().await;
         // Should have completed without hanging.
     }
@@ -320,11 +336,11 @@ mod tests {
         let d3 = exponential_backoff_with_jitter(3);
         let d7 = exponential_backoff_with_jitter(7);
 
-        // Base: 2s, 4s, 8s, ... capped at 120s. Plus jitter (< 500ms).
-        assert!(d1 >= Duration::from_secs(2) && d1 < Duration::from_millis(2500));
-        assert!(d2 >= Duration::from_secs(4) && d2 < Duration::from_millis(4500));
-        assert!(d3 >= Duration::from_secs(8) && d3 < Duration::from_millis(8500));
-        assert!(d7 >= Duration::from_mins(2) && d7 < Duration::from_millis(120_500));
+        // Base: 2s, 4s, 8s, ... capped at 120s. Plus jitter (< 5000ms).
+        assert!(d1 >= Duration::from_secs(2) && d1 < Duration::from_secs(7));
+        assert!(d2 >= Duration::from_secs(4) && d2 < Duration::from_secs(9));
+        assert!(d3 >= Duration::from_secs(8) && d3 < Duration::from_secs(13));
+        assert!(d7 >= Duration::from_mins(2) && d7 < Duration::from_secs(125));
     }
 
     #[tokio::test]

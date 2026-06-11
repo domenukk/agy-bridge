@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -21,6 +21,7 @@ use crate::{
 /// and returns text on subsequent calls, enabling tests of the `chat_text()`
 /// agentic loop without a live Python runtime.
 pub struct ToolAwareMockRuntime {
+    next_id: AtomicU64,
     /// Counts how many times `chat()` has been called per agent.
     /// First call → tool call; subsequent calls → text response.
     chat_count: std::sync::Mutex<std::collections::HashMap<AgentId, u32>>,
@@ -37,6 +38,7 @@ pub struct ToolAwareMockRuntime {
 impl ToolAwareMockRuntime {
     pub(crate) fn new() -> Self {
         Self {
+            next_id: AtomicU64::new(1),
             chat_count: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_create: AtomicBool::new(false),
             fail_quota: AtomicBool::new(false),
@@ -53,18 +55,16 @@ impl ToolAwareMockRuntime {
 }
 
 impl Runtime for ToolAwareMockRuntime {
-    async fn create_agent(
-        &self,
-        _agent_id: AgentId,
-        _config: AgentConfig,
-        _bridge_state: Arc<crate::runtime::AgentBridgeState>,
-    ) -> Result<(), Error> {
+    async fn create_agent(&self, _config: AgentConfig) -> Result<AgentId, Error> {
         if self.fail_create.load(Ordering::SeqCst) {
             return Err(Error::BackendError {
                 message: "invalid config: missing system instructions".to_owned(),
             });
         }
-        Ok(())
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(id)
     }
 
     /// # Panics
@@ -641,7 +641,8 @@ mod tests {
         let response = agent.chat("Hello").await.expect("chat should succeed");
 
         // Simulate usage being populated in shared state
-        if let Ok(mut state) = response.shared_state.lock() {
+        {
+            let mut state = response.shared_state.lock().unwrap();
             state.usage = Some(UsageMetadata {
                 prompt_token_count: Some(50),
                 cached_content_token_count: None,

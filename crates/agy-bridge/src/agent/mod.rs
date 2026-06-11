@@ -33,15 +33,13 @@ pub type AgentId = u64;
 ///
 /// This allows unit tests to inject a mock runtime without requiring a live
 /// Python interpreter. The real implementation will call through to `PyO3`.
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "Runtime is not object-safe by design; callers always know the concrete type"
+)]
 pub trait Runtime: Send + Sync {
-    /// Create an agent from the given config using the pre-allocated ID.
-    async fn create_agent(
-        &self,
-        agent_id: AgentId,
-        config: AgentConfig,
-        bridge_state: Arc<crate::runtime::AgentBridgeState>,
-    ) -> Result<(), Error>;
+    /// Create an agent from the given config, returning its ID.
+    async fn create_agent(&self, config: AgentConfig) -> Result<AgentId, Error>;
 
     /// Send a chat message to the agent, returning a streaming response handle.
     ///
@@ -174,10 +172,11 @@ pub struct AgentHandle<R: Runtime + 'static> {
     /// Per-API-key quota state. Agents sharing the same effective API key
     /// share backoff tracking; agents with different keys are independent.
     quota_state: Arc<crate::quota::QuotaState>,
-    /// Per-agent bridge state: tools, hooks, policies, shared tool state.
-    /// Passed to Python via [`BridgeContext`](crate::runtime::BridgeContext)
-    /// and kept alive here for the agent's lifetime.
-    bridge_state: Arc<crate::runtime::AgentBridgeState>,
+    /// Kept alive for the agent's lifetime so the global `BRIDGE_STATE`
+    /// entry isn't the only strong reference.
+    _registry: Option<Arc<crate::tools::ToolRegistry>>,
+    /// Kept alive to preserve a strong reference to the policy confirmation handler.
+    policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     conversation_id: Mutex<Option<String>>,
     is_started: AtomicBool,
     is_shutdown: AtomicBool,
@@ -209,29 +208,52 @@ impl<R: Runtime> AgentHandle<R> {
         let quota_key = config.effective_api_key().unwrap_or_default();
         let quota_state = runtime.quota_registry().state_for_key(&quota_key);
         quota_state.wait_for_quota().await;
+        let id = if hook_runner.is_some() {
+            // Serialize the set→create→clear sequence so concurrent creates
+            // cannot overwrite each other's temporary hook runner.
+            //
+            // NOTE: These must remain process-global because the Python-side
+            // callback (`dispatch_rust_hook`) is itself process-global — it is
+            // registered in `sys.modules["_agy_bridge_globals"]` and has no way
+            // to identify which runtime instance triggered it. A per-runtime
+            // guard would not prevent cross-runtime races on the shared
+            // INITIALIZING_HOOK_RUNNER slot.
+            let _guard = crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await;
+            if let Ok(mut opt) = crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
+                *opt = hook_runner.as_ref().map(Arc::clone);
+            } else {
+                tracing::error!("INITIALIZING_HOOK_RUNNER mutex poisoned — hook may not fire");
+            }
+            let result = runtime.create_agent(config.clone()).await;
+            if let Ok(mut opt) = crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
+                *opt = None;
+            } else {
+                tracing::error!("INITIALIZING_HOOK_RUNNER mutex poisoned — stale hook may persist");
+            }
+            result?
+        } else {
+            runtime.create_agent(config.clone()).await?
+        };
 
-        // Pre-allocate a globally-unique agent ID.
-        let id = crate::runtime::next_agent_id();
+        tracing::info!(agent_id = id, "Agent created successfully");
 
-        // Build the bridge state that callbacks will use. It's wrapped in
-        // an Arc shared between the AgentHandle (keeps it alive) and the
-        // BridgeContext pyclass (passed through Python callbacks).
+        // Build and insert per-agent bridge state in a single lock acquisition.
         let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
-        let bridge_state = Arc::new(crate::runtime::AgentBridgeState {
+        let bridge_entry = crate::runtime::AgentBridgeState {
             registry: registry.as_ref().map(Arc::clone),
             hook_runner: hook_runner.as_ref().map(Arc::clone),
             policies: policies_set,
             policy_handler: policy_handler.as_ref().map(Arc::clone),
-            tool_state: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        });
-
-        // Create the Python-side agent, passing the bridge state so
-        // callbacks can find hooks/tools/policies without a global lookup.
-        runtime
-            .create_agent(id, config.clone(), Arc::clone(&bridge_state))
-            .await?;
-
-        tracing::info!(agent_id = id, "Agent created successfully");
+            tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+        if let Ok(mut map) = crate::runtime::bridge_state().write() {
+            map.insert(id, bridge_entry);
+        } else {
+            tracing::error!(
+                agent_id = id,
+                "Failed to acquire write lock on BRIDGE_STATE"
+            );
+        }
 
         let conversation_id = Mutex::new(config.conversation_id.clone());
         Ok(Self {
@@ -239,7 +261,8 @@ impl<R: Runtime> AgentHandle<R> {
             runtime,
             config,
             quota_state,
-            bridge_state,
+            _registry: registry,
+            policy_handler,
             conversation_id,
             is_started: AtomicBool::new(true),
             is_shutdown: AtomicBool::new(false),
@@ -324,9 +347,16 @@ impl<R: Runtime> AgentHandle<R> {
                     retry_after: DEFAULT_QUOTA_BACKOFF,
                 })
             }
-            Err(e) => Err(Error::BackendError {
-                message: format!("Failed to read response text: {e}"),
-            }),
+            Err(e) => {
+                let converted = Error::from(e);
+                if matches!(converted, Error::Safety) {
+                    Err(converted)
+                } else {
+                    Err(Error::BackendError {
+                        message: format!("Failed to read response text: {converted}"),
+                    })
+                }
+            }
         }
     }
 
@@ -699,7 +729,7 @@ impl<R: Runtime> AgentHandle<R> {
             config,
             arc_registry,
             None,
-            self.bridge_state.policy_handler.clone(),
+            self.policy_handler.clone(),
         )
         .await
     }
@@ -714,6 +744,17 @@ impl<R: Runtime> Drop for AgentHandle<R> {
                  sending best-effort shutdown signal"
             );
             self.runtime.try_shutdown_agent(self.id);
+        }
+
+        // Clean up global bridge state entry.
+        if let Ok(mut map) = crate::runtime::bridge_state().write() {
+            map.remove(&self.id);
+        } else {
+            tracing::error!(
+                agent_id = self.id,
+                "BRIDGE_STATE RwLock poisoned during Drop — \
+                 bridge state entry for this agent may leak"
+            );
         }
     }
 }

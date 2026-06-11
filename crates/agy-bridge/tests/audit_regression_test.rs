@@ -3,8 +3,6 @@
 //! These tests verify fixes for specific bugs and ensure they don't regress.
 //! They run without a live Python SDK or API key.
 
-mod common;
-
 #[test]
 fn test_load_dotenv_strips_double_quotes() {
     // Regression: load_dotenv was not stripping surrounding quotes from values.

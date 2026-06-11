@@ -87,23 +87,20 @@ fn test_ask_user_policy_live_gating() {
 
             let bridge = AgyBridge::builder()
                 .chat_timeout(Duration::from_mins(2))
-                .build()
-                .unwrap();
+                .build()?;
 
             let handler = TestAskUserHandler;
 
             let agent = bridge.agent(config)
                 .tools(registry)
                 .policy_handler(handler)
-                .await
-                .expect("Failed to create agent");
+                .await?;
 
             // Turn 1: Request secure action, allowed by handler
             println!("\n--- TURN 1 (Allow) ---");
             let response = agent.chat("Call the do_secure_action tool with the secret 'Agent007' and tell me the result.")
-                .await
-                .expect("chat failed");
-            let text = response.text().await.expect("text resolution failed");
+                .await?;
+            let text = response.text().await?;
             println!("AGENT RESPONSE 1: {text}");
             assert!(
                 text.contains("Agent007") || text.contains("successfully"),
@@ -113,16 +110,16 @@ fn test_ask_user_policy_live_gating() {
             // Turn 2: Request secure action again, denied by handler
             println!("\n--- TURN 2 (Deny) ---");
             let response = agent.chat("Call the do_secure_action tool with the secret 'SuperAgent99' again and tell me what happens.")
-                .await
-                .expect("chat failed");
-            let text = response.text().await.expect("text resolution failed");
+                .await?;
+            let text = response.text().await?;
             println!("AGENT RESPONSE 2: {text}");
             assert!(
                 text.contains("blocked") || text.contains("denied") || text.contains("policy") || text.contains("error") || text.contains("permission"),
                 "Expected denied tool execution in agent response, got: {text}"
             );
 
-            agent.shutdown().await.unwrap();
-        });
+            agent.shutdown().await?;
+            Ok(())
+        })
     });
 }

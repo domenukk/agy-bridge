@@ -29,11 +29,9 @@ impl MockRuntime {
 impl agy_bridge::agent::Runtime for MockRuntime {
     async fn create_agent(
         &self,
-        _agent_id: agy_bridge::agent::AgentId,
         _config: AgentConfig,
-        _bridge_state: std::sync::Arc<agy_bridge::runtime::AgentBridgeState>,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<agy_bridge::agent::AgentId, Error> {
+        Ok(1)
     }
 
     async fn chat(

@@ -1,11 +1,26 @@
 //! JSON serialization for Content values.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use serde::Serialize;
 
 use super::{
     media::MediaContent,
     types::{Content, ContentPrimitive},
 };
+
+/// Strongly-typed payload for media content serialization.
+///
+/// All fields are borrowed — the only allocation is the base64 `data` string,
+/// which is unavoidable.
+#[derive(Serialize)]
+struct MediaPayload<'a> {
+    #[serde(rename = "type")]
+    media_type: &'a str,
+    data: String,
+    mime_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+}
 
 // =============================================================================
 // Python-side serialization helpers
@@ -21,44 +36,61 @@ use super::{
 ///
 /// # Errors
 ///
-/// Returns [`Error::BackendError`] if serialization fails (should not
-/// happen for well-formed content).
+/// Returns [`Error::BackendError`] if serialization fails.
 pub(crate) fn content_to_json(content: &Content) -> Result<String, crate::error::Error> {
-    let value = content_to_value(content);
-    serde_json::to_string(&value).map_err(|e| crate::error::Error::BackendError {
+    let value = content_to_value(content).map_err(|e| crate::error::Error::BackendError {
         message: format!("Content serialization failed: {e}"),
+    })?;
+    serde_json::to_string(&value).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Content JSON encoding failed: {e}"),
     })
 }
 
 /// Convert a [`Content`] to a `serde_json::Value` for the Python helper.
-pub(crate) fn content_to_value(content: &Content) -> serde_json::Value {
+///
+/// # Errors
+///
+/// Returns `serde_json::Error` if any media payload fails to serialize.
+pub(crate) fn content_to_value(content: &Content) -> Result<serde_json::Value, serde_json::Error> {
     match content {
-        Content::Text { text } => serde_json::Value::String(text.clone()),
-        Content::Image(m) => typed_media_to_value(m),
-        Content::Document(m) => typed_media_to_value(m),
-        Content::Audio(m) => typed_media_to_value(m),
-        Content::Video(m) => typed_media_to_value(m),
+        Content::Text { text } => Ok(serde_json::Value::String(text.clone())),
+        Content::Image(m) => serialize_typed_media(m),
+        Content::Document(m) => serialize_typed_media(m),
+        Content::Audio(m) => serialize_typed_media(m),
+        Content::Video(m) => serialize_typed_media(m),
         Content::Multi { parts } => {
-            let items: Vec<serde_json::Value> = parts.iter().map(primitive_to_value).collect();
-            serde_json::Value::Array(items)
+            let items: Result<Vec<serde_json::Value>, _> =
+                parts.iter().map(serialize_primitive).collect();
+            items.map(serde_json::Value::Array)
         }
     }
 }
 
 /// Convert a [`ContentPrimitive`] to a `serde_json::Value`.
-fn primitive_to_value(prim: &ContentPrimitive) -> serde_json::Value {
+///
+/// # Errors
+///
+/// Returns `serde_json::Error` if the media payload fails to serialize.
+fn serialize_primitive(prim: &ContentPrimitive) -> Result<serde_json::Value, serde_json::Error> {
     match prim {
-        ContentPrimitive::Text { text } => serde_json::Value::String(text.clone()),
-        ContentPrimitive::Image(m) => typed_media_to_value(m),
-        ContentPrimitive::Document(m) => typed_media_to_value(m),
-        ContentPrimitive::Audio(m) => typed_media_to_value(m),
-        ContentPrimitive::Video(m) => typed_media_to_value(m),
+        ContentPrimitive::Text { text } => Ok(serde_json::Value::String(text.clone())),
+        ContentPrimitive::Image(m) => serialize_typed_media(m),
+        ContentPrimitive::Document(m) => serialize_typed_media(m),
+        ContentPrimitive::Audio(m) => serialize_typed_media(m),
+        ContentPrimitive::Video(m) => serialize_typed_media(m),
     }
 }
 
-/// Build a JSON object for any [`MediaContent`] implementor with base64-encoded data.
-fn typed_media_to_value<T: MediaContent>(media: &T) -> serde_json::Value {
-    media_to_value(
+/// Serialize any [`MediaContent`] implementor to a JSON value with
+/// base64-encoded data.
+///
+/// # Errors
+///
+/// Returns `serde_json::Error` if the payload fails to serialize.
+fn serialize_typed_media<T: MediaContent>(
+    media: &T,
+) -> Result<serde_json::Value, serde_json::Error> {
+    serialize_media(
         T::TYPE_NAME,
         media.data(),
         media.mime_type(),
@@ -66,30 +98,24 @@ fn typed_media_to_value<T: MediaContent>(media: &T) -> serde_json::Value {
     )
 }
 
-/// Build a JSON object for a media primitive with base64-encoded data.
-fn media_to_value(
+/// Build a JSON value for a media primitive with base64-encoded data.
+///
+/// # Errors
+///
+/// Returns `serde_json::Error` if `serde_json::to_value` fails.
+fn serialize_media(
     type_name: &str,
     data: &[u8],
     mime_type: &str,
     description: Option<&str>,
-) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    map.insert("type".into(), serde_json::Value::String(type_name.into()));
-    map.insert(
-        "data".into(),
-        serde_json::Value::String(BASE64.encode(data)),
-    );
-    map.insert(
-        "mime_type".into(),
-        serde_json::Value::String(mime_type.into()),
-    );
-    if let Some(desc) = description {
-        map.insert(
-            "description".into(),
-            serde_json::Value::String((*desc).to_owned()),
-        );
-    }
-    serde_json::Value::Object(map)
+) -> Result<serde_json::Value, serde_json::Error> {
+    let payload = MediaPayload {
+        media_type: type_name,
+        data: BASE64.encode(data),
+        mime_type,
+        description,
+    };
+    serde_json::to_value(&payload)
 }
 
 #[cfg(test)]

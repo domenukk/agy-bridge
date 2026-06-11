@@ -71,21 +71,38 @@ fn test_hooks_lifecycle_live() {
 
             let bridge = AgyBridge::builder()
                 .chat_timeout(Duration::from_mins(1))
-                .build()
-                .unwrap();
+                .build()?;
 
-            let agent = bridge.agent(config).hooks(hook_runner).await.unwrap();
+            let agent = bridge.agent(config).hooks(hook_runner).await?;
 
             let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
             let prompt = format!(
                 "Use view_file to read the file '{}' and tell me its contents.",
                 cargo_toml.display(),
             );
-            let text = agent.chat(&*prompt).await.unwrap().text().await.unwrap();
+            let text = agent.chat(&*prompt).await?.text().await?;
             println!("AGENT FULL RESPONSE: {text}");
 
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            agent.shutdown().await.unwrap();
+            let mut post_turn_seen = false;
+            for _ in 0..300 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("post_turn:"))
+                {
+                    post_turn_seen = true;
+                    break;
+                }
+            }
+            assert!(
+                post_turn_seen,
+                "Expected post_turn event, got: {:?}",
+                events.lock().unwrap()
+            );
+
+            agent.shutdown().await?;
 
             let events_list = events.lock().unwrap().clone();
 
@@ -95,12 +112,6 @@ fn test_hooks_lifecycle_live() {
                     .iter()
                     .any(|e| e.starts_with("pre_turn:") && e.contains("view_file")),
                 "Expected pre_turn event mentioning view_file, got: {events_list:?}"
-            );
-
-            // Assert we saw post_turn
-            assert!(
-                events_list.iter().any(|e| e.starts_with("post_turn:")),
-                "Expected post_turn event, got: {events_list:?}"
             );
 
             // Assert ordering: pre_turn always comes before post_turn
@@ -113,6 +124,8 @@ fn test_hooks_lifecycle_live() {
                 .position(|e| e.starts_with("post_turn:"))
                 .unwrap();
             assert!(pre_turn_idx < post_turn_idx);
-        });
+
+            Ok(())
+        })
     });
 }

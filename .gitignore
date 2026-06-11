@@ -4,3 +4,5 @@ target
 .agents/
 .env
 *.stderr
+ORIGINAL_REQUEST.md
+PROJECT.md

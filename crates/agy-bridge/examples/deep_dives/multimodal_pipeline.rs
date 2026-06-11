@@ -24,17 +24,22 @@ fn find_generated_image(name: &str) -> Option<PathBuf> {
     let mut matches = Vec::new();
     let mut dirs_to_visit = vec![base];
     while let Some(d) = dirs_to_visit.pop() {
-        if let Ok(entries) = fs::read_dir(d) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs_to_visit.push(path);
-                } else if let Some(n) = path.file_name().and_then(|n| n.to_str())
-                    && n.starts_with(name)
-                    && n.to_ascii_lowercase().ends_with(".png")
-                {
-                    matches.push(path);
+        match fs::read_dir(d) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        dirs_to_visit.push(path);
+                    } else if let Some(n) = path.file_name().and_then(|n| n.to_str())
+                        && n.starts_with(name)
+                        && n.to_ascii_lowercase().ends_with(".png")
+                    {
+                        matches.push(path);
+                    }
                 }
+            }
+            Err(e) => {
+                eprintln!("Warning: cannot read directory: {e}");
             }
         }
     }

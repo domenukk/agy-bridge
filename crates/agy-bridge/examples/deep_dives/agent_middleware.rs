@@ -11,8 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agy_bridge::hooks::HookEntry;
-use agy_bridge::{hooks::HookResult, prelude::*};
+use agy_bridge::{
+    hooks::{HookEntry, HookResult},
+    prelude::*,
+};
 
 #[llm_tool]
 /// Look up a user by email address and return their profile.

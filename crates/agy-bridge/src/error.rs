@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use fast_rands::Rand;
 use pyo3::prelude::*;
 
 use crate::streaming::StreamError;
@@ -67,7 +68,7 @@ pub enum Error {
 
     /// An error originating from the streaming response layer.
     #[error(transparent)]
-    Stream(#[from] StreamError),
+    Stream(StreamError),
 
     /// The provided configuration is invalid or self-contradictory.
     #[error("Invalid configuration: {message}")]
@@ -140,6 +141,19 @@ impl From<std::io::Error> for Error {
         Self::Io {
             message: err.to_string(),
             kind: err.kind(),
+        }
+    }
+}
+
+impl From<StreamError> for Error {
+    fn from(err: StreamError) -> Self {
+        let msg = err.message.to_lowercase();
+        if msg.contains("safety") {
+            Self::Safety
+        } else if msg.contains("max tokens") || msg.contains("token limit") {
+            Self::MaxTokens
+        } else {
+            Self::Stream(err)
         }
     }
 }
@@ -339,8 +353,16 @@ where
     }
 }
 
-/// Maximum backoff cap for exponential retry (seconds).
 pub(crate) const MAX_BACKOFF_SECS: u64 = 120;
+
+/// Base for the exponential backoff calculation (e.g. 2^n).
+const BACKOFF_EXPONENT_BASE: u64 = 2;
+/// Conversion factor from seconds to milliseconds.
+const MILLISECONDS_PER_SECOND: u64 = 1000;
+/// Divisor to compute total jitter spread (e.g., base / 2 = 50% spread).
+const JITTER_TOTAL_SPREAD_DIVISOR: u64 = 2;
+/// Divisor to compute minimum jitter boundary (e.g., base / 4 = 25% lower bound).
+const JITTER_MIN_SUBTRACT_DIVISOR: u64 = 4;
 
 /// Compute exponential backoff duration with jitter: 2^attempt seconds,
 /// capped at [`MAX_BACKOFF_SECS`], then jittered by ±25%.
@@ -352,24 +374,23 @@ pub(crate) const MAX_BACKOFF_SECS: u64 = 120;
 /// retry simultaneously.
 fn backoff_duration(attempt: u32) -> Duration {
     let attempt = attempt.max(1);
-    let base_secs = 2u64
+    let base_secs = BACKOFF_EXPONENT_BASE
         .checked_shl(attempt.saturating_sub(1))
         .unwrap_or(MAX_BACKOFF_SECS)
         .min(MAX_BACKOFF_SECS);
-    let base_ms = base_secs.saturating_mul(1000);
+    let base_ms = base_secs.saturating_mul(MILLISECONDS_PER_SECOND);
     // Apply ±25% jitter: range is [75%, 125%] of base_ms.
-    let jitter_range = base_ms / 2; // 50% total spread
-    let jitter_min = base_ms.saturating_sub(base_ms / 4);
+    let jitter_range = base_ms / JITTER_TOTAL_SPREAD_DIVISOR; // 50% total spread
+    let jitter_min = base_ms.saturating_sub(base_ms / JITTER_MIN_SUBTRACT_DIVISOR);
     let jittered_ms = if jitter_range == 0 {
         base_ms
     } else {
+        let limit = u32::try_from(jitter_range).unwrap_or_else(|e| {
+            tracing::warn!("Int conversion failed: {}", e);
+            u32::MAX
+        });
         jitter_min
-            + u64::from(fastrand::u32(
-                ..u32::try_from(jitter_range).unwrap_or_else(|e| {
-                    tracing::warn!("Int conversion failed: {}", e);
-                    u32::MAX
-                }),
-            ))
+            + (fast_rands::StdRand::new().between(0, limit.saturating_sub(1) as usize) as u64)
     };
     Duration::from_millis(jittered_ms)
 }
@@ -379,6 +400,32 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    #[test]
+    fn test_stream_error_conversion() {
+        let safety_err = StreamError {
+            message: "Step error (status=ERROR): Candidate blocked by safety".to_string(),
+        };
+        let mapped_safety = Error::from(safety_err);
+        assert!(matches!(mapped_safety, Error::Safety));
+
+        let max_tokens_err = StreamError {
+            message: "Step error (status=ERROR): Max tokens reached".to_string(),
+        };
+        let mapped_max_tokens = Error::from(max_tokens_err);
+        assert!(matches!(mapped_max_tokens, Error::MaxTokens));
+
+        let other_err = StreamError {
+            message: "Some other connection issue".to_string(),
+        };
+        let mapped_other = Error::from(other_err);
+        match mapped_other {
+            Error::Stream(e) => {
+                assert_eq!(e.message, "Some other connection issue");
+            }
+            other => panic!("Expected Error::Stream, got: {other:?}"),
+        }
+    }
 
     #[test]
     fn test_backend_error_from_pyerr() {

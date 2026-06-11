@@ -65,7 +65,7 @@ fn test_trigger_agent_creation() {
             .expect("build runtime");
 
         rt.block_on(async {
-            let bridge = agy_bridge::AgyBridge::builder().build().unwrap();
+            let bridge = agy_bridge::AgyBridge::builder().build()?;
             let triggers = vec![agy_bridge::triggers::TriggerEntry {
                 name: "test_every".into(),
                 config: agy_bridge::triggers::TriggerConfig::every_secs(10),
@@ -80,10 +80,7 @@ fn test_trigger_agent_creation() {
                 .build();
 
             // Agent creation with triggers should succeed.
-            let agent = bridge
-                .agent(config)
-                .await
-                .expect("create agent with triggers");
+            let agent = bridge.agent(config).await?;
 
             // Verify the agent still works for normal prompts.
             let result = agent.chat_text("Say hello").await;
@@ -98,7 +95,8 @@ fn test_trigger_agent_creation() {
                 }
             }
 
-            agent.shutdown().await.expect("shutdown");
-        });
+            agent.shutdown().await?;
+            Ok(())
+        })
     });
 }

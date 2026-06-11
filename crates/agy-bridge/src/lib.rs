@@ -3,7 +3,10 @@
 // in edition 2024) would require `unsafe {}` blocks inside every generated body.
 // Suppressing crate-wide avoids noise without reducing actual safety guarantees,
 // since all hand-written unsafe blocks already use explicit `unsafe {}` scoping.
-#![allow(unsafe_op_in_unsafe_fn)]
+#![expect(
+    unsafe_op_in_unsafe_fn,
+    reason = "PyO3 proc macros generate unsafe fn wrappers that would require redundant unsafe blocks"
+)]
 #![doc = include_str!("../README.md")]
 //! agy-bridge: Standalone reusable `PyO3` bridge for the Google Antigravity SDK.
 
@@ -139,20 +142,25 @@ pub fn load_dotenv() -> &'static std::collections::HashMap<String, String> {
             let candidate = dir.join(".env");
             if candidate.is_file() {
                 let mut env_map = std::collections::HashMap::new();
-                if let Ok(contents) = std::fs::read_to_string(&candidate) {
-                    for line in contents.lines() {
-                        if let Some((k, v)) = parse_dotenv_line(line)
-                            && std::env::var_os(k).is_none()
-                        {
-                            // SAFETY: Called inside the OnceLock closure during
-                            // single-threaded initialization, before any threads
-                            // are spawned. set_var is not thread-safe, but here
-                            // we are the only thread.
-                            unsafe {
-                                std::env::set_var(k, v);
+                match std::fs::read_to_string(&candidate) {
+                    Ok(contents) => {
+                        for line in contents.lines() {
+                            if let Some((k, v)) = parse_dotenv_line(line)
+                                && std::env::var_os(k).is_none()
+                            {
+                                // SAFETY: Called inside the OnceLock closure during
+                                // single-threaded initialization, before any threads
+                                // are spawned. set_var is not thread-safe, but here
+                                // we are the only thread.
+                                unsafe {
+                                    std::env::set_var(k, v);
+                                }
+                                env_map.insert(k.to_owned(), v.to_owned());
                             }
-                            env_map.insert(k.to_owned(), v.to_owned());
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to read .env file at {}", candidate.display());
                     }
                 }
                 return env_map;
@@ -211,7 +219,7 @@ pub type Agent = agent::AgentHandle<runtime::PythonRuntime>;
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # agy_bridge::load_dotenv();
 /// // Zero-config:
-/// let bridge = AgyBridge::builder().build()?;
+/// // let bridge = AgyBridge::builder().build()?;
 ///
 /// // With custom timeouts:
 /// let bridge = AgyBridge::builder()
@@ -219,7 +227,13 @@ pub type Agent = agent::AgentHandle<runtime::PythonRuntime>;
 ///     .build()?;
 ///
 /// // Create an agent (simple):
-/// let agent = bridge.agent(AgentConfig::default()).await?;
+/// // let agent = bridge.agent(AgentConfig::default()).await?;
+/// # let agent = bridge.agent(
+/// #     AgentConfig::builder()
+/// #         .system_instructions("Reply with 'Hello!' and nothing else. Never use tools.")
+/// #         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+/// #         .build()
+/// # ).await?;
 ///
 /// // Create an agent with tools and hooks:
 /// // let agent = bridge.agent(config)

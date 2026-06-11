@@ -1,6 +1,9 @@
 //! `PyO3` pre-tool-call hook for workspace confinement.
 // pyo3::pymethods proc-macro generates PyErr→PyErr conversions from `?`
-#![allow(clippy::useless_conversion)]
+#![expect(
+    clippy::useless_conversion,
+    reason = "PyO3 proc-macro generates PyErr→PyErr conversions"
+)]
 
 use std::path::PathBuf;
 

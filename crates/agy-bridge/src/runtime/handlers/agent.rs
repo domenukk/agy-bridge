@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use tokio::{sync::oneshot, time::timeout};
 
 use super::super::{
-    AgentId, BridgeContext,
+    AgentId,
     command_loop::{AGY_BRIDGE_GLOBALS_MODULE, AgentRegistry},
     dispatch_rust_policy_confirm, dispatch_rust_tool,
     py_scripts::PYTHON_AGENT_INIT_SCRIPT,
@@ -47,7 +47,6 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
     agy_bridge_globals.setattr(DISPATCH_RUST_POLICY_CONFIRM_ATTR, confirm_func)?;
 
     globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;
-    globals_module.add_class::<BridgeContext>()?;
     Ok(())
 }
 
@@ -55,9 +54,7 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
 fn init_agent_instance(
     py: Python<'_>,
     config_json: &str,
-    agent_id: u64,
-    bridge_ctx: BridgeContext,
-    event_loop: &PyObject,
+    next_id: u64,
 ) -> PyResult<(PyObject, PyObject)> {
     let globals = pyo3::types::PyDict::new_bound(py);
     py.run_bound(PYTHON_AGENT_INIT_SCRIPT, Some(&globals), None)?;
@@ -70,14 +67,7 @@ fn init_agent_instance(
         )
     })?;
 
-    let bridge_ctx_py = pyo3::Py::new(py, bridge_ctx)?;
-    let val = init_agent_fn.call1((
-        config_json,
-        agent_id,
-        agent_cls,
-        bridge_ctx_py,
-        event_loop.bind(py),
-    ))?;
+    let val = init_agent_fn.call1((config_json, next_id, agent_cls))?;
     let agent_ctx = val.get_item(0)?;
     let aenter_coro = val.get_item(1)?;
     let ctx_py = agent_ctx.to_object(py);
@@ -123,21 +113,16 @@ async fn attempt_aexit_cleanup(ctx_py: &Py<PyAny>, cleanup_timeout: Duration) {
 pub(in crate::runtime) async fn handle_create_agent(
     registry: AgentRegistry,
     chat_timeout: Duration,
-    agent_id: AgentId,
     config_json: String,
-    bridge_ctx: BridgeContext,
     reply: oneshot::Sender<Result<AgentId, Error>>,
 ) {
-    tracing::info!(
-        agent_id = agent_id.0,
-        "Live-SDK: CreateAgent command received"
-    );
+    static AGENT_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    tracing::info!("Live-SDK: CreateAgent command received");
+    let next_id = AGENT_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let init_result = Python::with_gil(|py| {
         prepare_agent_globals(py)?;
-        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
-        let event_loop = locals.event_loop(py).to_object(py);
-        init_agent_instance(py, &config_json, agent_id.0, bridge_ctx, &event_loop)
+        init_agent_instance(py, &config_json, next_id)
     });
 
     let (ctx_py, aenter_coro_py) = match init_result {
@@ -192,7 +177,7 @@ pub(in crate::runtime) async fn handle_create_agent(
     tracing::info!("Live-SDK: __aenter__ completed");
     match enter_result {
         Ok(agent_instance_py) => {
-            let aid = agent_id;
+            let aid = AgentId(next_id);
             match registry.lock() {
                 Ok(mut guard) => {
                     guard.insert(aid, (ctx_py, agent_instance_py));
@@ -245,6 +230,13 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
         }
         return;
     };
+
+    // Clean up the global bridge state for this agent.
+    if let Ok(mut map) = super::super::bridge_state().write() {
+        map.remove(&agent_id.0);
+    } else {
+        tracing::warn!(agent_id = ?agent_id, "Failed to lock BRIDGE_STATE for cleanup");
+    }
 
     let aexit_coro_res = Python::with_gil(|py| {
         let ctx_bound = ctx_py.bind(py);

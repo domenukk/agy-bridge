@@ -16,27 +16,28 @@
 //!   Multiple chats/operations run concurrently through the Python asyncio event loop.
 //!
 //! - **Rust tool dispatch**: When the Python SDK invokes a Rust tool, `dispatch_rust_tool`
-//!   reads tool state from the `BridgeContext` pyclass, then uses `future_into_py` to run
-//!   the async tool on the tokio runtime — keeping the Python thread unblocked for other
-//!   coroutines.
+//!   reads tool state from `BRIDGE_STATE`, then uses `future_into_py` to run the async
+//!   tool on the tokio runtime — keeping the Python thread unblocked for other coroutines.
 //!
 //! - **Hook/policy dispatch**: Similarly, `dispatch_rust_hook` and `dispatch_rust_policy_confirm`
 //!   use `spawn_blocking` to run synchronous hook callbacks without holding the GIL.
 //!
-//! # Per-agent state via `BridgeContext`
+//! # Why global state (`BRIDGE_STATE`)?
 //!
-//! Per-agent state (tool registries, hook runners, policy sets) is held in an
-//! `Arc<AgentBridgeState>` shared between the Rust `AgentHandle` and a `#[pyclass]`
-//! `BridgeContext`. The `BridgeContext` is passed to the Python init script, captured
-//! by all callback closures, and returned to Rust dispatch functions — eliminating any
-//! need for global mutable state.
+//! The Python SDK's tool/hook/policy callbacks are dispatched via PyO3 `#[pyfunction]`
+//! entries (e.g. `dispatch_rust_tool`, `dispatch_rust_hook`). These functions are
+//! registered as plain Python callables and receive **only** the arguments the SDK
+//! passes (agent ID + serialized context). There is no way to thread a Rust reference
+//! or `Arc` through the Python call boundary.
+//!
+//! Therefore per-agent state (tool registries, hook runners, policy sets) is stored in
+//! a global `RwLock<HashMap<AgentId, AgentBridgeState>>`. The agent ID is used as a
+//! lookup key, and the lock is held only for brief `HashMap` operations (never across
+//! `.await` points). This is the standard pattern for PyO3 FFI bridges that need to
+//! associate Rust state with Python-side identifiers.
 
 #![expect(clippy::useless_conversion)] // PyO3 #[pyfunction] wrapper generates .into() on PyErr
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, oneshot};
@@ -102,12 +103,12 @@ impl std::fmt::Display for AgentId {
     }
 }
 
-/// Per-agent state shared between `AgentHandle` and the Python `BridgeContext`.
+/// Per-agent state stored in the global [`BRIDGE_STATE`] registry.
 ///
-/// Bundles all sidecar data that FFI callbacks need. The `AgentHandle` and
-/// the `BridgeContext` pyclass both hold `Arc<AgentBridgeState>`, so the state
-/// lives as long as either side needs it — no global registry required.
-pub struct AgentBridgeState {
+/// Bundles all sidecar data that FFI callbacks need to look up by agent ID.
+/// Consolidating into one struct means a single lock acquisition covers all
+/// lookups/insertions/removals, preventing inconsistent partial state.
+pub(crate) struct AgentBridgeState {
     /// Custom Rust tools registered for this agent.
     pub(crate) registry: Option<Arc<crate::tools::ToolRegistry>>,
     /// Lifecycle hooks for pre/post turn, tool-call gating, etc.
@@ -117,49 +118,44 @@ pub struct AgentBridgeState {
     /// Interactive confirmation handler for `NeedsConfirmation` policies.
     pub(crate) policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     /// Shared key-value state persisted across tool calls for this agent.
-    pub(crate) tool_state: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    pub(crate) tool_state: Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
 }
 
-/// Per-agent bridge context passed to Python and returned to Rust in callbacks.
+/// Single global registry of per-agent bridge state, keyed by agent ID.
 ///
-/// This `#[pyclass]` is created in [`AgentHandle::new()`](crate::agent::AgentHandle::new),
-/// passed to the Python init script, captured by all callback closures, and
-/// returned to Rust in `dispatch_rust_hook` / `dispatch_rust_tool` /
-/// `dispatch_rust_policy_confirm`. This eliminates the need for a global
-/// registry — each agent carries its own state.
-#[pyclass]
-#[derive(Clone)]
-pub(crate) struct BridgeContext {
-    /// The agent ID, exposed to Python for logging/payload construction.
-    #[pyo3(get)]
-    pub(crate) agent_id: u64,
-    /// Per-agent state: tool registry, hooks, policies.
-    pub(crate) state: Arc<AgentBridgeState>,
-}
-
-#[pymethods]
-impl BridgeContext {
-    /// Support `copy.copy()` — shares the same `Arc<AgentBridgeState>`.
-    fn __copy__(&self) -> Self {
-        self.clone()
-    }
-
-    /// Support `copy.deepcopy()` — the pydantic SDK deep-copies configs,
-    /// so this must work. The clone shares the same `Arc`, which is the
-    /// correct semantics (all copies dispatch to the same agent state).
-    fn __deepcopy__(&self, _memo: pyo3::Bound<'_, pyo3::types::PyDict>) -> Self {
-        self.clone()
-    }
-}
-
-/// Allocate a new globally-unique agent ID.
+/// # Lock choice
 ///
-/// IDs are unique across all `PythonRuntime` instances in the process
-/// because they come from a single [`AtomicU64`](std::sync::atomic::AtomicU64).
-pub(crate) fn next_agent_id() -> u64 {
-    static AGENT_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    AGENT_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// Uses `std::sync::RwLock` (not `tokio::sync::RwLock`) because the lock is
+/// held only for brief `HashMap` insert/remove/lookup operations and is never
+/// held across an `.await` point. This avoids the overhead of an async lock
+/// and is safe from deadlocks.
+///
+/// # Scalability
+///
+/// For typical agent counts (< ~100), `RwLock<HashMap>` provides sufficient
+/// throughput.  Read-side contention is bounded by the microsecond-scale lock
+/// duration.  If the bridge ever needs to support thousands of concurrent
+/// agents, replacing this with a `DashMap` would eliminate read-lock overhead
+/// entirely — but is unnecessary for current workloads.
+static BRIDGE_STATE: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>>,
+> = std::sync::OnceLock::new();
+
+/// Access the global per-agent bridge state registry.
+pub(crate) fn bridge_state()
+-> &'static std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>> {
+    BRIDGE_STATE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
+
+/// Fallback `Hooks` registry used during `create_agent` when the permanent entry is not yet registered.
+pub(crate) static INITIALIZING_HOOK_RUNNER: std::sync::Mutex<Option<Arc<crate::hooks::Hooks>>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes `create_agent` calls that install a temporary hook runner in
+/// [`INITIALIZING_HOOK_RUNNER`], preventing concurrent creates from
+/// overwriting each other's fallback runner.
+pub(crate) static CREATE_AGENT_HOOK_GUARD: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Execute a hook by name, deserializing the context JSON and calling the
 /// appropriate method on the runner. Returns the serialized result (empty
@@ -257,25 +253,39 @@ fn dispatch_hook_by_name(
 
 /// Dispatches a Rust hook call from the Python thread.
 #[pyfunction]
-#[allow(clippy::needless_pass_by_value)] // PyO3 extracts BridgeContext by value from Python
 pub(crate) fn dispatch_rust_hook(
     py: Python<'_>,
-    bridge_ctx: BridgeContext,
+    agent_id: u64,
     hook_point: String,
     context_json: String,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let agent_id = bridge_ctx.agent_id;
     tracing::debug!(agent_id, hook_point = %hook_point, "dispatch_rust_hook called from Python");
-    let hook_runner = bridge_ctx
-        .state
-        .hook_runner
-        .as_ref()
-        .ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "No active Hooks found for agent ID {agent_id}"
-            ))
-        })?
-        .clone();
+    let hook_runner = {
+        let map = bridge_state().read().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
+        })?;
+        if let Some(entry) = map.get(&agent_id) {
+            let runner = entry.hook_runner.as_ref().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "No active Hooks found for agent ID {agent_id}"
+                ))
+            })?;
+            Arc::clone(runner)
+        } else {
+            let opt = INITIALIZING_HOOK_RUNNER.lock().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to lock INITIALIZING_HOOK_RUNNER: {e}"
+                ))
+            })?;
+            if let Some(ref runner) = *opt {
+                Arc::clone(runner)
+            } else {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "No active bridge state or initializing hook runner found for agent ID {agent_id}"
+                )));
+            }
+        }
+    };
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         // SAFETY CONSTRAINT: Hooks dispatched here MUST NOT acquire the Python
@@ -296,25 +306,29 @@ pub(crate) fn dispatch_rust_hook(
 }
 
 #[pyfunction]
-#[allow(clippy::needless_pass_by_value)] // PyO3 extracts BridgeContext by value from Python
 pub(crate) fn dispatch_rust_policy_confirm(
     py: Python<'_>,
-    bridge_ctx: BridgeContext,
+    agent_id: u64,
     tool_name: String,
     args_json: String,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let agent_id = bridge_ctx.agent_id;
     tracing::info!(agent_id, tool = %tool_name, "dispatch_rust_policy_confirm called from Python");
-    let policy_handler = bridge_ctx
-        .state
-        .policy_handler
-        .as_ref()
-        .ok_or_else(|| {
+    let policy_handler = {
+        let map = bridge_state().read().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
+        })?;
+        let entry = map.get(&agent_id).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "No active bridge state found for agent ID {agent_id}"
+            ))
+        })?;
+        let handler = entry.policy_handler.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "No active AskUserHandler found for agent ID {agent_id}"
             ))
-        })?
-        .clone();
+        })?;
+        Arc::clone(handler)
+    };
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         // SAFETY CONSTRAINT: Handlers dispatched here MUST NOT acquire the Python
@@ -338,11 +352,21 @@ pub(crate) fn dispatch_rust_policy_confirm(
 }
 
 /// Evaluates policies and registered handlers to check if a tool execution is allowed.
-fn check_tool_execution_allowed(
-    state: &AgentBridgeState,
+pub(crate) fn check_tool_execution_allowed(
+    agent_id: u64,
     name: &str,
     args_json: &str,
 ) -> Result<bool, crate::error::Error> {
+    let map = bridge_state()
+        .read()
+        .map_err(|e| crate::error::Error::BackendError {
+            message: format!("Failed to read BRIDGE_STATE: {e}"),
+        })?;
+
+    let Some(state) = map.get(&agent_id) else {
+        return Ok(false);
+    };
+
     let (is_allowed, needs_confirm) = match state.policies.evaluate(name) {
         crate::policies::PolicyDecision::Allow => (true, false),
         crate::policies::PolicyDecision::Deny => (false, false),
@@ -354,6 +378,9 @@ fn check_tool_execution_allowed(
     }
 
     if needs_confirm && let Some(ref handler) = state.policy_handler {
+        let handler = Arc::clone(handler);
+        // Drop the lock before calling the handler (it may block).
+        drop(map);
         let args_val: serde_json::Value =
             serde_json::from_str(args_json).map_err(|e| crate::error::Error::BackendError {
                 message: format!("Failed to parse policy args JSON: {e}"),
@@ -370,18 +397,16 @@ fn check_tool_execution_allowed(
 /// tokio `Handle` to `block_on` the async `ToolRegistry::dispatch`, which
 /// is safe because this function runs on the Python thread (not a tokio worker).
 #[pyfunction]
-#[allow(clippy::needless_pass_by_value)] // PyO3 extracts BridgeContext by value from Python
 fn dispatch_rust_tool<'py>(
     py: Python<'py>,
-    bridge_ctx: BridgeContext,
+    agent_id: u64,
     name: String,
     args_json: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let agent_id = bridge_ctx.agent_id;
     tracing::info!(agent_id, tool = %name, "dispatch_rust_tool called from Python (async)");
 
     // Evaluate policies before tool dispatch
-    let is_allowed = check_tool_execution_allowed(&bridge_ctx.state, &name, args_json)
+    let is_allowed = check_tool_execution_allowed(agent_id, &name, args_json)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     if !is_allowed {
@@ -390,17 +415,22 @@ fn dispatch_rust_tool<'py>(
         )));
     }
 
-    let registry = bridge_ctx
-        .state
-        .registry
-        .as_ref()
-        .ok_or_else(|| {
+    let (registry, tool_state) = {
+        let map = bridge_state().read().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
+        })?;
+        let entry = map.get(&agent_id).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "No active bridge state found for agent ID {agent_id}"
+            ))
+        })?;
+        let registry = entry.registry.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "No active ToolRegistry found for agent ID {agent_id}"
             ))
-        })?
-        .clone();
-    let tool_state = Arc::clone(&bridge_ctx.state.tool_state);
+        })?;
+        (Arc::clone(registry), Arc::clone(&entry.tool_state))
+    };
 
     let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("Failed to parse tool arguments JSON: {e}"))
@@ -424,9 +454,7 @@ fn dispatch_rust_tool<'py>(
 pub(crate) enum PyCommand {
     /// Create a new agent with the given configuration dict as JSON.
     CreateAgent {
-        agent_id: AgentId,
         config_json: String,
-        bridge_ctx: BridgeContext,
         reply: oneshot::Sender<Result<AgentId, Error>>,
     },
     /// Send a chat message to an agent.
@@ -793,20 +821,24 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                 message: format!("Failed to set asyncio event loop: {e}"),
             })?;
 
-        // Ensure _agy_bridge_globals module exists in sys.modules for
-        // prepare_agent_globals and the rate-limit interceptor.
+        // Register event_loop in globals for access from any thread
         let sys = py.import_bound("sys").map_err(|e| Error::BackendError {
             message: format!("Failed to import sys: {e}"),
         })?;
         let sys_modules = sys.getattr("modules").map_err(|e| Error::BackendError {
             message: format!("Failed to get sys.modules: {e}"),
         })?;
-        if !sys_modules
+        let globals_mod = if sys_modules
             .contains(command_loop::AGY_BRIDGE_GLOBALS_MODULE)
             .map_err(|e| Error::BackendError {
                 message: format!("Failed to check sys.modules: {e}"),
-            })?
-        {
+            })? {
+            sys_modules
+                .get_item(command_loop::AGY_BRIDGE_GLOBALS_MODULE)
+                .map_err(|e| Error::BackendError {
+                    message: format!("Failed to get _agy_bridge_globals: {e}"),
+                })?
+        } else {
             let types = py.import_bound("types").map_err(|e| Error::BackendError {
                 message: format!("Failed to import types: {e}"),
             })?;
@@ -824,7 +856,13 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                 .map_err(|e| Error::BackendError {
                     message: format!("Failed to register _agy_bridge_globals: {e}"),
                 })?;
-        }
+            module
+        };
+        globals_mod
+            .setattr("EVENT_LOOP", &event_loop)
+            .map_err(|e| Error::BackendError {
+                message: format!("Failed to set EVENT_LOOP in globals: {e}"),
+            })?;
 
         tracing::info!("Python asyncio event loop created on runtime thread");
 
@@ -856,10 +894,8 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 impl crate::agent::Runtime for PythonRuntime {
     async fn create_agent(
         &self,
-        agent_id: crate::agent::AgentId,
         config: crate::config::AgentConfig,
-        bridge_state: Arc<AgentBridgeState>,
-    ) -> Result<(), Error> {
+    ) -> Result<crate::agent::AgentId, Error> {
         // Report all available tools as requested by the user.
         let mut all_tools = config.custom_tool_names();
         if let Some(ref caps) = config.capabilities {
@@ -885,25 +921,19 @@ impl crate::agent::Runtime for PythonRuntime {
             all_tools.len(),
             all_tools
         );
+
         let config_json = serde_json::to_string(&config).map_err(|e| Error::BackendError {
             message: format!("Failed to serialize AgentConfig: {e}"),
         })?;
 
-        let bridge_ctx = BridgeContext {
-            agent_id,
-            state: bridge_state,
-        };
-
-        let _: AgentId = self
+        let raw_id = self
             .send_command("create_agent", false, |reply| PyCommand::CreateAgent {
-                agent_id: AgentId(agent_id),
                 config_json,
-                bridge_ctx,
                 reply,
             })
             .await?;
 
-        Ok(())
+        Ok(raw_id.0)
     }
 
     async fn chat(
@@ -1225,6 +1255,8 @@ err = MaxTokensException("dummy")
 
     #[test]
     fn test_ask_user_policy_custom_tool_gating() {
+        let agent_id: u64 = 999;
+
         // 1. Setup the PolicySet with an AskUser rule for "dangerous_tool"
         let mut policies = crate::policies::PolicySet::new();
         policies
@@ -1249,20 +1281,25 @@ err = MaxTokensException("dummy")
         }
         registry.register(DangerousTool);
 
-        // 4. Build bridge state directly (no global map)
-        let state = AgentBridgeState {
-            registry: Some(Arc::new(registry)),
-            hook_runner: None,
-            policies,
-            policy_handler: Some(Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>),
-            tool_state: Arc::new(Mutex::new(HashMap::new())),
-        };
+        // 4. Register all state in a single bridge_state() insertion
+        bridge_state().write().unwrap().insert(
+            agent_id,
+            AgentBridgeState {
+                registry: Some(Arc::new(registry)),
+                hook_runner: None,
+                policies,
+                policy_handler: Some(
+                    Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>
+                ),
+                tool_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            },
+        );
 
         // 5. Simulate check_tool_execution_allowed when the AskUserHandler allows it (returns true)
         handler
             .should_allow
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let res = check_tool_execution_allowed(&state, "dangerous_tool", "{}");
+        let res = check_tool_execution_allowed(agent_id, "dangerous_tool", "{}");
         assert!(res.is_ok(), "Check should succeed");
         assert!(
             res.unwrap(),
@@ -1273,11 +1310,14 @@ err = MaxTokensException("dummy")
         handler
             .should_allow
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let res = check_tool_execution_allowed(&state, "dangerous_tool", "{}");
+        let res = check_tool_execution_allowed(agent_id, "dangerous_tool", "{}");
         assert!(res.is_ok(), "Check should succeed");
         assert!(
             !res.unwrap(),
             "Should block tool execution when handler returns false"
         );
+
+        // Clean up
+        bridge_state().write().unwrap().remove(&agent_id);
     }
 }

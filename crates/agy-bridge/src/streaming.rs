@@ -25,8 +25,17 @@ use crate::types::{Step, UsageMetadata};
 /// # async fn main() -> Result<(), agy_bridge::error::Error> {
 /// # agy_bridge::load_dotenv();
 /// # let bridge = agy_bridge::AgyBridge::builder().build()?;
-/// # let agent = bridge.default_agent().await?;
-/// let result = agent.chat("hello").await?.text().await?;
+/// # let agent = bridge.agent(
+/// #     agy_bridge::config::AgentConfig::builder()
+/// #         .system_instructions("Reply with 'Hello!' and nothing else. Never use tools.")
+/// #         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+/// #         .build()
+/// # ).await?;
+/// let result = agent
+///     .chat("Reply with 'Hello!' and nothing else.")
+///     .await?
+///     .text()
+///     .await?;
 /// println!("{result}"); // prints text
 /// if let Some(usage) = result.usage() { /* access metadata */ }
 /// # agent.shutdown().await?;

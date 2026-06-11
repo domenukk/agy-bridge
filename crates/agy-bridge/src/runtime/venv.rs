@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 
 /// Configure Python's `sys.path` to include the virtual environment's
-/// `site-packages`.
+/// `site-packages`, and set `ANTIGRAVITY_HARNESS_PATH` if found.
 ///
 /// We avoid `site.getsitepackages()` because on Debian/Ubuntu systems it
 /// returns `dist-packages` paths that don't match the venv layout.
@@ -46,6 +46,24 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
     let major: u32 = version_info.getattr("major")?.extract()?;
     let minor: u32 = version_info.getattr("minor")?.extract()?;
     let py_version = format!("{major}.{minor}");
+
+    // Set ANTIGRAVITY_HARNESS_PATH if the binary exists.
+    let harness_path = venv
+        .join("lib")
+        .join(format!("python{py_version}"))
+        .join("site-packages")
+        .join("google")
+        .join("antigravity")
+        .join("bin")
+        .join("localharness");
+
+    if harness_path.is_file() {
+        environ.set_item(
+            "ANTIGRAVITY_HARNESS_PATH",
+            harness_path.to_string_lossy().to_string(),
+        )?;
+        tracing::debug!(path = %harness_path.display(), "Set ANTIGRAVITY_HARNESS_PATH in Python os.environ");
+    }
 
     // Use site.addsitedir() to add venv site-packages. Unlike a plain
     // sys.path.insert(), addsitedir() processes .pth files — which is

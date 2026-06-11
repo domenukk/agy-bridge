@@ -14,13 +14,6 @@ use super::{
 pub(super) const HANDLER_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Compile a Python helper function once, caching the result in a `OnceLock`.
-///
-/// The script is executed with a single dict as **both** `globals` and `locals`.
-/// This ensures that sibling helper functions defined in the same script
-/// (e.g. `_decode_content`, `_decode_prompt`) are visible to the target
-/// function at call time — Python sets a function's `__globals__` to the
-/// `globals` dict passed to `exec()`, so if we let it default to `__main__`
-/// the siblings would be missing and produce `NameError`.
 pub(crate) fn get_or_compile_py_helper(
     cache: &'static std::sync::OnceLock<PyObject>,
     script: &str,
@@ -31,7 +24,7 @@ pub(crate) fn get_or_compile_py_helper(
     }
     Python::with_gil(|py| {
         let locals = pyo3::types::PyDict::new_bound(py);
-        py.run_bound(script, Some(&locals), Some(&locals))
+        py.run_bound(script, None, Some(&locals))
             .map_err(|e| e.to_string())?;
         let fn_obj = locals
             .get_item(fn_name)
@@ -227,6 +220,16 @@ async fn cleanup_single_agent(agent_id: AgentId, ctx_py: PyObject) {
             );
         }
     }
+
+    // Also clean up the global bridge state for this agent.
+    if let Ok(mut map) = super::bridge_state().write() {
+        map.remove(&agent_id.0);
+    } else {
+        tracing::warn!(
+            agent_id = agent_id.0,
+            "BRIDGE_STATE RwLock poisoned during cleanup"
+        );
+    }
 }
 
 /// Outcome of dispatching a single command.
@@ -269,10 +272,6 @@ fn dispatch_query_command(cmd: PyCommand, registry: &AgentRegistry) -> Result<()
 
 /// Dispatch a single [`PyCommand`] to the appropriate handler, spawning
 /// async work into `active_tasks` where needed.
-#[expect(
-    clippy::too_many_lines,
-    reason = "flat match dispatcher — each arm is a trivial task spawn"
-)]
 async fn dispatch_async_command(
     cmd: PyCommand,
     registry: &AgentRegistry,
@@ -280,32 +279,20 @@ async fn dispatch_async_command(
     inter_agent_delay: Duration,
     active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
 ) -> DispatchResult {
-    // Synchronous query commands — handled without spawning tasks.
+    // Phase 1: synchronous query commands — no task spawned.
     let cmd = match dispatch_query_command(cmd, registry) {
         Ok(()) => return DispatchResult::Continue,
         Err(cmd) => cmd,
     };
 
-    match cmd {
-        PyCommand::CreateAgent {
-            agent_id,
-            config_json,
-            bridge_ctx,
-            reply,
-        } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                agent::handle_create_agent(
-                    registry,
-                    chat_timeout,
-                    agent_id,
-                    config_json,
-                    bridge_ctx,
-                    reply,
-                )
-                .await;
-            }));
-        }
+    // Phase 2: agent lifecycle commands (create, shutdown).
+    let cmd = match dispatch_lifecycle_command(cmd, registry, chat_timeout, active_tasks) {
+        Ok(()) => return DispatchResult::Continue,
+        Err(cmd) => cmd,
+    };
+
+    // Phase 3: chat (has its own async dispatch path).
+    let cmd = match cmd {
         PyCommand::Chat {
             agent_id,
             prompt,
@@ -321,72 +308,22 @@ async fn dispatch_async_command(
                 inter_agent_delay,
             )
             .await;
+            return DispatchResult::Continue;
         }
-        PyCommand::ShutdownAgent { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                agent::handle_shutdown_agent(registry, chat_timeout, agent_id, reply).await;
-            }));
-        }
-        PyCommand::Cancel { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_cancel(registry, agent_id, reply).await;
-            }));
-        }
-        PyCommand::WaitForIdle { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_wait_for_idle(registry, agent_id, reply).await;
-            }));
-        }
-        PyCommand::ClearHistory { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_clear_history(registry, agent_id, reply).await;
-            }));
-        }
-        PyCommand::Send {
-            agent_id,
-            prompt,
-            reply,
-        } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_send(registry, agent_id, prompt, reply).await;
-            }));
-        }
-        PyCommand::SignalIdle { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_signal_idle(registry, agent_id, reply).await;
-            }));
-        }
-        PyCommand::WaitForWakeup {
-            agent_id,
-            timeout_secs,
-            reply,
-        } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_wait_for_wakeup(registry, agent_id, timeout_secs, reply).await;
-            }));
-        }
-        PyCommand::Delete { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_delete(registry, agent_id, reply).await;
-            }));
-        }
-        PyCommand::Disconnect { agent_id, reply } => {
-            let registry = registry.clone();
-            active_tasks.push(Box::pin(async move {
-                async_ops::handle_disconnect(registry, agent_id, reply).await;
-            }));
-        }
+        other => other,
+    };
+
+    // Phase 4: async agent operations (cancel, idle, send, etc.).
+    let cmd = match dispatch_agent_operation(cmd, registry, active_tasks) {
+        Ok(()) => return DispatchResult::Continue,
+        Err(cmd) => cmd,
+    };
+
+    // Phase 5: global commands.
+    match cmd {
         PyCommand::Shutdown => {
             tracing::info!("Shutdown command received, exiting async command loop");
-            return DispatchResult::Shutdown;
+            DispatchResult::Shutdown
         }
         // Query commands already handled by dispatch_query_command above.
         PyCommand::GetHistory { .. }
@@ -395,9 +332,130 @@ async fn dispatch_async_command(
         | PyCommand::GetLastTurnUsage { .. }
         | PyCommand::GetCompactionIndices { .. }
         | PyCommand::GetLastResponse { .. }
-        | PyCommand::IsIdle { .. } => {
-            unreachable!("handled by dispatch_query_command")
+        | PyCommand::IsIdle { .. }
+        // Lifecycle and chat already handled above.
+        | PyCommand::CreateAgent { .. }
+        | PyCommand::ShutdownAgent { .. }
+        | PyCommand::Chat { .. }
+        // Agent operations already handled above.
+        | PyCommand::Cancel { .. }
+        | PyCommand::WaitForIdle { .. }
+        | PyCommand::ClearHistory { .. }
+        | PyCommand::Send { .. }
+        | PyCommand::SignalIdle { .. }
+        | PyCommand::WaitForWakeup { .. }
+        | PyCommand::Delete { .. }
+        | PyCommand::Disconnect { .. } => {
+            unreachable!("all variants handled by earlier dispatch phases")
         }
     }
-    DispatchResult::Continue
+}
+
+/// Push a handler future into `active_tasks`, cloning shared state as needed.
+///
+/// Eliminates the repeated `registry.clone()` + `Box::pin(async move { … })`
+/// boilerplate that every spawned command arm requires.
+fn spawn_agent_task(
+    active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    active_tasks.push(Box::pin(fut));
+}
+
+/// Dispatch agent lifecycle commands: create and shutdown.
+///
+/// Returns `Ok(())` if handled, `Err(cmd)` if not a lifecycle command.
+fn dispatch_lifecycle_command(
+    cmd: PyCommand,
+    registry: &AgentRegistry,
+    chat_timeout: Duration,
+    active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+) -> Result<(), PyCommand> {
+    match cmd {
+        PyCommand::CreateAgent { config_json, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                agent::handle_create_agent(registry, chat_timeout, config_json, reply).await;
+            });
+        }
+        PyCommand::ShutdownAgent { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                agent::handle_shutdown_agent(registry, chat_timeout, agent_id, reply).await;
+            });
+        }
+        other => return Err(other),
+    }
+    Ok(())
+}
+
+/// Dispatch async agent operations: cancel, idle, send, signal, wakeup,
+/// clear history, delete, disconnect.
+///
+/// Returns `Ok(())` if handled, `Err(cmd)` if not an agent operation.
+fn dispatch_agent_operation(
+    cmd: PyCommand,
+    registry: &AgentRegistry,
+    active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+) -> Result<(), PyCommand> {
+    match cmd {
+        PyCommand::Cancel { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_cancel(registry, agent_id, reply).await;
+            });
+        }
+        PyCommand::WaitForIdle { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_wait_for_idle(registry, agent_id, reply).await;
+            });
+        }
+        PyCommand::ClearHistory { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_clear_history(registry, agent_id, reply).await;
+            });
+        }
+        PyCommand::Send {
+            agent_id,
+            prompt,
+            reply,
+        } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_send(registry, agent_id, prompt, reply).await;
+            });
+        }
+        PyCommand::SignalIdle { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_signal_idle(registry, agent_id, reply).await;
+            });
+        }
+        PyCommand::WaitForWakeup {
+            agent_id,
+            timeout_secs,
+            reply,
+        } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_wait_for_wakeup(registry, agent_id, timeout_secs, reply).await;
+            });
+        }
+        PyCommand::Delete { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_delete(registry, agent_id, reply).await;
+            });
+        }
+        PyCommand::Disconnect { agent_id, reply } => {
+            let registry = registry.clone();
+            spawn_agent_task(active_tasks, async move {
+                async_ops::handle_disconnect(registry, agent_id, reply).await;
+            });
+        }
+        other => return Err(other),
+    }
+    Ok(())
 }
