@@ -36,19 +36,27 @@
 //! `.await` points). This is the standard pattern for PyO3 FFI bridges that need to
 //! associate Rust state with Python-side identifiers.
 
-#![expect(clippy::useless_conversion)] // PyO3 #[pyfunction] wrapper generates .into() on PyErr
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{error::Error, quota::QuotaState};
 
+pub(crate) mod bridge_state;
 pub(crate) mod command_loop;
+pub(crate) mod ffi_dispatch;
 mod handlers;
 pub(crate) mod py_scripts;
 pub(crate) mod streaming;
 pub(crate) mod venv;
+
+// Re-export items used by sibling modules and external crate consumers.
+pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state};
+pub(crate) use ffi_dispatch::{
+    CREATE_AGENT_HOOK_GUARD, INITIALIZING_HOOK_RUNNER, dispatch_rust_hook,
+    dispatch_rust_policy_confirm, dispatch_rust_tool,
+};
 
 /// Safety-net timeout for a single `send_command` round-trip.
 ///
@@ -91,360 +99,6 @@ pub fn default_chat_timeout() -> Duration {
         })
     });
     Duration::from_secs(secs)
-}
-
-/// Opaque agent identifier returned by the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct AgentId(pub(crate) u64);
-
-impl std::fmt::Display for AgentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "agent-{}", self.0)
-    }
-}
-
-/// Per-agent state stored in the global [`BRIDGE_STATE`] registry.
-///
-/// Bundles all sidecar data that FFI callbacks need to look up by agent ID.
-/// Consolidating into one struct means a single lock acquisition covers all
-/// lookups/insertions/removals, preventing inconsistent partial state.
-pub(crate) struct AgentBridgeState {
-    /// Custom Rust tools registered for this agent.
-    pub(crate) registry: Option<Arc<crate::tools::ToolRegistry>>,
-    /// Lifecycle hooks for pre/post turn, tool-call gating, etc.
-    pub(crate) hook_runner: Option<Arc<crate::hooks::Hooks>>,
-    /// Policy rules governing tool-call permissions.
-    pub(crate) policies: crate::policies::PolicySet,
-    /// Interactive confirmation handler for `NeedsConfirmation` policies.
-    pub(crate) policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
-    /// Shared key-value state persisted across tool calls for this agent.
-    pub(crate) tool_state: Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
-}
-
-/// Single global registry of per-agent bridge state, keyed by agent ID.
-///
-/// # Lock choice
-///
-/// Uses `std::sync::RwLock` (not `tokio::sync::RwLock`) because the lock is
-/// held only for brief `HashMap` insert/remove/lookup operations and is never
-/// held across an `.await` point. This avoids the overhead of an async lock
-/// and is safe from deadlocks.
-///
-/// # Scalability
-///
-/// For typical agent counts (< ~100), `RwLock<HashMap>` provides sufficient
-/// throughput.  Read-side contention is bounded by the microsecond-scale lock
-/// duration.  If the bridge ever needs to support thousands of concurrent
-/// agents, replacing this with a `DashMap` would eliminate read-lock overhead
-/// entirely — but is unnecessary for current workloads.
-static BRIDGE_STATE: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>>,
-> = std::sync::OnceLock::new();
-
-/// Access the global per-agent bridge state registry.
-pub(crate) fn bridge_state()
--> &'static std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>> {
-    BRIDGE_STATE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
-}
-
-/// Fallback `Hooks` registry used during `create_agent` when the permanent entry is not yet registered.
-pub(crate) static INITIALIZING_HOOK_RUNNER: std::sync::Mutex<Option<Arc<crate::hooks::Hooks>>> =
-    std::sync::Mutex::new(None);
-
-/// Serializes `create_agent` calls that install a temporary hook runner in
-/// [`INITIALIZING_HOOK_RUNNER`], preventing concurrent creates from
-/// overwriting each other's fallback runner.
-pub(crate) static CREATE_AGENT_HOOK_GUARD: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
-
-/// Execute a hook by name, deserializing the context JSON and calling the
-/// appropriate method on the runner. Returns the serialized result (empty
-/// string for void hooks).
-fn dispatch_hook_by_name(
-    hook_runner: &crate::hooks::Hooks,
-    hook_point: &str,
-    context_json: &str,
-) -> Result<String, crate::error::Error> {
-    let mut result_json = String::new();
-    match hook_point {
-        "pre_turn" => {
-            let ctx = serde_json::from_str::<crate::hooks::PreTurnContext>(context_json).map_err(
-                |e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize PreTurnContext: {e}"),
-                },
-            )?;
-            hook_runner.run_pre_turn(&ctx);
-        }
-        "post_turn" => {
-            let ctx = serde_json::from_str::<crate::hooks::PostTurnContext>(context_json).map_err(
-                |e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize PostTurnContext: {e}"),
-                },
-            )?;
-            hook_runner.run_post_turn(&ctx);
-        }
-        "pre_tool_call_decide" => {
-            let ctx = serde_json::from_str::<crate::hooks::PreToolCallDecideContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize PreToolCallDecideContext: {e} | JSON was: {context_json}"),
-                })?;
-            let hook_result = hook_runner.run_pre_tool_call_decide(&ctx);
-            result_json = serde_json::to_string(&hook_result).map_err(|e| {
-                crate::error::Error::BackendError {
-                    message: format!("Failed to serialize PreToolCallDecide result: {e}"),
-                }
-            })?;
-        }
-        "post_tool_call" => {
-            let ctx = serde_json::from_str::<crate::hooks::PostToolCallContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!(
-                        "Failed to deserialize PostToolCallContext: {e} | JSON was: {context_json}"
-                    ),
-                })?;
-            hook_runner.run_post_tool_call(&ctx);
-        }
-        "on_compaction" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnCompactionContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnCompactionContext: {e}"),
-                })?;
-            hook_runner.run_on_compaction(&ctx);
-        }
-        "on_session_start" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnSessionStartContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnSessionStartContext: {e}"),
-                })?;
-            hook_runner.run_on_session_start(&ctx);
-        }
-        "on_session_end" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnSessionEndContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnSessionEndContext: {e}"),
-                })?;
-            hook_runner.run_on_session_end(&ctx);
-        }
-        "on_tool_error" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnToolErrorContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnToolErrorContext: {e}"),
-                })?;
-            hook_runner.run_on_tool_error(&ctx);
-        }
-        "on_interaction" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnInteractionContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnInteractionContext: {e}"),
-                })?;
-            let hook_result = hook_runner.run_on_interaction(&ctx);
-            result_json = serde_json::to_string(&hook_result).map_err(|e| {
-                crate::error::Error::BackendError {
-                    message: format!("Failed to serialize OnInteraction result: {e}"),
-                }
-            })?;
-        }
-        _ => {
-            tracing::warn!("Unknown hook point: {}", hook_point);
-        }
-    }
-    Ok(result_json)
-}
-
-/// Dispatches a Rust hook call from the Python thread.
-#[pyfunction]
-pub(crate) fn dispatch_rust_hook(
-    py: Python<'_>,
-    agent_id: u64,
-    hook_point: String,
-    context_json: String,
-) -> PyResult<Bound<'_, PyAny>> {
-    tracing::debug!(agent_id, hook_point = %hook_point, "dispatch_rust_hook called from Python");
-    let hook_runner = {
-        let map = bridge_state().read().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
-        })?;
-        if let Some(entry) = map.get(&agent_id) {
-            let runner = entry.hook_runner.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "No active Hooks found for agent ID {agent_id}"
-                ))
-            })?;
-            Arc::clone(runner)
-        } else {
-            let opt = INITIALIZING_HOOK_RUNNER.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to lock INITIALIZING_HOOK_RUNNER: {e}"
-                ))
-            })?;
-            if let Some(ref runner) = *opt {
-                Arc::clone(runner)
-            } else {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "No active bridge state or initializing hook runner found for agent ID {agent_id}"
-                )));
-            }
-        }
-    };
-
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        // SAFETY CONSTRAINT: Hooks dispatched here MUST NOT acquire the Python
-        // GIL. The Python thread (which holds the GIL) is blocked waiting for
-        // this future to complete via `future_into_py`. Acquiring the GIL from
-        // a blocking thread would deadlock.
-        let result = tokio::task::spawn_blocking(move || {
-            dispatch_hook_by_name(&hook_runner, &hook_point, &context_json)
-        })
-        .await
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Hook execution failed: {e}"))
-        })?
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-        Ok(result)
-    })
-}
-
-#[pyfunction]
-pub(crate) fn dispatch_rust_policy_confirm(
-    py: Python<'_>,
-    agent_id: u64,
-    tool_name: String,
-    args_json: String,
-) -> PyResult<Bound<'_, PyAny>> {
-    tracing::info!(agent_id, tool = %tool_name, "dispatch_rust_policy_confirm called from Python");
-    let policy_handler = {
-        let map = bridge_state().read().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
-        })?;
-        let entry = map.get(&agent_id).ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "No active bridge state found for agent ID {agent_id}"
-            ))
-        })?;
-        let handler = entry.policy_handler.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "No active AskUserHandler found for agent ID {agent_id}"
-            ))
-        })?;
-        Arc::clone(handler)
-    };
-
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        // SAFETY CONSTRAINT: Handlers dispatched here MUST NOT acquire the Python
-        // GIL. The Python thread is blocked waiting for this future.
-        let args_val: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "Failed to parse policy args JSON: {e}"
-            ))
-        })?;
-        let result =
-            tokio::task::spawn_blocking(move || policy_handler.confirm(&tool_name, &args_val))
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Policy confirmation panicked: {e}"
-                    ))
-                })?;
-
-        Ok(result)
-    })
-}
-
-/// Evaluates policies and registered handlers to check if a tool execution is allowed.
-pub(crate) fn check_tool_execution_allowed(
-    agent_id: u64,
-    name: &str,
-    args_json: &str,
-) -> Result<bool, crate::error::Error> {
-    let map = bridge_state()
-        .read()
-        .map_err(|e| crate::error::Error::BackendError {
-            message: format!("Failed to read BRIDGE_STATE: {e}"),
-        })?;
-
-    let Some(state) = map.get(&agent_id) else {
-        return Ok(false);
-    };
-
-    let (is_allowed, needs_confirm) = match state.policies.evaluate(name) {
-        crate::policies::PolicyDecision::Allow => (true, false),
-        crate::policies::PolicyDecision::Deny => (false, false),
-        crate::policies::PolicyDecision::NeedsConfirmation { .. } => (false, true),
-    };
-
-    if is_allowed {
-        return Ok(true);
-    }
-
-    if needs_confirm && let Some(ref handler) = state.policy_handler {
-        let handler = Arc::clone(handler);
-        // Drop the lock before calling the handler (it may block).
-        drop(map);
-        let args_val: serde_json::Value =
-            serde_json::from_str(args_json).map_err(|e| crate::error::Error::BackendError {
-                message: format!("Failed to parse policy args JSON: {e}"),
-            })?;
-        return Ok(handler.confirm(name, &args_val));
-    }
-
-    Ok(false)
-}
-
-/// Dispatches a Rust tool call from the Python thread.
-///
-/// Called by `AsyncRustProxy.__call__` in the Python SDK. Uses the stored
-/// tokio `Handle` to `block_on` the async `ToolRegistry::dispatch`, which
-/// is safe because this function runs on the Python thread (not a tokio worker).
-#[pyfunction]
-fn dispatch_rust_tool<'py>(
-    py: Python<'py>,
-    agent_id: u64,
-    name: String,
-    args_json: &str,
-) -> PyResult<Bound<'py, PyAny>> {
-    tracing::info!(agent_id, tool = %name, "dispatch_rust_tool called from Python (async)");
-
-    // Evaluate policies before tool dispatch
-    let is_allowed = check_tool_execution_allowed(agent_id, &name, args_json)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    if !is_allowed {
-        return Err(pyo3::exceptions::PyPermissionError::new_err(format!(
-            "Tool '{name}' execution blocked by agent policy rules"
-        )));
-    }
-
-    let (registry, tool_state) = {
-        let map = bridge_state().read().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
-        })?;
-        let entry = map.get(&agent_id).ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "No active bridge state found for agent ID {agent_id}"
-            ))
-        })?;
-        let registry = entry.registry.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "No active ToolRegistry found for agent ID {agent_id}"
-            ))
-        })?;
-        (Arc::clone(registry), Arc::clone(&entry.tool_state))
-    };
-
-    let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Failed to parse tool arguments JSON: {e}"))
-    })?;
-
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let ctx = crate::tools::ToolContext::with_shared_state(None, tool_state);
-        let output = registry
-            .dispatch(&name, args, &ctx)
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        // Extract the text content for the Python SDK — metadata stays Rust-side.
-        Ok(output.into_content())
-    })
 }
 
 /// Commands sent from Rust to the Python thread.
@@ -663,8 +317,6 @@ impl PythonRuntime {
         is_llm_op: bool,
         build_cmd: impl FnOnce(oneshot::Sender<Result<T, Error>>) -> PyCommand,
     ) -> Result<T, Error> {
-        self.quota_state.wait_for_quota().await;
-
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = build_cmd(reply_tx);
 
@@ -1143,7 +795,9 @@ impl crate::agent::Runtime for PythonRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
+    use super::{ffi_dispatch::check_tool_execution_allowed, *};
 
     fn test_config() -> RuntimeConfig {
         RuntimeConfig {

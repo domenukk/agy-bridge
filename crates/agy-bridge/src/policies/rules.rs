@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn traversal_relative_dotdot_beyond_start() {
+    fn traversal_relative_dotdot_above_start() {
         // Relative path: trying to go above start should stop.
         let p = normalize_path(std::path::Path::new("a/../../b"));
         assert_eq!(p, PathBuf::from("b"));

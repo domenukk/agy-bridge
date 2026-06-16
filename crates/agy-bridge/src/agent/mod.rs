@@ -70,11 +70,6 @@ pub trait Runtime: Send + Sync {
         timeout: std::time::Duration,
     ) -> Result<bool, Error>;
 
-    /// Acquire a keep-alive permit during quota waits.
-    async fn acquire_quota_keep_alive_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        None
-    }
-
     /// Wait if we're in a quota backoff period.
     async fn wait_for_quota(&self);
 
@@ -207,7 +202,6 @@ impl<R: Runtime> AgentHandle<R> {
     ) -> Result<Self, Error> {
         let quota_key = config.effective_api_key().unwrap_or_default();
         let quota_state = runtime.quota_registry().state_for_key(&quota_key);
-        quota_state.wait_for_quota().await;
         let id = if hook_runner.is_some() {
             // Serialize the set→create→clear sequence so concurrent creates
             // cannot overwrite each other's temporary hook runner.
@@ -288,19 +282,25 @@ impl<R: Runtime> AgentHandle<R> {
         }
 
         let content = content.into();
+        let max_retries = self.config.max_quota_retries.unwrap_or(0);
 
-        let permit = self.runtime.acquire_quota_keep_alive_permit().await;
-
-        let mut handle = 'retry: {
-            for attempt in 0..=Self::MAX_QUOTA_RETRIES {
-                self.quota_state.wait_for_quota().await;
+        let handle = 'retry: {
+            for attempt in 0..=max_retries {
+                if attempt > 0 {
+                    self.quota_state.wait_for_quota().await;
+                }
                 match self.runtime.chat(self.id, &content).await {
                     Ok(h) => break 'retry h,
                     Err(Error::QuotaExceeded { retry_after }) => {
-                        self.handle_quota_error("chat", attempt, retry_after)?;
+                        self.handle_quota_error("chat", attempt, max_retries, retry_after)?;
                     }
                     Err(ref e) if e.is_quota_error() => {
-                        self.handle_quota_error("chat", attempt, DEFAULT_QUOTA_BACKOFF)?;
+                        self.handle_quota_error(
+                            "chat",
+                            attempt,
+                            max_retries,
+                            DEFAULT_QUOTA_BACKOFF,
+                        )?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -310,7 +310,6 @@ impl<R: Runtime> AgentHandle<R> {
             });
         };
 
-        handle.keep_alive_permit = permit;
         if let Ok(mut guard) = self.last_shared_state.lock() {
             *guard = Some(Arc::clone(&handle.shared_state));
         } else {
@@ -331,33 +330,17 @@ impl<R: Runtime> AgentHandle<R> {
     /// Returns [`Error`] if the chat turn fails or stream errors occur.
     pub async fn chat_text(&self, message: impl Into<Content>) -> Result<String, Error> {
         let response = self.chat(message.into()).await?;
-        self.drain_text_with_retry(response).await
-    }
-
-    /// Drain text from a [`ChatResponseHandle`], retrying on 429 quota errors.
-    async fn drain_text_with_retry(&self, response: ChatResponseHandle) -> Result<String, Error> {
-        match response.text().await {
-            Ok(result) => Ok(result.into_string()),
-            Err(e)
-                if e.message.contains("429")
-                    || e.message.contains("503")
-                    || e.message.contains("RESOURCE_EXHAUSTED") =>
-            {
-                Err(Error::QuotaExceeded {
-                    retry_after: DEFAULT_QUOTA_BACKOFF,
-                })
-            }
-            Err(e) => {
-                let converted = Error::from(e);
-                if matches!(converted, Error::Safety) {
-                    Err(converted)
-                } else {
-                    Err(Error::BackendError {
-                        message: format!("Failed to read response text: {converted}"),
-                    })
+        let text = response.text().await.map_err(|e| {
+            let converted = Error::from(e);
+            if matches!(converted, Error::Safety) {
+                converted
+            } else {
+                Error::BackendError {
+                    message: format!("Failed to read response text: {converted}"),
                 }
             }
-        }
+        })?;
+        Ok(text.into_string())
     }
 
     /// Return the current conversation ID, if one has been set.
@@ -602,15 +585,19 @@ impl<R: Runtime> AgentHandle<R> {
 
         let content = content.into();
 
-        for attempt in 0..=Self::MAX_QUOTA_RETRIES {
-            self.quota_state.wait_for_quota().await;
+        let max_retries = self.config.max_quota_retries.unwrap_or(0);
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                self.quota_state.wait_for_quota().await;
+            }
             match self.runtime.send(self.id, &content).await {
                 Ok(()) => return Ok(()),
                 Err(Error::QuotaExceeded { retry_after }) => {
-                    self.handle_quota_error("send", attempt, retry_after)?;
+                    self.handle_quota_error("send", attempt, max_retries, retry_after)?;
                 }
                 Err(ref e) if e.is_quota_error() => {
-                    self.handle_quota_error("send", attempt, DEFAULT_QUOTA_BACKOFF)?;
+                    self.handle_quota_error("send", attempt, max_retries, DEFAULT_QUOTA_BACKOFF)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -639,26 +626,21 @@ impl<R: Runtime> AgentHandle<R> {
         self.runtime.wait_for_wakeup(self.id, timeout).await
     }
 
-    /// Maximum number of quota retry attempts before giving up.
-    const MAX_QUOTA_RETRIES: u32 = 120;
-
     /// Handle a quota/429 error from a retryable operation.
-    ///
-    /// Returns `Ok(())` if the caller should retry, or `Err` if retries
-    /// are exhausted.
     fn handle_quota_error(
         &self,
         operation: &str,
         attempt: u32,
+        max_retries: u32,
         retry_after: std::time::Duration,
     ) -> Result<(), Error> {
-        if attempt == Self::MAX_QUOTA_RETRIES {
+        if attempt >= max_retries {
             return Err(Error::QuotaExceeded { retry_after });
         }
         tracing::warn!(
             agent_id = self.id,
             attempt = attempt + 1,
-            max = Self::MAX_QUOTA_RETRIES,
+            max = max_retries,
             retry_after_ms = u64::try_from(retry_after.as_millis()).unwrap_or_else(|e| {
                 tracing::warn!("Int conversion failed: {e}");
                 u64::MAX

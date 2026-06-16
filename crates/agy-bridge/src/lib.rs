@@ -534,6 +534,13 @@ impl AgentBuilder<'_> {
         self
     }
 
+    /// Set the maximum number of quota retry attempts before giving up.
+    #[must_use]
+    pub fn max_quota_retries(mut self, retries: u32) -> Self {
+        self.config.max_quota_retries = Some(retries);
+        self
+    }
+
     /// Validate configuration and create the agent.
     ///
     /// Prefer using `.await` directly on the builder (via [`IntoFuture`])

@@ -82,6 +82,29 @@ impl QuotaRegistry {
                 .or_insert_with(|| Arc::new(QuotaState::new())),
         )
     }
+
+    /// Aggregate quota status across all keys in this registry.
+    ///
+    /// Returns a tuple of `(max_consecutive_429s, is_any_throttled)`.
+    #[must_use]
+    pub fn aggregate_status(&self) -> (u32, bool) {
+        let map = self.inner.read().unwrap_or_else(|e| {
+            tracing::error!("QuotaRegistry poisoned: {e}");
+            e.into_inner()
+        });
+
+        let mut max_429s = 0;
+        let mut throttled = false;
+
+        for state in map.values() {
+            max_429s = max_429s.max(state.consecutive_429_count());
+            if state.is_throttled() {
+                throttled = true;
+            }
+        }
+
+        (max_429s, throttled)
+    }
 }
 
 /// Inner state protected by a single mutex to ensure atomicity of
@@ -250,6 +273,23 @@ impl QuotaState {
                     "QuotaState mutex poisoned in consecutive_429_count — returning 0"
                 );
                 0
+            }
+        }
+    }
+
+    /// Check whether this state is currently in a backoff period.
+    #[must_use]
+    pub fn is_throttled(&self) -> bool {
+        match self.inner.lock() {
+            Ok(guard) => guard
+                .backoff_until
+                .is_some_and(|until| until > tokio::time::Instant::now()),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "QuotaState mutex poisoned in is_throttled — returning false"
+                );
+                false
             }
         }
     }

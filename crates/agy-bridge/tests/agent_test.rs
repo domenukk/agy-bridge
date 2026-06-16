@@ -104,10 +104,6 @@ impl agy_bridge::agent::Runtime for MockRuntime {
 
     async fn record_quota_hit(&self, _retry_after: std::time::Duration) {}
 
-    async fn acquire_quota_keep_alive_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        None
-    }
-
     async fn history(
         &self,
         _agent_id: agy_bridge::agent::AgentId,

@@ -126,6 +126,11 @@ pub struct GeminiConfig {
     /// Shared API key for all models. Falls back to `$GEMINI_API_KEY` env var.
     /// Individual `ModelEntry` instances can override this.
     pub api_key: Option<String>,
+    /// Base URL for the Gemini API endpoint.
+    /// When set, overrides the default Gemini API endpoint (e.g., for a local
+    /// proxy, staging environment, or alternative API-compatible gateway).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// Per-modality model selection and configuration.
     #[serde(default)]
     pub models: ModelConfig,
@@ -135,6 +140,7 @@ impl std::fmt::Debug for GeminiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GeminiConfig")
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("base_url", &self.base_url)
             .field("models", &self.models)
             .finish()
     }
@@ -215,6 +221,7 @@ mod tests {
     fn gemini_config_serde_roundtrip() {
         let config = GeminiConfig {
             api_key: Some("global-key".to_string()),
+            base_url: None,
             models: ModelConfig {
                 default: ModelEntry {
                     name: "gemini-3.5-flash".to_string(),
@@ -227,6 +234,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GeminiConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.api_key.as_deref(), Some("global-key"));
+        assert!(parsed.base_url.is_none());
         assert_eq!(parsed.models.default.name, "gemini-3.5-flash");
     }
 

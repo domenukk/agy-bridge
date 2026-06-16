@@ -227,6 +227,12 @@ pub struct AgentConfig {
     #[serde(default, rename = "gemini_config")]
     #[builder(setter(strip_option))]
     pub gemini: Option<GeminiConfig>,
+    /// Maximum number of quota retry attempts before giving up.
+    ///
+    /// If `None`, defaults to 0 (no retries).
+    #[serde(default)]
+    #[builder(setter(into, strip_option))]
+    pub max_quota_retries: Option<u32>,
 }
 
 impl Default for AgentConfig {
@@ -346,6 +352,7 @@ mod tests {
     fn agent_config_builder_with_gemini() {
         let gemini = GeminiConfig {
             api_key: Some("test-key".to_string()),
+            base_url: None,
             models: ModelConfig::default(),
         };
         let config = AgentConfig::builder().gemini(gemini).build();
@@ -358,6 +365,7 @@ mod tests {
     fn agent_config_builder_gemini_with_thinking_level() {
         let gemini = GeminiConfig {
             api_key: None,
+            base_url: None,
             models: ModelConfig {
                 default: ModelEntry {
                     name: "gemini-3.5-flash".to_string(),
@@ -389,6 +397,7 @@ mod tests {
         let config = AgentConfig {
             gemini: Some(GeminiConfig {
                 api_key: Some("roundtrip-key".to_string()),
+                base_url: None,
                 models: ModelConfig {
                     default: ModelEntry {
                         name: "gemini-3.5-flash".to_string(),
@@ -824,6 +833,7 @@ mod tests {
             .api_key("top-level-key")
             .gemini(super::super::GeminiConfig {
                 api_key: Some("shared-key".into()),
+                base_url: None,
                 models: super::super::ModelConfig {
                     default: super::super::ModelEntry {
                         name: "gemini-3.5-flash".into(),

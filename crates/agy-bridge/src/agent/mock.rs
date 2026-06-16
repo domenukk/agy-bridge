@@ -274,12 +274,17 @@ mod tests {
         }
     }
 
+    const TEST_MAX_QUOTA_RETRIES: u32 = 1000;
+
     #[tokio::test]
     async fn chat_with_quota_backoff_retries() {
         let rt = Arc::new(ToolAwareMockRuntime::new());
         rt.fail_quota.store(true, Ordering::SeqCst);
 
-        let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+        let config = AgentConfig::builder()
+            .max_quota_retries(TEST_MAX_QUOTA_RETRIES)
+            .build();
+        let agent = AgentHandle::new(Arc::clone(&rt), config, None, None, None)
             .await
             .expect("create should succeed");
 

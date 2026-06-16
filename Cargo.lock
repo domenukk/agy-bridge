@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agy-bridge"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "base64",
  "fast_rands",
@@ -289,9 +289,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-tool"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093be5183ff4332a909be773377dc7a245a61d962136831bad516bea310cea97"
+checksum = "18e7a85f081664029a7d432ac79670e50ba46680b551d25387f071b29ddd1fa3"
 dependencies = [
  "llm-tool-macros",
  "schemars",
@@ -302,9 +302,9 @@ dependencies = [
 
 [[package]]
 name = "llm-tool-macros"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b7810f8229117bf62f5ded24543178bb005a4adb0ae5e5db5b9c499464ea83c"
+checksum = "43ebcdacdf2f84f52d745b7ba880d442ccd08439acbfb349cc78c7392bc25fb7"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -602,6 +602,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "socket2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -662,6 +672,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
+ "socket2",
  "tokio-macros",
  "windows-sys",
 ]

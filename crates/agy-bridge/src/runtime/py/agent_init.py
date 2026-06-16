@@ -570,12 +570,91 @@ def init_agent(config_json, agent_id_u64, agent_cls):
     if "gemini_config" in local_config and local_config["gemini_config"] is None:
         local_config.pop("gemini_config")
 
+    # --- Handle custom base_url routing ---
+    # When a custom base_url is set (e.g., local proxy, alternative gateway),
+    # inject it into the harness config proto at connection time.
+    #
+    # IMPORTANT: The monkey-patch must be per-instance, not per-class.
+    # Multiple agents in the same process may use different base_urls
+    # (or no base_url at all). We use a registry keyed by strategy instance
+    # id to look up the correct URL.
+    custom_base_url = None
+    if "gemini_config" in local_config and local_config["gemini_config"]:
+        custom_base_url = local_config["gemini_config"].pop("base_url", None)
+
+    if custom_base_url:
+        # When routing through a proxy/gateway that handles auth (e.g., via
+        # LOAS, mTLS, or bearer tokens), no API key is needed.  Set a
+        # sentinel so the SDK's API key validation passes.
+        if "gemini_config" in local_config and local_config["gemini_config"]:
+            if not local_config["gemini_config"].get("api_key"):
+                local_config["gemini_config"]["api_key"] = "LOAS"
+
+        from google.antigravity.connections.local.local_connection import (
+            LocalConnectionStrategy,
+        )
+
+        # Per-instance registry: maps strategy id() → base_url.
+        # The class-level patch is installed once and dispatches
+        # per-instance using this registry.
+        if not hasattr(LocalConnectionStrategy, "_base_url_registry"):
+            LocalConnectionStrategy._base_url_registry = {}
+            _original_build = LocalConnectionStrategy._build_harness_config
+
+            def _patched_build(self):
+                config = _original_build(self)
+                url = LocalConnectionStrategy._base_url_registry.get(id(self))
+                if url:
+                    config.gemini_config.base_url = url
+                    if config.gemini_config.api_key == "LOAS":
+                        config.gemini_config.ClearField("api_key")
+                        logger.info(
+                            "Injected base_url=%s into harness config (auth sentinel cleared)",
+                            url,
+                        )
+                    else:
+                        logger.info(
+                            "Injected base_url=%s into harness config (real api_key kept)",
+                            url,
+                        )
+                return config
+
+            LocalConnectionStrategy._build_harness_config = _patched_build
+
+            # Also patch __init__ to register from the pending queue
+            _original_strategy_init = LocalConnectionStrategy.__init__
+
+            def _patched_strategy_init(self, *args, **kwargs):
+                _original_strategy_init(self, *args, **kwargs)
+                # Consume the pending base_url (set by _agent_lifecycle just
+                # before __aenter__) and associate it with this instance.
+                pending = getattr(LocalConnectionStrategy, "_pending_base_url", None)
+                if pending is not None:
+                    LocalConnectionStrategy._base_url_registry[id(self)] = pending
+                    LocalConnectionStrategy._pending_base_url = None
+
+            LocalConnectionStrategy.__init__ = _patched_strategy_init
+
+    # The Rust AgentConfig always serializes a `model` field (it's a required
+    # String, not Option).  The SDK's LocalAgentConfig validator rejects configs
+    # that set *both* the top-level `model` shorthand and
+    # `gemini_config.models.default`.  When gemini_config carries the model via
+    # `models.default`, drop the redundant top-level key.
+    if "gemini_config" in local_config and local_config.get("gemini_config"):
+        local_config.pop("model", None)
+
     from google.antigravity.connections.local.local_connection_config import (
         LocalAgentConfig,
     )
 
     config = LocalAgentConfig(triggers=sdk_triggers, **local_config)
     agent = agent_cls(config)
+
+    # Store the base_url on the agent object so _agent_lifecycle can
+    # set _pending_base_url at the right time (on the event loop thread,
+    # right before __aenter__).
+    if custom_base_url:
+        agent._agy_pending_base_url = custom_base_url
 
     import asyncio
 
@@ -585,6 +664,22 @@ def init_agent(config_json, agent_id_u64, agent_cls):
 
     async def _agent_lifecycle():
         try:
+            # Set _pending_base_url HERE, on the event loop thread, right
+            # before __aenter__. This avoids the race where another
+            # init_agent() call on the Python thread could overwrite it.
+            #
+            # The asyncio event loop is single-threaded and cooperative:
+            # no other coroutine can interleave between setting the pending
+            # URL and the strategy's __init__ consuming it during __aenter__.
+            pending_url = getattr(agent, "_agy_pending_base_url", None)
+            if pending_url is not None:
+                from google.antigravity.connections.local.local_connection import (
+                    LocalConnectionStrategy,
+                )
+
+                LocalConnectionStrategy._pending_base_url = pending_url
+                delattr(agent, "_agy_pending_base_url")
+
             async with agent:
                 result_holder["instance"] = agent
                 enter_event.set()
