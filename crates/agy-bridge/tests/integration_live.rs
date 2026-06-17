@@ -1203,3 +1203,54 @@ for line in sys.stdin:
         })
     });
 }
+
+#[derive(serde::Serialize, serde::Deserialize, agy_bridge::tools::JsonSchema)]
+struct MetadataTestResponse {
+    result: String,
+    some_code: i32,
+}
+
+#[llm_tool::llm_tool(description = "Test tool that returns structured data metadata")]
+fn structured_metadata_tool() -> Result<MetadataTestResponse, ToolError> {
+    Ok(MetadataTestResponse {
+        result: "Structured metadata works".into(),
+        some_code: 42,
+    })
+}
+
+#[test]
+fn live_rust_tool_metadata() {
+    common::run_live_test("live_rust_tool_metadata", || {
+        let _api_key = api_key();
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            use std::sync::{Arc, Mutex};
+            let metadata_capture = Arc::new(Mutex::new(serde_json::Value::Null));
+            let capture_clone = Arc::clone(&metadata_capture);
+
+            let mut hooks = agy_bridge::hooks::Hooks::new();
+            hooks.on_post_tool_call("capture_meta", move |ctx| {
+                if ctx.tool_name == "structured_metadata_tool" {
+                    *capture_clone.lock().unwrap() = ctx.metadata.clone();
+                }
+            });
+
+            let bridge = create_bridge();
+            let mut registry = ToolRegistry::new();
+            registry.register(StructuredMetadataTool);
+            let config = agy_bridge::config::AgentConfig::builder()
+                .system_instructions("Always call structured_metadata_tool and repeat its output")
+                .policies([agy_bridge::policies::PolicyRule::AllowAll])
+                .build();
+            let agent = bridge.agent(config).tools(registry).hooks(hooks).await?;
+            
+            let _text = agent.chat_text("Call structured_metadata_tool and tell me the result").await?;
+            
+            let meta = metadata_capture.lock().unwrap().clone();
+            assert_eq!(meta["some_code"], 42, "metadata should contain some_code");
+            assert_eq!(meta["result"], "Structured metadata works", "metadata should contain result");
+            Ok(())
+        })
+    })
+}

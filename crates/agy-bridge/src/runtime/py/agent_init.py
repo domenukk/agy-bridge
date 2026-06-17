@@ -70,6 +70,20 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                 self._real_current_turn_context = None
 
             LocalConnection.__init__ = patched_init
+
+            original_tool_result_to_dict = LocalConnection._tool_result_to_dict
+
+            def patched_tool_result_to_dict(self, result):
+                if result.error is not None:
+                    return {"error": result.error}
+
+                output = result.result
+                if isinstance(output, dict) and "content" in output:
+                    return {"result": output["content"]}
+
+                return original_tool_result_to_dict(self, result)
+
+            LocalConnection._tool_result_to_dict = patched_tool_result_to_dict
             LocalConnection._is_monkeypatched = True
     except Exception as e:
         logger.warning("Failed to apply LocalConnection monkeypatch: %s", e)
@@ -287,7 +301,29 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                                     tool_args = tool_args.dict()
 
                                 result_val = getattr(ctx, "result", None)
-                                if result_val is None:
+                                result_str = ""
+                                metadata = {}
+                                if result_val is not None:
+                                    if isinstance(result_val, dict) and "content" in result_val:
+                                        result_str = result_val["content"]
+                                        metadata = result_val.get("metadata", {})
+                                    else:
+                                        tool_output = getattr(result_val, "result", None)
+                                        if isinstance(tool_output, dict) and "content" in tool_output:
+                                            result_str = tool_output["content"]
+                                            metadata = tool_output.get("metadata", {})
+                                        else:
+                                            try:
+                                                if hasattr(result_val, "model_dump_json"):
+                                                    result_str = result_val.model_dump_json()
+                                                elif hasattr(result_val, "model_dump"):
+                                                    result_str = json.dumps(
+                                                        result_val.model_dump()
+                                                    )
+                                                else:
+                                                    result_str = json.dumps(result_val)
+                                            except Exception:
+                                                result_str = str(result_val)
                                     result_str = ""
                                 elif isinstance(result_val, str):
                                     result_str = result_val
@@ -314,6 +350,7 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                                     "name": tool_name,
                                     "args": tool_args,
                                     "result": result_str,
+                                    "metadata": metadata,
                                 }
                                 ctx_json = json.dumps(payload)
                             elif point_label == "on_tool_error":
