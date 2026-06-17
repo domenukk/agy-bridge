@@ -308,7 +308,14 @@ pub(crate) fn dispatch_rust_tool<'py>(
             .dispatch(&name, args, &ctx)
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        // Extract the text content for the Python SDK — metadata stays Rust-side.
-        Ok(output.into_content())
+        let res = Python::with_gil(|py| -> PyResult<PyObject> {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("content", output.content())?;
+            let metadata_val = pythonize::pythonize(py, output.metadata())?;
+            dict.set_item("metadata", metadata_val)?;
+            Ok(dict.into_py(py))
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(res)
     })
 }

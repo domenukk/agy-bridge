@@ -290,8 +290,6 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "llm-tool"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e7a85f081664029a7d432ac79670e50ba46680b551d25387f071b29ddd1fa3"
 dependencies = [
  "llm-tool-macros",
  "schemars",
@@ -303,8 +301,6 @@ dependencies = [
 [[package]]
 name = "llm-tool-macros"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43ebcdacdf2f84f52d745b7ba880d442ccd08439acbfb349cc78c7392bc25fb7"
 dependencies = [
  "convert_case",
  "proc-macro2",

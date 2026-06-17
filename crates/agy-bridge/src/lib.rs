@@ -228,10 +228,13 @@ pub type Agent = agent::AgentHandle<runtime::PythonRuntime>;
 ///
 /// // Create an agent (simple):
 /// // let agent = bridge.agent(AgentConfig::default()).await?;
+/// # let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+/// # let project_root = manifest_dir.parent().unwrap().parent().unwrap();
 /// # let agent = bridge.agent(
 /// #     AgentConfig::builder()
 /// #         .system_instructions("Reply with 'Hello!' and nothing else. Never use tools.")
 /// #         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+/// #         .workspaces(vec![project_root])
 /// #         .build()
 /// # ).await?;
 ///

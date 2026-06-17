@@ -133,6 +133,9 @@ pub struct PostToolCallContext {
     pub tool_args: serde_json::Value,
     /// The tool's return value (serialised).
     pub result: String,
+    /// Structured metadata from the tool response (if any).
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// Context passed to [`HookPoint::OnToolError`] hooks.

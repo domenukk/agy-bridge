@@ -117,6 +117,7 @@ fn hook_runner_post_tool_call_receives_result() {
         tool_name: "read_file".into(),
         tool_args: serde_json::json!({"path": "/tmp/x"}),
         result: "file contents here".into(),
+        metadata: serde_json::Value::Null,
     });
 
     assert_eq!(*captured.lock().unwrap(), "file contents here");
@@ -401,6 +402,7 @@ fn convenience_on_post_tool_call() {
         tool_name: "t".into(),
         tool_args: serde_json::Value::Null,
         result: "done".into(),
+        metadata: serde_json::Value::Null,
     });
     assert_eq!(*captured.lock().unwrap(), "done");
 }
