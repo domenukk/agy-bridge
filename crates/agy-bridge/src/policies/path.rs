@@ -156,4 +156,69 @@ mod tests {
         let p = PathBuf::from("/workspace/src/main.rs");
         assert!(is_path_in_workspace(p, &workspaces));
     }
+
+    // ── canonicalize_path ───────────────────────────────────────────
+
+    #[test]
+    fn canonicalize_path_returns_absolute_for_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = canonicalize_path(dir.path()).unwrap();
+        assert!(result.is_absolute());
+    }
+
+    #[test]
+    fn canonicalize_path_resolves_dot_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("sub");
+        std::fs::create_dir(&child).unwrap();
+        let with_dotdot = child.join("..");
+        let result = canonicalize_path(&with_dotdot).unwrap();
+        let expected = canonicalize_path(dir.path()).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn canonicalize_path_errors_on_nonexistent_path() {
+        let err =
+            canonicalize_path(Path::new("/tmp/agy_bridge_test_nonexistent_9x7z")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn canonicalize_path_resolves_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_file = dir.path().join("real.txt");
+        std::fs::write(&real_file, b"data").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        let resolved = canonicalize_path(&link).unwrap();
+        let expected = canonicalize_path(&real_file).unwrap();
+        assert_eq!(resolved, expected);
+    }
+
+    // ── normalize_path ──────────────────────────────────────────────
+
+    #[test]
+    fn normalize_path_removes_dot() {
+        let result = normalize_path(Path::new("/a/./b/./c"));
+        assert_eq!(result, PathBuf::from("/a/b/c"));
+    }
+
+    #[test]
+    fn normalize_path_resolves_parent() {
+        let result = normalize_path(Path::new("/a/b/../c"));
+        assert_eq!(result, PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn normalize_path_does_not_go_above_root() {
+        let result = normalize_path(Path::new("/a/../../b"));
+        assert_eq!(result, PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn normalize_path_preserves_absolute_simple_path() {
+        let result = normalize_path(Path::new("/usr/local/bin"));
+        assert_eq!(result, PathBuf::from("/usr/local/bin"));
+    }
 }

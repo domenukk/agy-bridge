@@ -8,7 +8,7 @@
 //! The actual Python wrapping (creating `PyO3` classes that the SDK dispatches to)
 //! requires the Python runtime and is gated behind integration tests.
 
-use std::time::Instant;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -63,9 +63,8 @@ pub struct SessionContext {
     pub session_id: String,
     /// Numeric agent identifier within the bridge runtime.
     pub agent_id: u64,
-    /// Monotonic timestamp of when the session was started.
-    #[serde(skip, default = "std::time::Instant::now")]
-    pub started_at: Instant,
+    /// Wall-clock timestamp of when the session was started.
+    pub started_at: SystemTime,
 }
 
 /// Context passed to [`HookPoint::OnSessionStart`] hooks.
@@ -83,6 +82,7 @@ pub struct OnSessionEndContext {
 }
 
 /// Context passed to [`HookPoint::OnCompaction`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnCompactionContext {}
 
@@ -766,7 +766,7 @@ mod tests {
         let ctx = SessionContext {
             session_id: "sess-1".into(),
             agent_id: 42,
-            started_at: Instant::now(),
+            started_at: SystemTime::now(),
         };
         let cloned = ctx;
         assert_eq!(cloned.session_id, "sess-1");
@@ -778,11 +778,27 @@ mod tests {
         let ctx = SessionContext {
             session_id: "sess-debug".into(),
             agent_id: 1,
-            started_at: Instant::now(),
+            started_at: SystemTime::now(),
         };
         let dbg = format!("{ctx:?}");
         assert!(dbg.contains("sess-debug"));
         assert!(dbg.contains("agent_id: 1"));
+    }
+
+    #[test]
+    fn session_context_serde_roundtrip_preserves_started_at() {
+        let original = SessionContext {
+            session_id: "sess-rt".into(),
+            agent_id: 99,
+            started_at: SystemTime::now(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: SessionContext = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(parsed.session_id, original.session_id);
+        assert_eq!(parsed.agent_id, original.agent_id);
+        // SystemTime roundtrips through serde; Instant did not.
+        assert_eq!(parsed.started_at, original.started_at);
     }
 
     // ── HookEntry::new validated constructor tests ──────────────────────

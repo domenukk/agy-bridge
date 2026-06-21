@@ -376,16 +376,25 @@ impl From<Vec<PolicyRule>> for PolicySet {
     ///
     /// # Panics
     ///
-    /// Panics if the rule list is invalid (e.g., rules after a terminal
-    /// `AllowAll` / `DenyAll`). Prefer [`PolicySet::validated_from`] for
-    /// fallible conversion.
+    /// Panics if any rule fails validation (e.g. empty tool name,
+    /// empty handler ID, or empty workspace list).
+    /// Prefer [`PolicySet::validated_from`] for fallible
+    /// conversion.
     fn from(rules: Vec<PolicyRule>) -> Self {
         Self::validated_from(rules).expect("PolicySet::from(Vec<PolicyRule>): invalid rules")
     }
 }
 
 impl FromIterator<PolicyRule> for PolicySet {
-    /// Create a `PolicySet` from an iterator of policy rules, panic-validating them.
+    /// Create a `PolicySet` from an iterator of policy rules,
+    /// panic-validating them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any rule fails validation (e.g. empty tool name,
+    /// empty handler ID, or empty workspace list).
+    /// Use [`PolicySet::validated_from`] for fallible
+    /// alternatives.
     fn from_iter<T: IntoIterator<Item = PolicyRule>>(iter: T) -> Self {
         let rules = iter.into_iter().collect::<Vec<_>>();
         Self::from(rules)
@@ -393,7 +402,14 @@ impl FromIterator<PolicyRule> for PolicySet {
 }
 
 impl<const N: usize> From<[PolicyRule; N]> for PolicySet {
-    /// Create a `PolicySet` from a fixed-size array of policy rules, panic-validating them.
+    /// Create a `PolicySet` from a fixed-size array, panic-validating
+    /// each rule.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any rule fails validation (e.g. empty tool name,
+    /// empty handler ID, or empty workspace list).
+    /// Prefer [`PolicySet::validated_from`] for fallible conversion.
     fn from(rules: [PolicyRule; N]) -> Self {
         Self::from(Vec::from(rules))
     }
@@ -1126,5 +1142,36 @@ mod tests {
             PolicyRule::DenyAll,
         ]);
         assert_eq!(set.len(), 3);
+    }
+
+    // ── validated_from additional coverage ────────────────────────────
+
+    #[test]
+    fn validated_from_valid_rules_via_vec() {
+        let rules = vec![
+            PolicyRule::allow("view_file"),
+            PolicyRule::deny("run_command"),
+            PolicyRule::DenyAll,
+        ];
+        let set = PolicySet::validated_from(rules).expect("valid rules");
+        assert_eq!(set.len(), 3);
+        assert!(set.evaluate("view_file").is_allowed());
+    }
+
+    #[test]
+    fn validated_from_invalid_rule_via_vec_is_err() {
+        let rules = vec![PolicyRule::Allow(String::new())];
+        assert!(PolicySet::validated_from(rules).is_err());
+    }
+
+    #[test]
+    fn validated_from_single_allow_all() {
+        let set = PolicySet::validated_from(vec![PolicyRule::AllowAll]).expect("valid rules");
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn validated_from_empty_workspace_only_is_err() {
+        assert!(PolicySet::validated_from(vec![PolicyRule::WorkspaceOnly(vec![])]).is_err());
     }
 }

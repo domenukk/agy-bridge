@@ -129,3 +129,249 @@ fn test_hooks_lifecycle_live() {
         })
     });
 }
+
+#[test]
+fn test_on_tool_error_hook_live() {
+    common::run_live_test("test_on_tool_error_hook_live", || {
+        let rt = test_runtime();
+        rt.block_on(async {
+            let key = api_key();
+
+            let events = Arc::new(Mutex::new(Vec::new()));
+
+            let mut hooks = Hooks::new();
+
+            let e = Arc::clone(&events);
+            hooks.on_tool_error("log_tool_error", move |ctx| {
+                e.lock()
+                    .unwrap()
+                    .push(format!("tool_error:{}:{}", ctx.tool_name, ctx.error));
+            });
+
+            // Also register pre_tool_call_decide to allow all tool calls.
+            hooks.on_pre_tool_call_decide("allow_all", |_ctx| HookResult::allow());
+
+            let config = AgentConfig::builder()
+                .api_key(&key)
+                .model("gemini-3.5-flash")
+                .capabilities(CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile]))
+                .build();
+
+            let bridge = AgyBridge::builder()
+                .chat_timeout(Duration::from_mins(1))
+                .build()?;
+
+            let agent = bridge.agent(config).hooks(hooks).await?;
+
+            // Ask the agent to view a file that does not exist — this should trigger a tool error.
+            let prompt = "Use view_file to read the file '/tmp/__nonexistent_agy_bridge_test_file_42__'. \
+                          Report what happened.";
+            let _text = agent.chat(prompt).await?.text().await?;
+
+            // Poll for the tool_error event.
+            let mut seen = false;
+            for _ in 0..300 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("tool_error:"))
+                {
+                    seen = true;
+                    break;
+                }
+            }
+
+            agent.shutdown().await?;
+
+            assert!(
+                seen,
+                "Expected on_tool_error event to fire, got: {:?}",
+                events.lock().unwrap()
+            );
+
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn test_transform_tool_input_hook_live() {
+    common::run_live_test("test_transform_tool_input_hook_live", || {
+        let rt = test_runtime();
+        rt.block_on(async {
+            let key = api_key();
+
+            let events = Arc::new(Mutex::new(Vec::new()));
+
+            let mut hooks = Hooks::new();
+
+            // Register a transform that records when it runs.
+            let e = Arc::clone(&events);
+            hooks.on_transform_tool_input("log_transform", move |ctx| {
+                e.lock()
+                    .unwrap()
+                    .push(format!("transform:{}", ctx.tool_name));
+                // Return None to leave args unchanged.
+                None
+            });
+
+            hooks.on_pre_tool_call_decide("allow_all", |_ctx| HookResult::allow());
+
+            let config = AgentConfig::builder()
+                .api_key(&key)
+                .model("gemini-3.5-flash")
+                .capabilities(CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile]))
+                .build();
+
+            let bridge = AgyBridge::builder()
+                .chat_timeout(Duration::from_mins(1))
+                .build()?;
+
+            let agent = bridge.agent(config).hooks(hooks).await?;
+
+            let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            let prompt = format!(
+                "Use view_file to read '{}' and tell me the package name.",
+                cargo_toml.display(),
+            );
+            let _text = agent.chat(&*prompt).await?.text().await?;
+
+            // Poll for the transform event.
+            let mut seen = false;
+            for _ in 0..300 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("transform:"))
+                {
+                    seen = true;
+                    break;
+                }
+            }
+
+            agent.shutdown().await?;
+
+            assert!(
+                seen,
+                "Expected transform_tool_input event to fire, got: {:?}",
+                events.lock().unwrap()
+            );
+
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn test_session_and_interaction_hooks_live() {
+    common::run_live_test("test_session_and_interaction_hooks_live", || {
+        let rt = test_runtime();
+        rt.block_on(async {
+            let key = api_key();
+
+            let events = Arc::new(Mutex::new(Vec::new()));
+
+            let mut hooks = Hooks::new();
+
+            let e1 = Arc::clone(&events);
+            hooks.on_session_start("log_session_start", move |ctx| {
+                e1.lock()
+                    .unwrap()
+                    .push(format!("session_start:{}", ctx.session.session_id));
+            });
+
+            let e2 = Arc::clone(&events);
+            hooks.on_session_end("log_session_end", move |ctx| {
+                e2.lock()
+                    .unwrap()
+                    .push(format!("session_end:{}", ctx.session.session_id));
+            });
+
+            let e3 = Arc::clone(&events);
+            hooks.on_interaction("log_interaction", move |ctx| {
+                e3.lock()
+                    .unwrap()
+                    .push(format!("interaction:{}", ctx.message.chars().take(30).collect::<String>()));
+                HookResult::allow()
+            });
+
+            let config = AgentConfig::builder()
+                .api_key(&key)
+                .model("gemini-3.5-flash")
+                .build();
+
+            let bridge = AgyBridge::builder()
+                .chat_timeout(Duration::from_mins(1))
+                .build()?;
+
+            let agent = bridge.agent(config).hooks(hooks).await?;
+
+            // Simple chat to trigger interaction hook.
+            let _text = agent.chat("Say 'hello' and nothing else.").await?.text().await?;
+
+            // Poll for session_start (fires on agent creation).
+            let mut start_seen = false;
+            for _ in 0..300 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("session_start:"))
+                {
+                    start_seen = true;
+                    break;
+                }
+            }
+
+            agent.shutdown().await?;
+
+            // After shutdown, poll for session_end.
+            let mut end_seen = false;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("session_end:"))
+                {
+                    end_seen = true;
+                    break;
+                }
+            }
+
+            let events_list = events.lock().unwrap().clone();
+
+            assert!(
+                start_seen,
+                "Expected session_start event, got: {events_list:?}"
+            );
+            assert!(
+                end_seen,
+                "Expected session_end event, got: {events_list:?}"
+            );
+
+            // Verify ordering: session_start before session_end.
+            if let (Some(start_idx), Some(end_idx)) = (
+                events_list
+                    .iter()
+                    .position(|e| e.starts_with("session_start:")),
+                events_list
+                    .iter()
+                    .position(|e| e.starts_with("session_end:")),
+            ) {
+                assert!(
+                    start_idx < end_idx,
+                    "session_start should precede session_end, got indices: start={start_idx}, end={end_idx}"
+                );
+            }
+
+            Ok(())
+        })
+    });
+}

@@ -184,4 +184,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("description").is_none());
     }
+
+    #[test]
+    fn typed_json_video_has_base64_data() {
+        let content = Content::Video(super::super::media::Video {
+            data: vec![0x00, 0x00, 0x00, 0x1C, 0x66],
+            mime_type: "video/mp4".to_string(),
+            description: Some("clip".to_string()),
+        });
+        let json = content_to_json(&content).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "Video");
+        assert_eq!(parsed["mime_type"], "video/mp4");
+        assert_eq!(parsed["description"], "clip");
+        let decoded = BASE64.decode(parsed["data"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, vec![0x00, 0x00, 0x00, 0x1C, 0x66]);
+    }
 }

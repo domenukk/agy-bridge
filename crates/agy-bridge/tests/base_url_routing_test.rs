@@ -277,8 +277,12 @@ impl MockGeminiServer {
         }
 
         let response = build_response(&parsed.request_line);
-        let _ = writer.write_all(response.as_bytes()).await;
-        let _ = writer.flush().await;
+        if let Err(e) = writer.write_all(response.as_bytes()).await {
+            eprintln!("[MOCK] write error: {e}");
+        }
+        if let Err(e) = writer.flush().await {
+            eprintln!("[MOCK] flush error: {e}");
+        }
     }
 
     fn base_url(&self) -> String {
@@ -410,8 +414,12 @@ fn multiple_agents_use_independent_base_urls() {
         let agent_a = BRIDGE.agent(config_a).await.expect("create agent A");
         let agent_b = BRIDGE.agent(config_b).await.expect("create agent B");
 
-        let _result_a = agent_a.chat_text("Hello from A").await;
-        let _result_b = agent_b.chat_text("Hello from B").await;
+        if let Err(e) = agent_a.chat_text("Hello from A").await {
+            eprintln!("Agent A chat error (expected with mock): {e}");
+        }
+        if let Err(e) = agent_b.chat_text("Hello from B").await {
+            eprintln!("Agent B chat error (expected with mock): {e}");
+        }
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

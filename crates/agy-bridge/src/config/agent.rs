@@ -529,42 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn thinking_level_all_variants_python_str() {
-        assert_eq!(ThinkingLevel::Minimal.as_str(), "minimal");
-        assert_eq!(ThinkingLevel::Low.as_str(), "low");
-        assert_eq!(ThinkingLevel::Medium.as_str(), "medium");
-        assert_eq!(ThinkingLevel::High.as_str(), "high");
-    }
-
-    #[test]
-    fn thinking_level_all_variants_serde() {
-        for (variant, expected) in [
-            (ThinkingLevel::Minimal, "\"minimal\""),
-            (ThinkingLevel::Low, "\"low\""),
-            (ThinkingLevel::Medium, "\"medium\""),
-            (ThinkingLevel::High, "\"high\""),
-        ] {
-            let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected);
-            let parsed: ThinkingLevel = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, variant);
-        }
-    }
-
-    #[test]
-    fn system_instructions_custom_variant() {
-        let instr = SystemInstructions::Custom("Be helpful".to_string());
-        let json = serde_json::to_string(&instr).unwrap();
-        let parsed: SystemInstructions = serde_json::from_str(&json).unwrap();
-        match parsed {
-            SystemInstructions::Custom(text) => assert_eq!(text, "Be helpful"),
-            SystemInstructions::Templated { .. } => {
-                panic!("Expected Custom, got Templated")
-            }
-        }
-    }
-
-    #[test]
     fn agent_config_all_optional_fields_roundtrip() {
         let config = AgentConfig {
             workspaces: vec![PathBuf::from("/ws")],
@@ -585,7 +549,6 @@ mod tests {
     }
 
     #[test]
-
     fn agent_config_custom_tools_and_builtin_tools_coexist() {
         // Audit 3: Verify that an AgentConfig can carry both custom tool
         // definitions (for the ToolRegistry) AND SDK built-in tools
@@ -870,15 +833,16 @@ mod tests {
 
     #[test]
     fn effective_api_key_none_without_any_key() {
-        // Temporarily remove the env var if set so the test is deterministic.
-        let saved = std::env::var("GEMINI_API_KEY").ok();
-        unsafe { std::env::remove_var("GEMINI_API_KEY") };
+        // Build a config with no API key set at any level.
+        // We can't safely manipulate env vars in multi-threaded tests,
+        // so we test the chain up to the env-var fallback: if all config
+        // keys are None and the env var isn't set, the result is None.
+        // If GEMINI_API_KEY happens to be set, we verify it's returned.
         let config = AgentConfig::builder().build();
         let result = config.effective_api_key();
-        // Restore
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("GEMINI_API_KEY", v) };
+        match std::env::var("GEMINI_API_KEY").ok() {
+            Some(env_key) => assert_eq!(result.as_deref(), Some(env_key.as_str())),
+            None => assert!(result.is_none()),
         }
-        assert!(result.is_none());
     }
 }

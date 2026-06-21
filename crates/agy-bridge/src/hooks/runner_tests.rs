@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::SystemTime;
 
 use super::{super::types::SessionContext, *};
 
@@ -481,7 +481,7 @@ fn convenience_on_session_start() {
         session: SessionContext {
             session_id: "sess-42".into(),
             agent_id: 7,
-            started_at: Instant::now(),
+            started_at: SystemTime::now(),
         },
     });
     assert_eq!(*captured_id.lock().unwrap(), "sess-42");
@@ -505,7 +505,7 @@ fn convenience_on_session_end() {
         session: SessionContext {
             session_id: "sess-99".into(),
             agent_id: 42,
-            started_at: Instant::now(),
+            started_at: SystemTime::now(),
         },
     });
     assert_eq!(captured_agent.load(Ordering::SeqCst), 42);

@@ -26,7 +26,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
-    let cwd = std::env::current_dir().expect("failed to get current directory");
+    let cwd = std::env::current_dir()?;
 
     // Enable only shell-related tools — no file editing or subagents.
     let config = AgentConfig::builder()

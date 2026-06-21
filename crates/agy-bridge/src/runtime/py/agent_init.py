@@ -304,18 +304,30 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                                 result_str = ""
                                 metadata = {}
                                 if result_val is not None:
-                                    if isinstance(result_val, dict) and "content" in result_val:
+                                    if (
+                                        isinstance(result_val, dict)
+                                        and "content" in result_val
+                                    ):
                                         result_str = result_val["content"]
                                         metadata = result_val.get("metadata", {})
                                     else:
-                                        tool_output = getattr(result_val, "result", None)
-                                        if isinstance(tool_output, dict) and "content" in tool_output:
+                                        tool_output = getattr(
+                                            result_val, "result", None
+                                        )
+                                        if (
+                                            isinstance(tool_output, dict)
+                                            and "content" in tool_output
+                                        ):
                                             result_str = tool_output["content"]
                                             metadata = tool_output.get("metadata", {})
                                         else:
                                             try:
-                                                if hasattr(result_val, "model_dump_json"):
-                                                    result_str = result_val.model_dump_json()
+                                                if hasattr(
+                                                    result_val, "model_dump_json"
+                                                ):
+                                                    result_str = (
+                                                        result_val.model_dump_json()
+                                                    )
                                                 elif hasattr(result_val, "model_dump"):
                                                     result_str = json.dumps(
                                                         result_val.model_dump()

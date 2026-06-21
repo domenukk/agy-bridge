@@ -5,11 +5,7 @@
 //! - `Hooks` for callback storage + `HookEntry` config for the builder
 //! - Workspace-scoped agent restricted to `.md` files
 
-use agy_bridge::{
-    config::CapabilitiesConfig,
-    hooks::{HookEntry, HookResult},
-    prelude::*,
-};
+use agy_bridge::{config::CapabilitiesConfig, hooks::HookResult, prelude::*};
 
 /// Extract the file/directory path from a tool-call's arguments.
 fn extract_path_arg(args: &serde_json::Value) -> String {
@@ -61,12 +57,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let hook_entries = [HookEntry {
-        name: "md_policy".to_string(),
-        point: HookPoint::PreToolCallDecide,
-        callback_id: "md_policy".to_string(),
-    }];
-
     let system_instructions = format!(
         "You are an expert Technical Writer for the Google Antigravity SDK.\n\
          Audit all Markdown documentation in the target directory and fix \
@@ -78,12 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::builder()
         .system_instructions(system_instructions)
         .workspaces(std::slice::from_ref(&target_dir))
-        .hooks(hook_entries.clone())
         .capabilities(CapabilitiesConfig::default())
         .policies(vec![PolicyRule::AllowAll])
         .build();
 
-    let agent = bridge.agent(config).await?;
+    let agent = bridge.agent(config).hooks(hook_runner).await?;
 
     let prompt = "Check all documentation in the target directory and fix any discrepancies.";
     println!("Prompt: {prompt}\n");

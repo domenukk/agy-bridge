@@ -273,7 +273,7 @@ fn rust_tool_definition_serde_roundtrip() {
             .expect("FlashParams deserialization");
     assert_eq!(params.device_id, "dev-1");
     assert_eq!(params.build_image, "img.bin");
-    let schema = schemars::r#gen::SchemaGenerator::default().root_schema_for::<FlashParams>();
+    let schema = schemars::schema_for!(FlashParams);
     let schema_value = serde_json::to_value(&schema).expect("schema to Value");
 
     let tool = agy_bridge::tools::ToolDefinition {
@@ -1210,7 +1210,8 @@ struct MetadataTestResponse {
     some_code: i32,
 }
 
-#[llm_tool::llm_tool(description = "Test tool that returns structured data metadata")]
+/// Test tool that returns structured data metadata.
+#[llm_tool::llm_tool]
 fn structured_metadata_tool() -> Result<MetadataTestResponse, ToolError> {
     Ok(MetadataTestResponse {
         result: "Structured metadata works".into(),
@@ -1244,13 +1245,18 @@ fn live_rust_tool_metadata() {
                 .policies([agy_bridge::policies::PolicyRule::AllowAll])
                 .build();
             let agent = bridge.agent(config).tools(registry).hooks(hooks).await?;
-            
-            let _text = agent.chat_text("Call structured_metadata_tool and tell me the result").await?;
-            
+
+            let _text = agent
+                .chat_text("Call structured_metadata_tool and tell me the result")
+                .await?;
+
             let meta = metadata_capture.lock().unwrap().clone();
             assert_eq!(meta["some_code"], 42, "metadata should contain some_code");
-            assert_eq!(meta["result"], "Structured metadata works", "metadata should contain result");
+            assert_eq!(
+                meta["result"], "Structured metadata works",
+                "metadata should contain result"
+            );
             Ok(())
         })
-    })
+    });
 }

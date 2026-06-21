@@ -693,4 +693,380 @@ mod tests {
         let img = Image::new(vec![1], String::from("image/gif"));
         assert_eq!(img.mime_type, "image/gif");
     }
+
+    // ── with_description() builder ──────────────────────────────────
+
+    #[test]
+    fn image_with_description_sets_description() {
+        let img = Image::png(vec![1]).with_description("a logo");
+        assert_eq!(img.description.as_deref(), Some("a logo"));
+        assert_eq!(img.mime_type, "image/png");
+    }
+
+    #[test]
+    fn document_with_description_sets_description() {
+        let doc = Document::pdf(vec![1]).with_description("invoice");
+        assert_eq!(doc.description.as_deref(), Some("invoice"));
+        assert_eq!(doc.mime_type, "application/pdf");
+    }
+
+    #[test]
+    fn audio_with_description_sets_description() {
+        let audio = Audio::mp3(vec![1]).with_description("intro jingle");
+        assert_eq!(audio.description.as_deref(), Some("intro jingle"));
+        assert_eq!(audio.mime_type, "audio/mpeg");
+    }
+
+    #[test]
+    fn video_with_description_sets_description() {
+        let video = Video::mp4(vec![1]).with_description("demo clip");
+        assert_eq!(video.description.as_deref(), Some("demo clip"));
+        assert_eq!(video.mime_type, "video/mp4");
+    }
+
+    // ── Convenience constructors ────────────────────────────────────
+
+    #[test]
+    fn image_webp_creates_correct_image() {
+        let img = Image::webp(vec![1, 2]);
+        assert_eq!(img.mime_type, "image/webp");
+        assert_eq!(img.data, vec![1, 2]);
+        assert!(img.description.is_none());
+    }
+
+    #[test]
+    fn image_gif_creates_correct_image() {
+        let img = Image::gif(vec![0x47, 0x49, 0x46]);
+        assert_eq!(img.mime_type, "image/gif");
+        assert_eq!(img.data, vec![0x47, 0x49, 0x46]);
+        assert!(img.description.is_none());
+    }
+
+    #[test]
+    fn audio_ogg_creates_correct_audio() {
+        let audio = Audio::ogg(vec![0x4F, 0x67]);
+        assert_eq!(audio.mime_type, "audio/ogg");
+        assert_eq!(audio.data, vec![0x4F, 0x67]);
+        assert!(audio.description.is_none());
+    }
+
+    #[test]
+    fn audio_flac_creates_correct_audio() {
+        let audio = Audio::flac(vec![0x66, 0x4C]);
+        assert_eq!(audio.mime_type, "audio/flac");
+        assert_eq!(audio.data, vec![0x66, 0x4C]);
+        assert!(audio.description.is_none());
+    }
+
+    #[test]
+    fn document_plain_text_creates_correct_document() {
+        let doc = Document::plain_text(b"hello".to_vec());
+        assert_eq!(doc.mime_type, "text/plain");
+        assert_eq!(doc.data, b"hello");
+        assert!(doc.description.is_none());
+    }
+
+    #[test]
+    fn document_json_creates_correct_document() {
+        let doc = Document::json(b"{}".to_vec());
+        assert_eq!(doc.mime_type, "application/json");
+        assert_eq!(doc.data, b"{}");
+        assert!(doc.description.is_none());
+    }
+
+    #[test]
+    fn video_webm_creates_correct_video() {
+        let video = Video::webm(vec![0x1A, 0x45]);
+        assert_eq!(video.mime_type, "video/webm");
+        assert_eq!(video.data, vec![0x1A, 0x45]);
+        assert!(video.description.is_none());
+    }
+
+    // ── from_file() — Image ────────────────────────────────────────
+
+    #[test]
+    fn image_from_file_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, b"\x89PNG").unwrap();
+        let img = Image::from_file(&path).unwrap();
+        assert_eq!(img.data, b"\x89PNG");
+        assert_eq!(img.mime_type, "image/png");
+        assert!(img.description.is_none());
+    }
+
+    #[test]
+    fn image_from_file_unknown_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.bmp");
+        std::fs::write(&path, b"BM").unwrap();
+        let err = Image::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unrecognized"),
+            "expected 'unrecognized' in: {err}"
+        );
+    }
+
+    #[test]
+    fn image_from_file_wrong_mime_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_image.mp3");
+        std::fs::write(&path, b"\xFF\xFB").unwrap();
+        let err = Image::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not an image type"),
+            "expected MIME prefix error in: {err}"
+        );
+    }
+
+    #[test]
+    fn image_from_file_missing_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noext");
+        std::fs::write(&path, b"data").unwrap();
+        let err = Image::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("missing file extension"),
+            "expected 'missing file extension' in: {err}"
+        );
+    }
+
+    // ── from_file() — Document ─────────────────────────────────────
+
+    #[test]
+    fn document_from_file_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"%PDF-1.4").unwrap();
+        let doc = Document::from_file(&path).unwrap();
+        assert_eq!(doc.data, b"%PDF-1.4");
+        assert_eq!(doc.mime_type, "application/pdf");
+        assert!(doc.description.is_none());
+    }
+
+    #[test]
+    fn document_from_file_text_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        let doc = Document::from_file(&path).unwrap();
+        assert_eq!(doc.data, b"hello world");
+        assert_eq!(doc.mime_type, "text/plain");
+    }
+
+    #[test]
+    fn document_from_file_json_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let doc = Document::from_file(&path).unwrap();
+        assert_eq!(doc.data, b"{}");
+        assert_eq!(doc.mime_type, "application/json");
+    }
+
+    #[test]
+    fn document_from_file_unknown_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.xyz");
+        std::fs::write(&path, b"stuff").unwrap();
+        let err = Document::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unrecognized"),
+            "expected 'unrecognized' in: {err}"
+        );
+    }
+
+    #[test]
+    fn document_from_file_wrong_mime_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_doc.png");
+        std::fs::write(&path, b"\x89PNG").unwrap();
+        let err = Document::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not a document type"),
+            "expected MIME prefix error in: {err}"
+        );
+    }
+
+    #[test]
+    fn document_from_file_missing_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noext");
+        std::fs::write(&path, b"data").unwrap();
+        let err = Document::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("missing file extension"),
+            "expected 'missing file extension' in: {err}"
+        );
+    }
+
+    // ── from_file() — Audio ────────────────────────────────────────
+
+    #[test]
+    fn audio_from_file_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp3");
+        std::fs::write(&path, b"\xFF\xFB\x90").unwrap();
+        let audio = Audio::from_file(&path).unwrap();
+        assert_eq!(audio.data, b"\xFF\xFB\x90");
+        assert_eq!(audio.mime_type, "audio/mpeg");
+        assert!(audio.description.is_none());
+    }
+
+    #[test]
+    fn audio_from_file_wav_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.wav");
+        std::fs::write(&path, b"RIFF").unwrap();
+        let audio = Audio::from_file(&path).unwrap();
+        assert_eq!(audio.mime_type, "audio/wav");
+    }
+
+    #[test]
+    fn audio_from_file_unknown_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sound.aac");
+        std::fs::write(&path, b"data").unwrap();
+        let err = Audio::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unrecognized"),
+            "expected 'unrecognized' in: {err}"
+        );
+    }
+
+    #[test]
+    fn audio_from_file_wrong_mime_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_audio.png");
+        std::fs::write(&path, b"\x89PNG").unwrap();
+        let err = Audio::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not an audio type"),
+            "expected MIME prefix error in: {err}"
+        );
+    }
+
+    #[test]
+    fn audio_from_file_missing_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noext");
+        std::fs::write(&path, b"data").unwrap();
+        let err = Audio::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("missing file extension"),
+            "expected 'missing file extension' in: {err}"
+        );
+    }
+
+    // ── from_file() — Video ────────────────────────────────────────
+
+    #[test]
+    fn video_from_file_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, b"\x00\x00\x00\x1Cftyp").unwrap();
+        let video = Video::from_file(&path).unwrap();
+        assert_eq!(video.data, b"\x00\x00\x00\x1Cftyp");
+        assert_eq!(video.mime_type, "video/mp4");
+        assert!(video.description.is_none());
+    }
+
+    #[test]
+    fn video_from_file_webm_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.webm");
+        std::fs::write(&path, b"\x1A\x45\xDF\xA3").unwrap();
+        let video = Video::from_file(&path).unwrap();
+        assert_eq!(video.mime_type, "video/webm");
+    }
+
+    #[test]
+    fn video_from_file_unknown_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.avi");
+        std::fs::write(&path, b"RIFF").unwrap();
+        let err = Video::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unrecognized"),
+            "expected 'unrecognized' in: {err}"
+        );
+    }
+
+    #[test]
+    fn video_from_file_wrong_mime_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_video.png");
+        std::fs::write(&path, b"\x89PNG").unwrap();
+        let err = Video::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not a video type"),
+            "expected MIME prefix error in: {err}"
+        );
+    }
+
+    #[test]
+    fn video_from_file_missing_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noext");
+        std::fs::write(&path, b"data").unwrap();
+        let err = Video::from_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("missing file extension"),
+            "expected 'missing file extension' in: {err}"
+        );
+    }
+
+    // ── from_file() — file does not exist ──────────────────────────
+
+    #[test]
+    fn image_from_file_nonexistent_file() {
+        let err = Image::from_file("/tmp/agy_bridge_test_nonexistent_8f3a.png").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn document_from_file_nonexistent_file() {
+        let err = Document::from_file("/tmp/agy_bridge_test_nonexistent_8f3a.pdf").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn audio_from_file_nonexistent_file() {
+        let err = Audio::from_file("/tmp/agy_bridge_test_nonexistent_8f3a.mp3").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn video_from_file_nonexistent_file() {
+        let err = Video::from_file("/tmp/agy_bridge_test_nonexistent_8f3a.mp4").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ── mime::from_extension ────────────────────────────────────────
+
+    #[test]
+    fn mime_from_extension_case_insensitive() {
+        assert_eq!(mime::from_extension("PNG"), Some("image/png"));
+        assert_eq!(mime::from_extension("Jpeg"), Some("image/jpeg"));
+        assert_eq!(mime::from_extension("MP4"), Some("video/mp4"));
+    }
+
+    #[test]
+    fn mime_from_extension_unknown_returns_none() {
+        assert_eq!(mime::from_extension("bmp"), None);
+        assert_eq!(mime::from_extension("avi"), None);
+        assert_eq!(mime::from_extension(""), None);
+    }
 }

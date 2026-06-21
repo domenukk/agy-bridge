@@ -325,27 +325,12 @@ async fn dispatch_async_command(
             tracing::info!("Shutdown command received, exiting async command loop");
             DispatchResult::Shutdown
         }
-        // Query commands already handled by dispatch_query_command above.
-        PyCommand::GetHistory { .. }
-        | PyCommand::GetTurnCount { .. }
-        | PyCommand::GetTotalUsage { .. }
-        | PyCommand::GetLastTurnUsage { .. }
-        | PyCommand::GetCompactionIndices { .. }
-        | PyCommand::GetLastResponse { .. }
-        | PyCommand::IsIdle { .. }
-        // Lifecycle and chat already handled above.
-        | PyCommand::CreateAgent { .. }
-        | PyCommand::ShutdownAgent { .. }
-        | PyCommand::Chat { .. }
-        // Agent operations already handled above.
-        | PyCommand::Cancel { .. }
-        | PyCommand::WaitForIdle { .. }
-        | PyCommand::ClearHistory { .. }
-        | PyCommand::Send { .. }
-        | PyCommand::SignalIdle { .. }
-        | PyCommand::WaitForWakeup { .. }
-        | PyCommand::Delete { .. }
-        | PyCommand::Disconnect { .. } => {
+        // All other variants are handled by earlier dispatch phases.
+        // Using `_` instead of explicit listing so that adding a new
+        // PyCommand variant causes a compile error in the earlier
+        // dispatch functions (which use exhaustive matches) rather than
+        // being silently caught here.
+        _ => {
             unreachable!("all variants handled by earlier dispatch phases")
         }
     }

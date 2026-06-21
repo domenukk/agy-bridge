@@ -11,10 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agy_bridge::{
-    hooks::{HookEntry, HookResult},
-    prelude::*,
-};
+use agy_bridge::{hooks::HookResult, prelude::*};
 
 #[llm_tool]
 /// Look up a user by email address and return their profile.
@@ -61,7 +58,7 @@ fn check_rate_limit(
     (count, at_limit)
 }
 
-fn register_rate_limit_hook(runner: &mut Hooks, entries: &mut Vec<HookEntry>) {
+fn register_rate_limit_hook(runner: &mut Hooks) {
     let calls = Arc::new(Mutex::new(
         std::collections::HashMap::<String, Vec<Instant>>::new(),
     ));
@@ -84,46 +81,23 @@ fn register_rate_limit_hook(runner: &mut Hooks, entries: &mut Vec<HookEntry>) {
             HookResult::allow()
         }
     });
-    entries.push(HookEntry {
-        name: "rate_limit".to_string(),
-        point: HookPoint::PreToolCallDecide,
-        callback_id: "rate_limit".to_string(),
-    });
 }
 
-fn register_audit_log_hook(
-    runner: &mut Hooks,
-    entries: &mut Vec<HookEntry>,
-    audit_log: &Arc<Mutex<Vec<String>>>,
-) {
+fn register_audit_log_hook(runner: &mut Hooks, audit_log: &Arc<Mutex<Vec<String>>>) {
     let log = Arc::clone(audit_log);
     runner.on_post_tool_call("audit_log", move |ctx| {
         let entry = format!("✅ {}: {}", ctx.tool_name, ctx.result);
         println!("  📝 [Audit] {entry}");
         log.lock().unwrap().push(entry);
     });
-    entries.push(HookEntry {
-        name: "audit_log".to_string(),
-        point: HookPoint::PostToolCall,
-        callback_id: "audit_log".to_string(),
-    });
 }
 
-fn register_fallback_hook(
-    runner: &mut Hooks,
-    entries: &mut Vec<HookEntry>,
-    audit_log: &Arc<Mutex<Vec<String>>>,
-) {
+fn register_fallback_hook(runner: &mut Hooks, audit_log: &Arc<Mutex<Vec<String>>>) {
     let log = Arc::clone(audit_log);
     runner.on_tool_error("fallback", move |ctx| {
         let entry = format!("❌ {}: {}", ctx.tool_name, ctx.error);
         println!("  🔧 [Fallback] {entry}");
         log.lock().unwrap().push(entry);
-    });
-    entries.push(HookEntry {
-        name: "fallback".to_string(),
-        point: HookPoint::OnToolError,
-        callback_id: "fallback".to_string(),
     });
 }
 
@@ -139,18 +113,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let audit_log = Arc::new(Mutex::new(Vec::new()));
     let mut hook_runner = Hooks::new();
-    let mut hook_entries = Vec::new();
-    register_rate_limit_hook(&mut hook_runner, &mut hook_entries);
-    register_audit_log_hook(&mut hook_runner, &mut hook_entries, &audit_log);
-    register_fallback_hook(&mut hook_runner, &mut hook_entries, &audit_log);
+    register_rate_limit_hook(&mut hook_runner);
+    register_audit_log_hook(&mut hook_runner, &audit_log);
+    register_fallback_hook(&mut hook_runner, &audit_log);
 
     let config = AgentConfig::builder()
         .system_instructions("You have access to user lookup and notification tools. Use them as needed. Keep responses under 2 sentences.".to_string())
-        .hooks(hook_entries.clone())
         .policies(vec![PolicyRule::AllowAll])
         .build();
 
-    let agent = bridge.agent(config).tools(registry).await?;
+    let agent = bridge
+        .agent(config)
+        .tools(registry)
+        .hooks(hook_runner)
+        .await?;
 
     println!("\n{}", "=".repeat(60));
     println!("📨 Prompt 1: Normal tool use (audit logged)");

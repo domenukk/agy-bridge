@@ -91,34 +91,47 @@ impl Hooks {
         self
     }
 
-    /// Run all [`HookPoint::PreTurn`] callbacks in registration order.
-    pub fn run_pre_turn(&self, ctx: &PreTurnContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::PreTurn) {
-            tracing::trace!(hook = %name, turn = ctx.turn_number, "firing pre_turn hook");
-            if let HookCallback::PreTurn(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "pre_turn hook panicked — continuing");
-                }
+    /// Run all observer callbacks at the given [`HookPoint`], calling `invoke`
+    /// for each matching callback.
+    ///
+    /// Panics in individual callbacks are caught and logged; execution
+    /// continues with the remaining callbacks.
+    fn run_observer<F>(&self, point: HookPoint, mut invoke: F)
+    where
+        F: FnMut(&str, &HookCallback),
+    {
+        for (_, name, cb) in self.iter_at(point) {
+            let name_owned = name.clone();
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(&name_owned, cb)))
+            {
+                tracing::error!(
+                    hook = %name,
+                    panic = ?panic,
+                    "{} hook panicked — continuing", point.label(),
+                );
             }
         }
     }
 
+    /// Run all [`HookPoint::PreTurn`] callbacks in registration order.
+    pub fn run_pre_turn(&self, ctx: &PreTurnContext) {
+        self.run_observer(HookPoint::PreTurn, |name, cb| {
+            tracing::trace!(hook = %name, turn = ctx.turn_number, "firing pre_turn hook");
+            if let HookCallback::PreTurn(f) = cb {
+                f(ctx);
+            }
+        });
+    }
+
     /// Run all [`HookPoint::PostTurn`] callbacks in registration order.
     pub fn run_post_turn(&self, ctx: &PostTurnContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::PostTurn) {
+        self.run_observer(HookPoint::PostTurn, |name, cb| {
             tracing::trace!(hook = %name, turn = ctx.turn_number, "firing post_turn hook");
             if let HookCallback::PostTurn(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "post_turn hook panicked — continuing");
-                }
+                f(ctx);
             }
-        }
+        });
     }
 
     /// Run all [`HookPoint::PreToolCallDecide`] callbacks in registration order.
@@ -163,77 +176,52 @@ impl Hooks {
 
     /// Run all [`HookPoint::PostToolCall`] callbacks in registration order.
     pub fn run_post_tool_call(&self, ctx: &PostToolCallContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::PostToolCall) {
+        self.run_observer(HookPoint::PostToolCall, |name, cb| {
             tracing::trace!(hook = %name, tool = %ctx.tool_name, "firing post_tool_call hook");
             if let HookCallback::PostToolCall(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "post_tool_call hook panicked — continuing");
-                }
+                f(ctx);
             }
-        }
+        });
     }
 
     /// Run all [`HookPoint::OnToolError`] callbacks in registration order.
     pub fn run_on_tool_error(&self, ctx: &OnToolErrorContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::OnToolError) {
+        self.run_observer(HookPoint::OnToolError, |name, cb| {
             tracing::trace!(hook = %name, tool = %ctx.tool_name, error = %ctx.error, "firing on_tool_error hook");
             if let HookCallback::OnToolError(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "on_tool_error hook panicked — continuing");
-                }
+                f(ctx);
             }
-        }
+        });
     }
 
     /// Run all [`HookPoint::OnSessionStart`] callbacks in registration order.
     pub fn run_on_session_start(&self, ctx: &OnSessionStartContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::OnSessionStart) {
+        self.run_observer(HookPoint::OnSessionStart, |name, cb| {
             tracing::trace!(hook = %name, "firing on_session_start hook");
             if let HookCallback::OnSessionStart(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "on_session_start hook panicked — continuing");
-                }
+                f(ctx);
             }
-        }
+        });
     }
 
     /// Run all [`HookPoint::OnSessionEnd`] callbacks in registration order.
     pub fn run_on_session_end(&self, ctx: &OnSessionEndContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::OnSessionEnd) {
+        self.run_observer(HookPoint::OnSessionEnd, |name, cb| {
             tracing::trace!(hook = %name, "firing on_session_end hook");
             if let HookCallback::OnSessionEnd(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "on_session_end hook panicked — continuing");
-                }
+                f(ctx);
             }
-        }
+        });
     }
 
     /// Run all [`HookPoint::OnCompaction`] callbacks in registration order.
     pub fn run_on_compaction(&self, ctx: &OnCompactionContext) {
-        for (_, name, cb) in self.iter_at(HookPoint::OnCompaction) {
+        self.run_observer(HookPoint::OnCompaction, |name, cb| {
             tracing::trace!(hook = %name, "firing on_compaction hook");
             if let HookCallback::OnCompaction(f) = cb {
-                let name = name.clone();
-                if let Err(panic) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
-                {
-                    tracing::error!(hook = %name, panic = ?panic, "on_compaction hook panicked — continuing");
-                }
+                f(ctx);
             }
-        }
+        });
     }
 
     /// Run all [`HookPoint::OnInteraction`] callbacks in registration order.

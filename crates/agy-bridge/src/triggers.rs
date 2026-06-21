@@ -224,6 +224,21 @@ impl TriggerSet {
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Fallible version of [`FromIterator`] — validates each entry
+    /// and returns the first error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] if any entry has an empty name
+    /// or `message_template`.
+    pub fn try_from_iter(iter: impl IntoIterator<Item = TriggerEntry>) -> Result<Self, Error> {
+        let mut set = Self::new();
+        for entry in iter {
+            set.push(entry)?;
+        }
+        Ok(set)
+    }
 }
 
 impl From<TriggerSet> for Vec<TriggerEntry> {
@@ -239,6 +254,14 @@ impl From<&TriggerSet> for Vec<TriggerEntry> {
 }
 
 impl FromIterator<TriggerEntry> for TriggerSet {
+    /// Create a `TriggerSet` from an iterator of trigger entries,
+    /// panic-validating each one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any entry fails validation (empty name or
+    /// `message_template`). Use [`TriggerSet::try_from_iter`] for a
+    /// fallible alternative.
     fn from_iter<T: IntoIterator<Item = TriggerEntry>>(iter: T) -> Self {
         let mut set = Self::new();
         for entry in iter {
@@ -250,12 +273,25 @@ impl FromIterator<TriggerEntry> for TriggerSet {
 }
 
 impl From<Vec<TriggerEntry>> for TriggerSet {
+    /// Convert a `Vec<TriggerEntry>` into a `TriggerSet`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any entry fails validation (empty name or
+    /// `message_template`). Prefer [`TriggerSet::try_from_iter`] for fallible conversion.
     fn from(entries: Vec<TriggerEntry>) -> Self {
         Self::from_iter(entries)
     }
 }
 
 impl<const N: usize> From<[TriggerEntry; N]> for TriggerSet {
+    /// Create a `TriggerSet` from a fixed-size array, panic-validating
+    /// each entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any entry fails validation (empty name or
+    /// `message_template`). Prefer [`TriggerSet::try_from_iter`] for fallible conversion.
     fn from(entries: [TriggerEntry; N]) -> Self {
         Self::from_iter(entries)
     }
@@ -443,6 +479,76 @@ mod tests {
 
         let set_from_vec = TriggerSet::from(vec![entry]);
         assert_eq!(set_from_vec.len(), 1);
+    }
+
+    #[test]
+    fn try_from_vec_valid_entries() {
+        let entries = vec![TriggerEntry {
+            name: "poll".to_owned(),
+            config: TriggerConfig::every_secs(60),
+            message_template: "poll now".to_owned(),
+        }];
+        let set = TriggerSet::try_from_iter(entries).expect("valid entries");
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn try_from_iter_vec_invalid_entry_is_err() {
+        let entries = vec![TriggerEntry {
+            name: "  ".to_owned(),
+            config: TriggerConfig::every_secs(10),
+            message_template: "msg".to_owned(),
+        }];
+        assert!(TriggerSet::try_from_iter(entries).is_err());
+    }
+
+    #[test]
+    fn try_from_iter_array_valid_entries() {
+        let entry = TriggerEntry {
+            name: "poll".to_owned(),
+            config: TriggerConfig::every_secs(60),
+            message_template: "poll now".to_owned(),
+        };
+        let set = TriggerSet::try_from_iter([entry]).expect("valid entries");
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn try_from_iter_array_invalid_entry_is_err() {
+        let entry = TriggerEntry {
+            name: "poll".to_owned(),
+            config: TriggerConfig::every_secs(10),
+            message_template: "  ".to_owned(),
+        };
+        assert!(TriggerSet::try_from_iter([entry]).is_err());
+    }
+
+    #[test]
+    fn try_from_iter_valid() {
+        let entries = vec![TriggerEntry {
+            name: "poll".to_owned(),
+            config: TriggerConfig::every_secs(60),
+            message_template: "poll now".to_owned(),
+        }];
+        let set = TriggerSet::try_from_iter(entries).expect("valid entries");
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn try_from_iter_invalid_is_err() {
+        let entries = vec![
+            TriggerEntry {
+                name: "poll".to_owned(),
+                config: TriggerConfig::every_secs(60),
+                message_template: "poll now".to_owned(),
+            },
+            TriggerEntry {
+                name: String::new(),
+                config: TriggerConfig::every_secs(10),
+                message_template: "msg".to_owned(),
+            },
+        ];
+        assert!(TriggerSet::try_from_iter(entries).is_err());
     }
 
     #[test]

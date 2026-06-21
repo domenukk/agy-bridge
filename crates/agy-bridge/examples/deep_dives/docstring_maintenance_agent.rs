@@ -7,11 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use agy_bridge::{
-    config::CapabilitiesConfig,
-    hooks::{HookEntry, HookResult},
-    prelude::*,
-};
+use agy_bridge::{config::CapabilitiesConfig, hooks::HookResult, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,19 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let hook_entries = [
-        HookEntry {
-            name: "py_policy".to_string(),
-            point: HookPoint::PreToolCallDecide,
-            callback_id: "py_policy".to_string(),
-        },
-        HookEntry {
-            name: "edit_tracker".to_string(),
-            point: HookPoint::PostToolCall,
-            callback_id: "edit_tracker".to_string(),
-        },
-    ];
-
     let system_instructions = format!(
         "You are an expert Docstring Maintenance Agent.\n\
          Audit all Python files in the target directory and ensure all public \
@@ -91,12 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::builder()
         .system_instructions(system_instructions)
         .workspaces(std::slice::from_ref(&target_dir))
-        .hooks(hook_entries.clone())
         .capabilities(CapabilitiesConfig::default())
         .policies(vec![PolicyRule::AllowAll])
         .build();
 
-    let agent = bridge.agent(config).await?;
+    let agent = bridge.agent(config).hooks(hook_runner).await?;
 
     let prompt = "Audit all Python files and ensure public symbols have Google-style docstrings.";
     println!("Prompt: {prompt}\n");

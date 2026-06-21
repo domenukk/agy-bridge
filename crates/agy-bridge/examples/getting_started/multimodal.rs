@@ -25,7 +25,8 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
     // ── Build multimodal content: text + image ──────────────────────────
 
-    let image = Image::from_file("blank.png")?;
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let image = Image::from_file(manifest_dir.join("blank.png"))?;
     println!(
         "  Image: {} bytes, mime_type={}",
         image.data.len(),
