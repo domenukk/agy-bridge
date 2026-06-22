@@ -141,12 +141,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.register(PassTurn);
         let config = AgentConfig::builder()
             .system_instructions(instructions.to_string())
-            .triggers([TriggerEntry {
-                name: "nudge".to_string(),
-                config: TriggerConfig::every_secs(60),
-                message_template: "The discussion is wrapping up. Make your final point concisely."
-                    .to_string(),
-            }])
+            .triggers([TriggerEntry::new(
+                "nudge",
+                TriggerConfig::every_secs(60),
+                "The discussion is wrapping up. Make your final point concisely.",
+            )])
             .build();
         let agent = bridge.agent(config).tools(registry).await?;
         agents.push((name.to_string(), agent));

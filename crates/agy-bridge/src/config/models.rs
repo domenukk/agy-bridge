@@ -13,10 +13,14 @@ use super::{DEFAULT_IMAGE_GENERATION_MODEL, DEFAULT_MODEL};
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum ThinkingLevel {
+    /// Least reasoning depth; fastest and cheapest.
     Minimal,
+    /// Below-average reasoning depth.
     Low,
+    /// Balanced reasoning depth (the default).
     #[default]
     Medium,
+    /// Maximum reasoning depth; highest latency and token usage.
     High,
 }
 

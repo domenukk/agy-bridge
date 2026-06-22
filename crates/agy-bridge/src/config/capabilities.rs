@@ -8,16 +8,27 @@ use super::DEFAULT_IMAGE_GENERATION_MODEL;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinTools {
+    /// List files and subdirectories.
     ListDir,
+    /// Regex search within directory contents.
     SearchDir,
+    /// Find files by name pattern.
     FindFile,
+    /// Read file contents.
     ViewFile,
+    /// Create a new file.
     CreateFile,
+    /// Edit an existing file.
     EditFile,
+    /// Execute a shell command.
     RunCommand,
+    /// Ask the user a question.
     AskQuestion,
+    /// Spawn a subagent.
     StartSubagent,
+    /// Generate images from text prompts.
     GenerateImage,
+    /// Signal task completion.
     Finish,
 }
 

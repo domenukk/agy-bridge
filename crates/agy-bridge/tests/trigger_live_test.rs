@@ -16,11 +16,11 @@ mod common;
 
 #[test]
 fn trigger_entry_serialization_roundtrip() {
-    let entry = agy_bridge::triggers::TriggerEntry {
-        name: "test_every".into(),
-        config: agy_bridge::triggers::TriggerConfig::every_secs(5),
-        message_template: "ping from every".into(),
-    };
+    let entry = agy_bridge::triggers::TriggerEntry::new(
+        "test_every",
+        agy_bridge::triggers::TriggerConfig::every_secs(5),
+        "ping from every",
+    );
     let json = serde_json::to_string(&entry).expect("serialize");
     let parsed: agy_bridge::triggers::TriggerEntry =
         serde_json::from_str(&json).expect("deserialize");
@@ -66,11 +66,11 @@ fn test_trigger_agent_creation() {
 
         rt.block_on(async {
             let bridge = agy_bridge::AgyBridge::builder().build()?;
-            let triggers = vec![agy_bridge::triggers::TriggerEntry {
-                name: "test_every".into(),
-                config: agy_bridge::triggers::TriggerConfig::every_secs(10),
-                message_template: "ping from every".into(),
-            }];
+            let triggers = vec![agy_bridge::triggers::TriggerEntry::new(
+                "test_every",
+                agy_bridge::triggers::TriggerConfig::every_secs(10),
+                "ping from every",
+            )];
 
             let config = AgentConfig::builder()
                 .system_instructions("You are a test agent. Reply with OK.")

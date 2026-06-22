@@ -41,23 +41,20 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     //   hooks.on_pre_tool_call_decide("safety_gate", |ctx| { ... });
 
     // Fire the pre-turn hook manually to demonstrate it.
-    hooks.run_pre_turn(&PreTurnContext {
-        prompt: "Hello from the hook demo!".into(),
-        turn_number: 1,
-    });
+    hooks.run_pre_turn(&PreTurnContext::new("Hello from the hook demo!", 1));
 
     // Fire the pre-tool-call-decide hook for a safe tool.
-    let safe_result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext {
-        tool_name: "view_file".into(),
-        tool_args: serde_json::Value::Null,
-    });
+    let safe_result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext::new(
+        "view_file",
+        serde_json::Value::Null,
+    ));
     println!("  view_file decision: allowed={}", safe_result.allow);
 
     // Fire the pre-tool-call-decide hook for the blocked tool.
-    let blocked_result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext {
-        tool_name: "dangerous_tool".into(),
-        tool_args: serde_json::Value::Null,
-    });
+    let blocked_result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext::new(
+        "dangerous_tool",
+        serde_json::Value::Null,
+    ));
     println!(
         "  dangerous_tool decision: allowed={}, reason='{}'",
         blocked_result.allow, blocked_result.message

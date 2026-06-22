@@ -31,14 +31,10 @@ use super::types::{
 ///         }
 ///     });
 ///
-/// hooks.run_pre_turn(&PreTurnContext {
-///     prompt: "hi".into(),
-///     turn_number: 1,
-/// });
-/// let result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext {
-///     tool_name: "safe_tool".into(),
-///     tool_args: serde_json::Value::Null,
-/// });
+/// hooks.run_pre_turn(&PreTurnContext::new("hi", 1));
+/// let result = hooks.run_pre_tool_call_decide(
+///     &PreToolCallDecideContext::new("safe_tool", serde_json::Value::Null),
+/// );
 /// assert!(result.allow);
 /// ```
 ///

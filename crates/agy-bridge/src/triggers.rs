@@ -147,6 +147,7 @@ impl TriggerConfig {
 }
 
 /// A named trigger attached to an agent.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerEntry {
     /// Descriptive name for the trigger (e.g. `"poll_threads"`).
@@ -160,6 +161,20 @@ pub struct TriggerEntry {
 }
 
 impl TriggerEntry {
+    /// Create a new trigger entry.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        config: TriggerConfig,
+        message_template: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            config,
+            message_template: message_template.into(),
+        }
+    }
+
     /// Validate that the entry has non-empty name and `message_template`.
     ///
     /// # Errors

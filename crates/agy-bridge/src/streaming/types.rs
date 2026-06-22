@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::types::{Step, UsageMetadata};
 
-/// The result of draining a chat response via [`ChatResponseHandle::text()`].
+/// The result of draining a chat response via [`super::ChatResponseHandle::text()`].
 ///
 /// Carries the full response text alongside optional metadata (token usage,
 /// structured output). Dereferences to `&str` for ergonomic use:
@@ -132,7 +132,7 @@ impl std::fmt::Display for StreamError {
 
 impl std::error::Error for StreamError {}
 
-/// An ordered event from a response timeline, produced by [`ChatResponseHandle::resolve`].
+/// An ordered event from a response timeline, produced by [`super::ChatResponseHandle::resolve`].
 ///
 /// Mirrors the Python SDK's `ChatResponse.resolve()` which returns
 /// `list[StreamChunk | ToolCall | ToolResult]`.

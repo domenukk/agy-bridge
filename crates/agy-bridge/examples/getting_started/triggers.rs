@@ -15,17 +15,17 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agy_bridge::load_dotenv();
     // ── 1. Build individual trigger entries ──────────────────────────────
 
-    let periodic_trigger = TriggerEntry {
-        name: "poll_threads".into(),
-        config: TriggerConfig::every_secs(30),
-        message_template: "Check threads for new updates".into(),
-    };
+    let periodic_trigger = TriggerEntry::new(
+        "poll_threads",
+        TriggerConfig::every_secs(30),
+        "Check threads for new updates",
+    );
 
-    let file_trigger = TriggerEntry {
-        name: "watch_workspace".into(),
-        config: TriggerConfig::on_file_change("/tmp/agy-bridge-demo"),
-        message_template: "Files changed in workspace: {changes}".into(),
-    };
+    let file_trigger = TriggerEntry::new(
+        "watch_workspace",
+        TriggerConfig::on_file_change("/tmp/agy-bridge-demo"),
+        "Files changed in workspace: {changes}",
+    );
 
     println!(
         "  Periodic trigger:  {}",

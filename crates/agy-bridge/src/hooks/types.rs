@@ -57,6 +57,7 @@ impl HookResult {
 /// Created when a session starts and carried through to session-end hooks
 /// so hooks can correlate events, measure session duration, and identify
 /// the agent instance.
+#[non_exhaustive]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionContext {
     /// Unique identifier for this session.
@@ -64,10 +65,22 @@ pub struct SessionContext {
     /// Numeric agent identifier within the bridge runtime.
     pub agent_id: u64,
     /// Wall-clock timestamp of when the session was started.
+    ///
+    /// Defaults to [`UNIX_EPOCH`](SystemTime::UNIX_EPOCH) if the backend
+    /// does not supply this field.
+    #[serde(default = "SessionContext::default_started_at")]
     pub started_at: SystemTime,
 }
 
+impl SessionContext {
+    /// Fallback value when `started_at` is absent from the JSON payload.
+    fn default_started_at() -> SystemTime {
+        SystemTime::UNIX_EPOCH
+    }
+}
+
 /// Context passed to [`HookPoint::OnSessionStart`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnSessionStartContext {
     /// Session metadata for the newly started session.
@@ -75,6 +88,7 @@ pub struct OnSessionStartContext {
 }
 
 /// Context passed to [`HookPoint::OnSessionEnd`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnSessionEndContext {
     /// Session metadata for the ending session.
@@ -87,6 +101,7 @@ pub struct OnSessionEndContext {
 pub struct OnCompactionContext {}
 
 /// Context passed to [`HookPoint::OnInteraction`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnInteractionContext {
     /// The interaction message content.
@@ -94,6 +109,7 @@ pub struct OnInteractionContext {
 }
 
 /// Context passed to [`HookPoint::PreTurn`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreTurnContext {
     /// The user prompt for this turn.
@@ -102,7 +118,19 @@ pub struct PreTurnContext {
     pub turn_number: u32,
 }
 
+impl PreTurnContext {
+    /// Create a new pre-turn context.
+    #[must_use]
+    pub fn new(prompt: impl Into<String>, turn_number: u32) -> Self {
+        Self {
+            prompt: prompt.into(),
+            turn_number,
+        }
+    }
+}
+
 /// Context passed to [`HookPoint::PostTurn`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostTurnContext {
     /// The model's response text for this turn.
@@ -112,6 +140,7 @@ pub struct PostTurnContext {
 }
 
 /// Context passed to [`HookPoint::PreToolCallDecide`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreToolCallDecideContext {
     /// Name of the tool about to be called.
@@ -122,7 +151,19 @@ pub struct PreToolCallDecideContext {
     pub tool_args: serde_json::Value,
 }
 
+impl PreToolCallDecideContext {
+    /// Create a new pre-tool-call-decide context.
+    #[must_use]
+    pub fn new(tool_name: impl Into<String>, tool_args: serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            tool_args,
+        }
+    }
+}
+
 /// Context passed to [`HookPoint::PostToolCall`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostToolCallContext {
     /// Name of the tool that was called.
@@ -139,6 +180,7 @@ pub struct PostToolCallContext {
 }
 
 /// Context passed to [`HookPoint::OnToolError`] hooks.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnToolErrorContext {
     /// Name of the tool that errored.
