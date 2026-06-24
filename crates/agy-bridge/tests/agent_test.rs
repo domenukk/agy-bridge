@@ -42,12 +42,14 @@ impl agy_bridge::agent::Runtime for MockRuntime {
         // Record the user message in history.
         let text = content.as_text().unwrap_or("(non-text)").to_owned();
 
-        if let Ok(mut h) = self.history.lock() {
-            h.push(agy_bridge::types::ConversationMessage {
-                role: agy_bridge::types::MessageRole::User,
-                content: text,
-            });
-        }
+        let mut h = self
+            .history
+            .lock()
+            .expect("history mutex poisoned in test mock");
+        h.push(agy_bridge::types::ConversationMessage {
+            role: agy_bridge::types::MessageRole::User,
+            content: text,
+        });
 
         self.turn_count.fetch_add(1, Ordering::SeqCst);
 
@@ -143,9 +145,11 @@ impl agy_bridge::agent::Runtime for MockRuntime {
     }
 
     async fn clear_history(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<(), Error> {
-        if let Ok(mut h) = self.history.lock() {
-            h.clear();
-        }
+        let mut h = self
+            .history
+            .lock()
+            .expect("history mutex poisoned in test mock");
+        h.clear();
         self.turn_count.store(0, Ordering::SeqCst);
         Ok(())
     }

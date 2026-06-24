@@ -183,7 +183,7 @@ where
     std::thread::sleep(stagger);
 
     let start = std::time::Instant::now();
-    let budget = std::time::Duration::from_mins(3);
+    let budget = std::time::Duration::from_mins(5);
     let mut sleep_duration = std::time::Duration::from_secs(5);
     let mut attempt = 1;
 

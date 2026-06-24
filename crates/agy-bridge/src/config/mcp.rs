@@ -216,12 +216,12 @@ mod tests {
     };
 
     fn py_pydantic_field_default(module: &str, class: &str, field: &str) -> f64 {
-        pyo3::prepare_freethreaded_python();
-        pyo3::Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
             crate::runtime::venv::configure_python_sys_path(py)
                 .unwrap_or_else(|e| panic!("Failed to configure python sys.path: {e}"));
             let m = py
-                .import_bound(module)
+                .import(module)
                 .unwrap_or_else(|e| panic!("Failed to import {module}: {e}"));
             let cls = m
                 .getattr(class)

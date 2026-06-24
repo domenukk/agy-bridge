@@ -198,7 +198,9 @@ pub static PYTHON_SEND_SCRIPT: std::sync::LazyLock<String> = std::sync::LazyLock
         r"
 async def _send(agent, prompt):
     decoded = _decode_prompt(prompt)
-    conv = agent.conversation
+    conv = getattr(agent, 'conversation', None)
+    if conv is None:
+        raise RuntimeError('agent.conversation is not available; cannot send')
     await conv.send(decoded)
 "
     )
@@ -206,13 +208,17 @@ async def _send(agent, prompt):
 
 pub const PYTHON_SIGNAL_IDLE_SCRIPT: &str = r"
 async def _signal_idle(agent):
-    conv = agent.conversation
+    conv = getattr(agent, 'conversation', None)
+    if conv is None:
+        raise RuntimeError('agent.conversation is not available; cannot signal idle')
     await conv.signal_idle()
 ";
 
 pub const PYTHON_WAIT_FOR_WAKEUP_SCRIPT: &str = r"
 async def _wait_for_wakeup(agent, timeout_secs):
-    conv = agent.conversation
+    conv = getattr(agent, 'conversation', None)
+    if conv is None:
+        raise RuntimeError('agent.conversation is not available; cannot wait for wakeup')
     return await conv.wait_for_wakeup(timeout=timeout_secs)
 ";
 
@@ -221,6 +227,8 @@ async def _wait_for_wakeup(agent, timeout_secs):
 pub const PYTHON_EXTRACT_METADATA_SCRIPT: &str = r"
 def _extract(response, agent):
     import json
+    import logging
+    _log = logging.getLogger('agy_bridge.extract_metadata')
     u = getattr(response, 'usage_metadata', None)
     if u is None and agent is not None:
         conv = getattr(agent, 'conversation', None)
@@ -238,6 +246,7 @@ def _extract(response, agent):
             try:
                 u_json = json.dumps(dict(u))
             except Exception:
+                _log.warning('Failed to serialize usage_metadata via dict(), falling back to to_json()', exc_info=True)
                 u_json = getattr(u, 'to_json', lambda: None)()
     if s is not None:
         if hasattr(s, 'model_dump_json'):
@@ -248,6 +257,7 @@ def _extract(response, agent):
             try:
                 s_json = json.dumps(dict(s))
             except Exception:
+                _log.warning('Failed to serialize structured_output via dict(), falling back to to_json()', exc_info=True)
                 s_json = getattr(s, 'to_json', lambda: None)()
     return (u_json, s_json)
 ";

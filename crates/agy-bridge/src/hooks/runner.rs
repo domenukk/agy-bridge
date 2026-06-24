@@ -32,9 +32,10 @@ use super::types::{
 ///     });
 ///
 /// hooks.run_pre_turn(&PreTurnContext::new("hi", 1));
-/// let result = hooks.run_pre_tool_call_decide(
-///     &PreToolCallDecideContext::new("safe_tool", serde_json::Value::Null),
-/// );
+/// let result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext::new(
+///     "safe_tool",
+///     serde_json::Value::Null,
+/// ));
 /// assert!(result.allow);
 /// ```
 ///

@@ -751,17 +751,17 @@ mod tests {
     //
     // These tests import the live Python SDK and verify that our Rust
     // constants haven't drifted from the canonical Python values.  They
-    // require `pyo3::prepare_freethreaded_python()` and a venv with the
+    // require `pyo3::Python::initialize()` and a venv with the
     // SDK installed.
 
     /// Helper: extract a Python module-level attribute as a `String`.
     fn py_str_attr(module: &str, attr: &str) -> String {
-        pyo3::prepare_freethreaded_python();
-        pyo3::Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
             crate::runtime::venv::configure_python_sys_path(py)
                 .unwrap_or_else(|e| panic!("Failed to configure python sys.path: {e}"));
             let m = py
-                .import_bound(module)
+                .import(module)
                 .unwrap_or_else(|e| panic!("Failed to import {module}: {e}"));
             m.getattr(attr)
                 .unwrap_or_else(|e| panic!("Failed to get {module}.{attr}: {e}"))

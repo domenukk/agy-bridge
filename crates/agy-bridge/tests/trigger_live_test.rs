@@ -90,8 +90,17 @@ fn test_trigger_agent_creation() {
                 }
                 Err(e) => {
                     // Transient backend errors (workspace discovery, etc.) are
-                    // acceptable — the point is that agent creation succeeded.
-                    eprintln!("Trigger agent prompt returned error (acceptable): {e}");
+                    // acceptable — but only specific error types.
+                    let err_str = e.to_string();
+                    assert!(
+                        err_str.contains("Backend")
+                            || err_str.contains("timeout")
+                            || err_str.contains("Timeout")
+                            || err_str.contains("429")
+                            || err_str.contains("workspace"),
+                        "Unexpected error type from trigger agent test: {e}"
+                    );
+                    eprintln!("Trigger agent prompt returned expected error: {e}");
                 }
             }
 

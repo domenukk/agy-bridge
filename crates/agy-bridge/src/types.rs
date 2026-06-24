@@ -353,9 +353,11 @@ pub struct Step {
 macro_rules! impl_from_py_object {
     ($($t:ty),+) => {
         $(
-            impl<'py> pyo3::FromPyObject<'py> for $t {
-                fn extract_bound(ob: &pyo3::Bound<'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
-                    pythonize::depythonize(ob).map_err(|e| {
+            impl<'a, 'py> pyo3::FromPyObject<'a, 'py> for $t {
+                type Error = pyo3::PyErr;
+
+                fn extract(ob: pyo3::Borrowed<'a, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+                    pythonize::depythonize(&*ob).map_err(|e| {
                         pyo3::exceptions::PyValueError::new_err(format!(
                             "Failed to deserialize {} from Python dict: {}",
                             stringify!($t),
@@ -954,9 +956,9 @@ mod tests {
     #[test]
     fn test_pyo3_extract_roundtrip() {
         use pyo3::{prelude::*, types::PyDictMethods};
-        pyo3::prepare_freethreaded_python();
-        pyo3::Python::with_gil(|py| {
-            let dict = pyo3::types::PyDict::new_bound(py);
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let dict = pyo3::types::PyDict::new(py);
             dict.set_item("id", "step-1").unwrap();
             dict.set_item("step_index", 42).unwrap();
             dict.set_item("type", "TEXT_RESPONSE").unwrap();
@@ -973,7 +975,7 @@ mod tests {
             assert_eq!(step.status, StepStatus::Done);
 
             // Now test an enum
-            let s = pyo3::types::PyString::new_bound(py, "SYSTEM_MESSAGE");
+            let s = pyo3::types::PyString::new(py, "SYSTEM_MESSAGE");
             let st: StepType = s.extract().unwrap();
             assert_eq!(st, StepType::SystemMessage);
         });

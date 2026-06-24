@@ -445,28 +445,26 @@ mod tests {
     /// Verify our `BuiltinTools` enum exactly matches the Python SDK's tool names.
     #[test]
     fn builtin_tools_match_python_sdk() {
-        pyo3::prepare_freethreaded_python();
-        pyo3::Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
             crate::runtime::venv::configure_python_sys_path(py)
                 .unwrap_or_else(|e| panic!("Failed to configure python sys.path: {e}"));
             let types_mod = py
-                .import_bound("google.antigravity.types")
+                .import("google.antigravity.types")
                 .expect("Failed to import google.antigravity.types");
             let bt = types_mod
                 .getattr("BuiltinTools")
                 .expect("Failed to get BuiltinTools");
             // BuiltinTools is a (str, Enum) subclass — use `list(BuiltinTools)`
             // to iterate members, then extract `.value` from each.
-            let builtins = py
-                .import_bound("builtins")
-                .expect("Failed to import builtins");
+            let builtins = py.import("builtins").expect("Failed to import builtins");
             let members = builtins
                 .getattr("list")
                 .expect("Failed to get list")
                 .call1((bt,))
                 .expect("Failed to call list(BuiltinTools)");
             let py_tools: Vec<String> = members
-                .iter()
+                .try_iter()
                 .expect("Failed to iter members")
                 .map(|item| {
                     item.and_then(|v| v.getattr("value"))

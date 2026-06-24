@@ -5,8 +5,6 @@
 //! They look up per-agent state in [`bridge_state()`] and dispatch to the
 //! appropriate Rust handler.
 
-#![expect(clippy::useless_conversion)] // PyO3 #[pyfunction] wrapper generates .into() on PyErr
-
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -54,8 +52,21 @@ fn dispatch_hook_by_name(
                 .map_err(|e| crate::error::Error::BackendError {
                     message: format!("Failed to deserialize PreToolCallDecideContext: {e} | JSON was: {context_json}"),
                 })?;
+            // Run transform hooks first to get possibly-modified args.
+            let transformed_args = hook_runner.run_transform_tool_input(&ctx);
             let hook_result = hook_runner.run_pre_tool_call_decide(&ctx);
-            result_json = serde_json::to_string(&hook_result).map_err(|e| {
+            // Combine the decide result with any transformed args.
+            let mut result_val = serde_json::to_value(&hook_result).map_err(|e| {
+                crate::error::Error::BackendError {
+                    message: format!("Failed to serialize PreToolCallDecide result: {e}"),
+                }
+            })?;
+            if transformed_args != ctx.tool_args
+                && let serde_json::Value::Object(ref mut map) = result_val
+            {
+                map.insert("transformed_args".to_owned(), transformed_args);
+            }
+            result_json = serde_json::to_string(&result_val).map_err(|e| {
                 crate::error::Error::BackendError {
                     message: format!("Failed to serialize PreToolCallDecide result: {e}"),
                 }
@@ -111,7 +122,9 @@ fn dispatch_hook_by_name(
             })?;
         }
         _ => {
-            tracing::warn!("Unknown hook point: {}", hook_point);
+            return Err(crate::error::Error::BackendError {
+                message: format!("Unknown hook point: {hook_point}"),
+            });
         }
     }
     Ok(result_json)
@@ -308,12 +321,12 @@ pub(crate) fn dispatch_rust_tool<'py>(
             .dispatch(&name, args, &ctx)
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let res = Python::with_gil(|py| -> PyResult<PyObject> {
-            let dict = pyo3::types::PyDict::new_bound(py);
+        let res = Python::attach(|py| -> PyResult<Py<PyAny>> {
+            let dict = pyo3::types::PyDict::new(py);
             dict.set_item("content", output.content())?;
             let metadata_val = pythonize::pythonize(py, output.metadata())?;
             dict.set_item("metadata", metadata_val)?;
-            Ok(dict.into_py(py))
+            Ok(dict.into_any().unbind())
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(res)

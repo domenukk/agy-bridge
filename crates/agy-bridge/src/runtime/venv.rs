@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 /// We avoid `site.getsitepackages()` because on Debian/Ubuntu systems it
 /// returns `dist-packages` paths that don't match the venv layout.
 pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
-    let sys = py.import_bound("sys")?;
+    let sys = py.import("sys")?;
 
     let workspace_root = match std::env::var("CARGO_MANIFEST_DIR").ok() {
         Some(dir) if !dir.is_empty() => discover_venv_root(std::path::Path::new(&dir)),
@@ -36,7 +36,7 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
         return Ok(());
     }
 
-    let os = py.import_bound("os")?;
+    let os = py.import("os")?;
     let environ = os.getattr("environ")?;
     environ.set_item("VIRTUAL_ENV", venv.to_string_lossy().to_string())?;
     tracing::debug!(path = %venv.display(), "Set VIRTUAL_ENV in Python os.environ");
@@ -76,7 +76,7 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
 
     if site_packages.is_dir() {
         let sp_str = site_packages.to_string_lossy().to_string();
-        let site_mod = py.import_bound("site")?;
+        let site_mod = py.import("site")?;
         site_mod.call_method1("addsitedir", (sp_str.as_str(),))?;
         tracing::debug!(path = %sp_str, "Added venv site-packages via site.addsitedir()");
     }

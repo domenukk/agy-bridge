@@ -1,4 +1,4 @@
-def init_agent(config_json, agent_id_u64, agent_cls):
+def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     import logging, sys
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -16,6 +16,7 @@ def init_agent(config_json, agent_id_u64, agent_cls):
             )
 
             LocalConnection._real_current_turn_context = None
+            LocalConnection._idle_deferred = False
 
             @property
             def current_turn_context(self):
@@ -24,17 +25,14 @@ def init_agent(config_json, agent_id_u64, agent_cls):
             @current_turn_context.setter
             def current_turn_context(self, value):
                 self._real_current_turn_context = value
-                if value is None:
-                    if getattr(self, "_parent_idle", False) and not getattr(
-                        self, "_active_subagent_ids", set()
-                    ):
-                        logger.info(
-                            "[MONKEYPATCH] Triggering delayed is_idle.set() now that current_turn_context is None"
-                        )
-                        if hasattr(self, "_is_idle") and hasattr(
-                            self._is_idle, "_event"
-                        ):
-                            self._is_idle._event.set()
+                # When the turn context is cleared, fire any deferred idle signal.
+                if value is None and getattr(self, "_idle_deferred", False):
+                    self._idle_deferred = False
+                    logger.info(
+                        "[MONKEYPATCH] Firing deferred is_idle.set() now that _current_turn_context is None"
+                    )
+                    # Access the real asyncio.Event inside PatchedEvent to bypass the guard.
+                    self._is_idle._event.set()
 
             LocalConnection._current_turn_context = current_turn_context
 
@@ -52,8 +50,9 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                     def set(self):
                         if self._conn._current_turn_context is not None:
                             logger.info(
-                                "[MONKEYPATCH] Delaying is_idle.set() because _current_turn_context is not None"
+                                "[MONKEYPATCH] Deferring is_idle.set() because _current_turn_context is not None"
                             )
+                            self._conn._idle_deferred = True
                             return
                         self._event.set()
 
@@ -68,6 +67,7 @@ def init_agent(config_json, agent_id_u64, agent_cls):
 
                 self._is_idle = PatchedEvent(original_event, self)
                 self._real_current_turn_context = None
+                self._idle_deferred = False
 
             LocalConnection.__init__ = patched_init
 
@@ -122,6 +122,17 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                 raise RuntimeError(
                     "dispatch_rust_tool not found in _agy_bridge_globals"
                 )
+            if not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
+                globals_mod.CURRENT_TOOL_CALLS = {}
+
+            class DummyToolCall:
+                def __init__(self, name, args):
+                    self.name = name
+                    self.args = args
+
+            globals_mod.CURRENT_TOOL_CALLS[int(self.agent_id)] = DummyToolCall(
+                self.__name__, kwargs
+            )
             args_json = json.dumps(kwargs)
 
             # PyO3 future_into_py returns an awaitable, but iscoroutinefunction is False.
@@ -245,66 +256,82 @@ def init_agent(config_json, agent_id_u64, agent_cls):
 
             registered_hooks = []
             for entry in hooks_entries:
-                hook_name = entry.get("name", "unnamed")
-                hook_point = entry.get("point", "")
-                # Translate CamelCase (e.g. PreTurn) to snake_case (e.g. pre_turn)
-                sdk_point = re.sub(r"(?<!^)(?=[A-Z])", "_", hook_point).lower()
+                try:
+                    hook_name = entry.get("name", "unnamed")
+                    hook_point = entry.get("point", "")
+                    # Translate CamelCase (e.g. PreTurn) to snake_case (e.g. pre_turn)
+                    sdk_point = re.sub(r"(?<!^)(?=[A-Z])", "_", hook_point).lower()
 
-                decorator = getattr(hooks_module, sdk_point, None)
-                if decorator is None:
-                    hook_logger.warning(
-                        "Unknown or unsupported hook point %r (translated to %r) for hook %r, skipping",
-                        hook_point,
-                        sdk_point,
-                        hook_name,
-                    )
-                    continue
+                    decorator = getattr(hooks_module, sdk_point, None)
+                    if decorator is None:
+                        hook_logger.warning(
+                            "Unknown or unsupported hook point %r (translated to %r) for hook %r, skipping",
+                            hook_point,
+                            sdk_point,
+                            hook_name,
+                        )
+                        continue
 
-                def _make_hook_cb(name, point_label):
-                    """Factory to capture name/point_label per hook."""
+                    def _make_hook_cb(name, point_label):
+                        """Factory to capture name/point_label per hook."""
 
-                    async def _hook_callback(ctx=None):
-                        import json, inspect
+                        async def _hook_callback(ctx=None):
+                            import json, inspect
 
-                        globals_mod = sys.modules.get("_agy_bridge_globals")
-                        if not globals_mod or not hasattr(
-                            globals_mod, "dispatch_rust_hook"
-                        ):
-                            hook_logger.warning(
-                                "dispatch_rust_hook not found in _agy_bridge_globals, skipping hook %r",
-                                name,
-                            )
-                            return
-
-                        if point_label == "pre_tool_call_decide":
-                            if globals_mod:
-                                globals_mod.CURRENT_TOOL_CALL = ctx
-
-                        # Map SDK context types to JSON for the Rust hook handler.
-                        # The SDK passes known pydantic types: ToolCall, ToolResult,
-                        # Content (str or BaseModel), or None (session hooks).
-                        try:
-                            if point_label == "post_tool_call":
-                                current_tool_call = (
-                                    getattr(globals_mod, "CURRENT_TOOL_CALL", None)
-                                    if globals_mod
-                                    else None
+                            globals_mod = sys.modules.get("_agy_bridge_globals")
+                            if not globals_mod or not hasattr(
+                                globals_mod, "dispatch_rust_hook"
+                            ):
+                                hook_logger.warning(
+                                    "dispatch_rust_hook not found in _agy_bridge_globals, skipping hook %r",
+                                    name,
                                 )
-                                tool_args = (
-                                    getattr(current_tool_call, "args", {})
-                                    if current_tool_call
-                                    else {}
-                                )
-                                if hasattr(tool_args, "model_dump"):
-                                    tool_args = tool_args.model_dump()
-                                elif hasattr(tool_args, "dict"):
-                                    tool_args = tool_args.dict()
+                                if point_label in (
+                                    "pre_turn",
+                                    "pre_tool_call_decide",
+                                    "on_interaction",
+                                ):
+                                    return hooks_module.HookResult(
+                                        allow=False,
+                                        message="dispatch_rust_hook not found in _agy_bridge_globals",
+                                    )
+                                return
 
-                                result_val = getattr(ctx, "result", None)
-                                result_str = ""
-                                metadata = {}
-                                if result_val is not None:
-                                    if (
+                            if point_label == "pre_tool_call_decide":
+                                if globals_mod:
+                                    if not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
+                                        globals_mod.CURRENT_TOOL_CALLS = {}
+                                    globals_mod.CURRENT_TOOL_CALLS[agent_id_u64] = ctx
+
+                            # Map SDK context types to JSON for the Rust hook handler.
+                            # The SDK passes known pydantic types: ToolCall, ToolResult,
+                            # Content (str or BaseModel), or None (session hooks).
+                            try:
+                                if point_label == "post_tool_call":
+                                    current_tool_call = (
+                                        globals_mod.CURRENT_TOOL_CALLS.get(agent_id_u64)
+                                        if globals_mod
+                                        and hasattr(globals_mod, "CURRENT_TOOL_CALLS")
+                                        else None
+                                    )
+                                    tool_args = (
+                                        getattr(current_tool_call, "args", {})
+                                        if current_tool_call
+                                        else {}
+                                    )
+                                    if hasattr(tool_args, "model_dump"):
+                                        tool_args = tool_args.model_dump()
+                                    elif hasattr(tool_args, "dict"):
+                                        tool_args = tool_args.dict()
+
+                                    result_val = getattr(ctx, "result", None)
+                                    result_str = ""
+                                    metadata = {}
+                                    if result_val is None:
+                                        result_str = ""
+                                    elif isinstance(result_val, str):
+                                        result_str = result_val
+                                    elif (
                                         isinstance(result_val, dict)
                                         and "content" in result_val
                                     ):
@@ -335,185 +362,213 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                                                 else:
                                                     result_str = json.dumps(result_val)
                                             except Exception:
+                                                logging.getLogger(
+                                                    "agy_bridge.tool_dispatch"
+                                                ).warning(
+                                                    "Failed to JSON-serialize tool result, falling back to str()",
+                                                    exc_info=True,
+                                                )
                                                 result_str = str(result_val)
-                                    result_str = ""
-                                elif isinstance(result_val, str):
-                                    result_str = result_val
-                                else:
-                                    try:
-                                        if hasattr(result_val, "model_dump_json"):
-                                            result_str = result_val.model_dump_json()
-                                        elif hasattr(result_val, "model_dump"):
-                                            result_str = json.dumps(
-                                                result_val.model_dump()
-                                            )
-                                        else:
-                                            result_str = json.dumps(result_val)
-                                    except Exception:
-                                        result_str = str(result_val)
 
-                                tool_name = getattr(ctx, "name", "")
-                                if hasattr(tool_name, "value"):
-                                    tool_name = tool_name.value
-                                elif not isinstance(tool_name, str):
-                                    tool_name = str(tool_name)
+                                    tool_name = getattr(ctx, "name", "")
+                                    if hasattr(tool_name, "value"):
+                                        tool_name = tool_name.value
+                                    elif not isinstance(tool_name, str):
+                                        tool_name = str(tool_name)
 
-                                payload = {
-                                    "name": tool_name,
-                                    "args": tool_args,
-                                    "result": result_str,
-                                    "metadata": metadata,
-                                }
-                                ctx_json = json.dumps(payload)
-                            elif point_label == "on_tool_error":
-                                current_tool_call = (
-                                    getattr(globals_mod, "CURRENT_TOOL_CALL", None)
-                                    if globals_mod
-                                    else None
-                                )
-                                tool_name = (
-                                    getattr(current_tool_call, "name", "")
-                                    if current_tool_call
-                                    else ""
-                                )
-                                tool_args = (
-                                    getattr(current_tool_call, "args", {})
-                                    if current_tool_call
-                                    else {}
-                                )
-                                if hasattr(tool_args, "model_dump"):
-                                    tool_args = tool_args.model_dump()
-                                elif hasattr(tool_args, "dict"):
-                                    tool_args = tool_args.dict()
-
-                                if hasattr(tool_name, "value"):
-                                    tool_name = tool_name.value
-                                elif not isinstance(tool_name, str):
-                                    tool_name = str(tool_name)
-
-                                payload = {
-                                    "tool_name": tool_name,
-                                    "tool_args": tool_args,
-                                    "error": str(ctx),
-                                }
-                                ctx_json = json.dumps(payload)
-                            elif ctx is None:
-                                if point_label in (
-                                    "on_session_start",
-                                    "on_session_end",
-                                ):
-                                    conversation_id = local_config.get(
-                                        "conversation_id"
-                                    )
-                                    if not conversation_id:
-                                        workspaces = local_config.get("workspaces")
-                                        if (
-                                            workspaces
-                                            and isinstance(workspaces, list)
-                                            and len(workspaces) > 0
-                                            and workspaces[0]
-                                        ):
-                                            import os
-
-                                            conversation_id = os.path.basename(
-                                                str(workspaces[0]).rstrip("/")
-                                            )
-                                    if not conversation_id:
-                                        conversation_id = "default_session"
                                     payload = {
-                                        "session": {
-                                            "session_id": str(conversation_id),
-                                            "agent_id": int(agent_id_u64),
-                                        }
+                                        "name": tool_name,
+                                        "args": tool_args,
+                                        "result": result_str,
+                                        "metadata": metadata,
                                     }
                                     ctx_json = json.dumps(payload)
-                                else:
-                                    ctx_json = "{}"
-                            elif point_label == "post_turn":
-                                text_val = getattr(ctx, "text", str(ctx))
-                                ctx_json = json.dumps(
-                                    {
-                                        "response_text": text_val,
-                                        "turn_number": getattr(ctx, "turn_number", 0),
-                                    }
-                                )
-                            elif point_label == "pre_turn":
-                                text_val = ctx if isinstance(ctx, str) else str(ctx)
-                                ctx_json = json.dumps(
-                                    {
-                                        "prompt": text_val,
-                                        "turn_number": getattr(ctx, "turn_number", 0),
-                                    }
-                                )
-                            elif isinstance(ctx, str):
-                                ctx_json = json.dumps({"value": ctx})
-                            elif hasattr(ctx, "model_dump_json"):
-                                ctx_json = ctx.model_dump_json()
-                            elif isinstance(ctx, dict):
-                                ctx_json = json.dumps(ctx)
-                            else:
-                                ctx_json = json.dumps(str(ctx))
-                        except Exception as e:
-                            hook_logger.error(
-                                "Failed to serialize hook context for %r: %s", name, e
-                            )
-                            ctx_json = "{}"
+                                elif point_label == "on_tool_error":
+                                    current_tool_call = (
+                                        globals_mod.CURRENT_TOOL_CALLS.get(agent_id_u64)
+                                        if globals_mod
+                                        and hasattr(globals_mod, "CURRENT_TOOL_CALLS")
+                                        else None
+                                    )
+                                    tool_name = (
+                                        getattr(current_tool_call, "name", "")
+                                        if current_tool_call
+                                        else ""
+                                    )
+                                    tool_args = (
+                                        getattr(current_tool_call, "args", {})
+                                        if current_tool_call
+                                        else {}
+                                    )
+                                    if hasattr(tool_args, "model_dump"):
+                                        tool_args = tool_args.model_dump()
+                                    elif hasattr(tool_args, "dict"):
+                                        tool_args = tool_args.dict()
 
-                        try:
-                            res = globals_mod.dispatch_rust_hook(
-                                int(agent_id_u64), point_label, ctx_json
-                            )
-                            if inspect.isawaitable(res):
-                                result_json = await res
-                            else:
-                                result_json = res
-                        except Exception as e:
-                            hook_logger.error(
-                                "dispatch_rust_hook failed for %r: %s", name, e
-                            )
+                                    if hasattr(tool_name, "value"):
+                                        tool_name = tool_name.value
+                                    elif not isinstance(tool_name, str):
+                                        tool_name = str(tool_name)
+
+                                    payload = {
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                        "error": str(ctx),
+                                    }
+                                    ctx_json = json.dumps(payload)
+                                elif ctx is None:
+                                    if point_label in (
+                                        "on_session_start",
+                                        "on_session_end",
+                                    ):
+                                        conversation_id = local_config.get(
+                                            "conversation_id"
+                                        )
+                                        if not conversation_id:
+                                            workspaces = local_config.get("workspaces")
+                                            if (
+                                                workspaces
+                                                and isinstance(workspaces, list)
+                                                and len(workspaces) > 0
+                                                and workspaces[0]
+                                            ):
+                                                import os
+
+                                                conversation_id = os.path.basename(
+                                                    str(workspaces[0]).rstrip("/")
+                                                )
+                                        if not conversation_id:
+                                            conversation_id = "default_session"
+                                        payload = {
+                                            "session": {
+                                                "session_id": str(conversation_id),
+                                                "agent_id": int(agent_id_u64),
+                                            }
+                                        }
+                                        ctx_json = json.dumps(payload)
+                                    else:
+                                        ctx_json = "{}"
+                                elif point_label == "post_turn":
+                                    text_val = getattr(ctx, "text", str(ctx))
+                                    ctx_json = json.dumps(
+                                        {
+                                            "response_text": text_val,
+                                            "turn_number": getattr(
+                                                ctx, "turn_number", 0
+                                            ),
+                                        }
+                                    )
+                                elif point_label == "pre_turn":
+                                    text_val = ctx if isinstance(ctx, str) else str(ctx)
+                                    ctx_json = json.dumps(
+                                        {
+                                            "prompt": text_val,
+                                            "turn_number": getattr(
+                                                ctx, "turn_number", 0
+                                            ),
+                                        }
+                                    )
+                                elif isinstance(ctx, str):
+                                    ctx_json = json.dumps({"value": ctx})
+                                elif hasattr(ctx, "model_dump_json"):
+                                    ctx_json = ctx.model_dump_json()
+                                elif isinstance(ctx, dict):
+                                    ctx_json = json.dumps(ctx)
+                                else:
+                                    ctx_json = json.dumps(str(ctx))
+                            except Exception as e:
+                                hook_logger.error(
+                                    "Failed to serialize hook context for %r: %s",
+                                    name,
+                                    e,
+                                )
+                                if point_label in (
+                                    "pre_turn",
+                                    "pre_tool_call_decide",
+                                    "on_interaction",
+                                ):
+                                    return hooks_module.HookResult(
+                                        allow=False,
+                                        message=f"Failed to serialize hook context: {e}",
+                                    )
+                                ctx_json = "{}"
+
+                            try:
+                                res = globals_mod.dispatch_rust_hook(
+                                    int(agent_id_u64), point_label, ctx_json
+                                )
+                                if inspect.isawaitable(res):
+                                    result_json = await res
+                                else:
+                                    result_json = res
+                            except Exception as e:
+                                hook_logger.error(
+                                    "dispatch_rust_hook failed for %r: %s", name, e
+                                )
+                                if point_label in (
+                                    "pre_turn",
+                                    "pre_tool_call_decide",
+                                    "on_interaction",
+                                ):
+                                    return hooks_module.HookResult(
+                                        allow=False, message=str(e)
+                                    )
+                                return
+
+                            if result_json:
+                                try:
+                                    res_dict = json.loads(result_json)
+                                    if "allow" in res_dict:
+                                        return hooks_module.HookResult(
+                                            allow=res_dict.get("allow", True),
+                                            message=res_dict.get("message", ""),
+                                        )
+                                except json.JSONDecodeError as e:
+                                    hook_logger.error(
+                                        "Failed to decode hook result JSON %r: %s",
+                                        result_json,
+                                        e,
+                                    )
+                                    if point_label in (
+                                        "pre_turn",
+                                        "pre_tool_call_decide",
+                                        "on_interaction",
+                                    ):
+                                        return hooks_module.HookResult(
+                                            allow=False,
+                                            message=f"Invalid hook result JSON: {e}",
+                                        )
+
                             if point_label in (
                                 "pre_turn",
                                 "pre_tool_call_decide",
                                 "on_interaction",
                             ):
-                                return hooks_module.HookResult(
-                                    allow=True, message=str(e)
-                                )
-                            return
+                                return hooks_module.HookResult(allow=True, message="")
 
-                        if result_json:
-                            try:
-                                res_dict = json.loads(result_json)
-                                if "allow" in res_dict:
-                                    return hooks_module.HookResult(
-                                        allow=res_dict.get("allow", True),
-                                        message=res_dict.get("message", ""),
-                                    )
-                            except json.JSONDecodeError:
-                                pass
+                        return _hook_callback
 
-                        if point_label in (
-                            "pre_turn",
-                            "pre_tool_call_decide",
-                            "on_interaction",
-                        ):
-                            return hooks_module.HookResult(allow=True, message="")
+                    callback = _make_hook_cb(hook_name, sdk_point)
 
-                    return _hook_callback
+                    decorator = getattr(hooks_module, sdk_point, None)
+                    if decorator is None:
+                        hook_logger.warning(
+                            "SDK does not support hook decorator for %r, skipping hook %r",
+                            sdk_point,
+                            hook_name,
+                        )
+                        continue
 
-                callback = _make_hook_cb(hook_name, sdk_point)
-
-                decorator = getattr(hooks_module, sdk_point, None)
-                if decorator is None:
-                    hook_logger.warning(
-                        "SDK does not support hook decorator for %r, skipping hook %r",
-                        sdk_point,
-                        hook_name,
+                    registered_hooks.append(decorator(callback))
+                    hook_logger.info(
+                        "Registered hook %r at point %s", hook_name, sdk_point
                     )
-                    continue
-
-                registered_hooks.append(decorator(callback))
-                hook_logger.info("Registered hook %r at point %s", hook_name, sdk_point)
+                except Exception as exc:
+                    hook_logger.error(
+                        "Failed to register hook %r: %s",
+                        entry.get("name", "unnamed"),
+                        exc,
+                    )
 
             if registered_hooks:
                 existing = local_config.get("hooks", [])
@@ -526,10 +581,6 @@ def init_agent(config_json, agent_id_u64, agent_cls):
             hook_logger.warning(
                 "google.antigravity.hooks.hooks module not available, skipping hook registration"
             )
-        except Exception as exc:
-
-            hook_logger = logging.getLogger("agy_bridge.hooks")
-            hook_logger.error("Failed to register hooks: %s", exc)
 
     # --- Wire triggers using SDK primitives ---
     trigger_entries = local_config.pop("triggers", [])
@@ -557,33 +608,44 @@ def init_agent(config_json, agent_id_u64, agent_cls):
                 return _trigger_callback
 
             for entry in trigger_entries:
-                trigger_name = entry.get("name", "unnamed")
-                config = entry.get("config", {})
-                message_template = entry.get("message_template", "")
+                try:
+                    trigger_name = entry.get("name", "unnamed")
+                    config = entry.get("config", {})
+                    message_template = entry.get("message_template", "")
 
-                callback = _make_trigger_cb(trigger_name, message_template)
+                    callback = _make_trigger_cb(trigger_name, message_template)
 
-                if "Every" in config:
-                    interval_secs = config["Every"].get("interval", 0)
-                    sdk_triggers.append(every(interval_secs, callback))
-                    trigger_logger.info(
-                        "Registered every(%ds) trigger %r", interval_secs, trigger_name
+                    if "Every" in config:
+                        interval_secs = config["Every"].get("interval", 0)
+                        sdk_triggers.append(every(interval_secs, callback))
+                        trigger_logger.info(
+                            "Registered every(%ds) trigger %r",
+                            interval_secs,
+                            trigger_name,
+                        )
+                    elif "OnFileChange" in config:
+                        path = config["OnFileChange"].get("path", "")
+                        sdk_triggers.append(on_file_change(path, callback))
+                        trigger_logger.info(
+                            "Registered on_file_change(%r) trigger %r",
+                            path,
+                            trigger_name,
+                        )
+                    else:
+                        trigger_logger.warning(
+                            "Unknown trigger config for %r: %s, skipping",
+                            trigger_name,
+                            config,
+                        )
+                except Exception as exc:
+                    trigger_logger.error(
+                        "Failed to register trigger %r: %s",
+                        entry.get("name", "unnamed"),
+                        exc,
                     )
-                elif "OnFileChange" in config:
-                    path = config["OnFileChange"].get("path", "")
-                    sdk_triggers.append(on_file_change(path, callback))
-                    trigger_logger.info(
-                        "Registered on_file_change(%r) trigger %r", path, trigger_name
-                    )
-                else:
-                    trigger_logger.warning(
-                        "Unknown trigger config for %r: %s, skipping",
-                        trigger_name,
-                        config,
-                    )
-        except Exception as exc:
+        except ImportError:
             trigger_logger = logging.getLogger("agy_bridge.triggers")
-            trigger_logger.error("Failed to register triggers: %s", exc)
+            trigger_logger.error("Failed to import trigger modules: %s", exc)
 
     # --- Wire MCP Servers ---
     # Rust serializes MCP servers as JSON dicts with a "type" discriminator.
@@ -738,10 +800,22 @@ def init_agent(config_json, agent_id_u64, agent_cls):
             if not enter_event.is_set():
                 enter_event.set()
 
-    globals_mod = sys.modules.get("_agy_bridge_globals")
-    if not globals_mod or not hasattr(globals_mod, "EVENT_LOOP"):
-        raise RuntimeError("EVENT_LOOP not found in _agy_bridge_globals")
-    loop = globals_mod.EVENT_LOOP
+    loop = passed_event_loop
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                loop = asyncio.get_event_loop()
+            except Exception:
+                logging.getLogger("agy_bridge.init").debug(
+                    "asyncio.get_event_loop() failed, falling back to _agy_bridge_globals.EVENT_LOOP",
+                    exc_info=True,
+                )
+                globals_mod = sys.modules.get("_agy_bridge_globals")
+                if not globals_mod or not hasattr(globals_mod, "EVENT_LOOP"):
+                    raise RuntimeError("EVENT_LOOP not found in _agy_bridge_globals")
+                loop = globals_mod.EVENT_LOOP
     future = asyncio.run_coroutine_threadsafe(_agent_lifecycle(), loop)
 
     class AgentLifecycleController:

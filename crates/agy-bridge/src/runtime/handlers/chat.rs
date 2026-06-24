@@ -6,10 +6,18 @@ use tokio::{sync::oneshot, time::timeout};
 
 use super::super::{
     AgentId,
-    command_loop::lookup_agent_instance,
+    command_loop::{get_or_compile_py_helper, lookup_agent_instance},
     py_scripts::{PYTHON_CHAT_START_SCRIPT, PYTHON_EXTRACT_METADATA_SCRIPT},
 };
 use crate::error::Error;
+
+/// Compiled-function cache for `_start_chat`.
+static START_CHAT_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+const START_CHAT_FN_NAME: &str = "_start_chat";
+
+/// Compiled-function cache for `_extract`.
+static EXTRACT_METADATA_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+const EXTRACT_METADATA_FN_NAME: &str = "_extract";
 
 /// Dispatch a `Chat` command: look up the agent, spawn the streaming handler.
 pub(in crate::runtime) async fn dispatch_chat_command(
@@ -30,7 +38,7 @@ pub(in crate::runtime) async fn dispatch_chat_command(
         return;
     };
 
-    let agent_instance = Python::with_gil(|py| agent_instance.clone_ref(py));
+    let agent_instance = Python::attach(|py| agent_instance.clone_ref(py));
     let chat_fut = handle_chat(agent_instance, chat_timeout, agent_id, prompt, reply);
     active_tasks.push(Box::pin(chat_fut));
     // Small delay between successive chat commands to avoid burst requests.
@@ -42,8 +50,8 @@ pub(in crate::runtime) async fn dispatch_chat_command(
 /// After `agent.chat()` returns a response, this function reaches into the
 /// agent's conversation object and calls `receive_steps()` to get the
 /// async iterator that yields individual steps.
-fn get_step_iterator(agent_instance: &PyObject, response_py: &PyObject) -> PyResult<PyObject> {
-    Python::with_gil(|py| {
+fn get_step_iterator(agent_instance: &Py<PyAny>, response_py: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    Python::attach(|py| {
         let response_bound = response_py.bind(py);
         let agent_bound = agent_instance.bind(py);
 
@@ -65,7 +73,7 @@ fn get_step_iterator(agent_instance: &PyObject, response_py: &PyObject) -> PyRes
             ));
         }
         let steps = conv.call_method0("receive_steps")?;
-        Ok(steps.to_object(py))
+        Ok(steps.clone().unbind())
     })
 }
 
@@ -74,28 +82,24 @@ fn get_step_iterator(agent_instance: &PyObject, response_py: &PyObject) -> PyRes
 /// Returns `(usage_json, structured_output_json)` — each `None` if absent
 /// or if extraction fails.
 fn extract_response_metadata(
-    response_py: &PyObject,
-    agent_instance: &PyObject,
+    response_py: &Py<PyAny>,
+    agent_instance: &Py<PyAny>,
     agent_id: AgentId,
 ) -> (Option<String>, Option<String>) {
-    let result: (Option<String>, Option<String>) = Python::with_gil(|py| {
-        let locals = pyo3::types::PyDict::new_bound(py);
-        if let Err(e) = py.run_bound(PYTHON_EXTRACT_METADATA_SCRIPT, None, Some(&locals)) {
-            tracing::warn!(agent_id = ?agent_id, error = %e, "Failed to run metadata extraction script");
+    let helper = match get_or_compile_py_helper(
+        &EXTRACT_METADATA_FN,
+        PYTHON_EXTRACT_METADATA_SCRIPT,
+        EXTRACT_METADATA_FN_NAME,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(agent_id = ?agent_id, error = %e, "Failed to compile metadata extraction helper");
             return (None, None);
         }
-        let helper_fn = match locals.get_item("_extract") {
-            Ok(Some(func)) => func,
-            Ok(None) => {
-                tracing::warn!(agent_id = ?agent_id, "Metadata extraction helper '_extract' not found in locals");
-                return (None, None);
-            }
-            Err(e) => {
-                tracing::warn!(agent_id = ?agent_id, error = %e, "Failed to look up '_extract' helper");
-                return (None, None);
-            }
-        };
-        match helper_fn.call1((response_py.bind(py), agent_instance.bind(py))) {
+    };
+
+    let result: (Option<String>, Option<String>) = Python::attach(|py| {
+        match helper.bind(py).call1((response_py.bind(py), agent_instance.bind(py))) {
             Ok(result) => result.extract().unwrap_or_else(|e| {
                 tracing::warn!(agent_id = ?agent_id, error = %e, "Failed to extract metadata tuple from Python result");
                 (None, None)
@@ -122,15 +126,17 @@ fn apply_response_metadata(
     usage_json: Option<String>,
     structured_json: Option<String>,
 ) {
-    if let Some(u_str) = usage_json
-        && let Ok(usage) = serde_json::from_str::<crate::types::UsageMetadata>(&u_str)
-    {
-        writer.set_usage(usage);
+    if let Some(u_str) = usage_json {
+        match serde_json::from_str::<crate::types::UsageMetadata>(&u_str) {
+            Ok(usage) => writer.set_usage(usage),
+            Err(e) => tracing::warn!("Failed to deserialize usage metadata: {e}"),
+        }
     }
-    if let Some(s_str) = structured_json
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&s_str)
-    {
-        writer.set_structured_output(val);
+    if let Some(s_str) = structured_json {
+        match serde_json::from_str::<serde_json::Value>(&s_str) {
+            Ok(val) => writer.set_structured_output(val),
+            Err(e) => tracing::warn!("Failed to deserialize structured output: {e}"),
+        }
     }
 }
 
@@ -138,7 +144,7 @@ fn apply_response_metadata(
 /// iterator on the Rust side, forwarding each chunk through the
 /// [`ChatResponseWriter`] channels for true streaming.
 pub(crate) async fn handle_chat(
-    agent_instance: PyObject,
+    agent_instance: Py<PyAny>,
     chat_timeout: Duration,
     agent_id: AgentId,
     prompt: String,
@@ -209,21 +215,40 @@ pub(crate) async fn handle_chat(
 }
 
 fn prepare_chat_start(
-    agent_instance: &PyObject,
+    agent_instance: &Py<PyAny>,
     prompt: &str,
     timeout: std::time::Duration,
-) -> Result<impl std::future::Future<Output = PyResult<PyObject>>, String> {
-    Python::with_gil(|py| {
-        let locals = pyo3::types::PyDict::new_bound(py);
-        py.run_bound(&PYTHON_CHAT_START_SCRIPT, Some(&locals), Some(&locals))
-            .map_err(|e| e.to_string())?;
-        let helper_fn = locals
-            .get_item("_start_chat")
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "Failed to define _start_chat helper".to_string())?;
+) -> Result<impl std::future::Future<Output = PyResult<Py<PyAny>>>, String> {
+    // `_start_chat` depends on helper functions (`_decode_prompt`,
+    // `_decode_content`) defined in the same script. These must share the same
+    // namespace as `_start_chat`'s `__globals__`, so we compile with a single
+    // dict for both globals and locals (unlike `get_or_compile_py_helper`,
+    // which passes `None` for globals).
+    let helper_fn = if let Some(cached) = START_CHAT_FN.get() {
+        Python::attach(|py| cached.clone_ref(py))
+    } else {
+        Python::attach(|py| {
+            let ns = pyo3::types::PyDict::new(py);
+            let c_script = std::ffi::CString::new(PYTHON_CHAT_START_SCRIPT.as_str())
+                .map_err(|e| e.to_string())?;
+            py.run(c_script.as_c_str(), Some(&ns), Some(&ns))
+                .map_err(|e| e.to_string())?;
+            let fn_obj = ns
+                .get_item(START_CHAT_FN_NAME)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Failed to define {START_CHAT_FN_NAME} helper"))?;
+            let py_obj = fn_obj.clone().unbind();
+            if let Err(e) = START_CHAT_FN.set(py_obj.clone_ref(py)) {
+                tracing::debug!("START_CHAT_FN cache was already set: {:?}", e);
+            }
+            Ok::<Py<PyAny>, String>(py_obj)
+        })?
+    };
 
+    Python::attach(|py| {
         let agent_bound = agent_instance.bind(py);
         let coro = helper_fn
+            .bind(py)
             .call1((agent_bound, prompt, timeout.as_secs_f64()))
             .map_err(|e| format!("{e}"))?;
         tracing::debug!("_start_chat coroutine created, converting to future");

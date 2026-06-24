@@ -23,8 +23,11 @@ Rust caller ──▶ AgentHandle ──▶ PythonRuntime (dedicated thread)
 - `src/config/` — `AgentConfig` builder, MCP servers, capabilities.
 - `src/policies/` — declarative allow/deny/confirm rules for tool execution.
 - `src/triggers.rs` — periodic and file-change trigger definitions.
-- `src/streaming.rs` — streaming response channels (text, thought, tool-call events).
+- `src/streaming/` — streaming response channels (text, thought, tool-call events).
 - `src/content/` — multimodal input types (text, image, audio, video, document).
+- `src/quota.rs` — quota tracking and backoff state.
+- `src/safety.rs` — safety filter detection heuristics.
+- `src/types.rs` — shared domain types.
 
 ## Rules
 

@@ -16,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.1.2"
+agy-bridge = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -36,12 +36,16 @@ use agy_bridge::AgyBridge;
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
 
     // Send a message and get the full reply text.
-    let text = agent.chat("Hello!").await?.text().await?;
+    let text = agent
+        .chat("Reply with 'Hello!' and nothing else.")
+        .await?
+        .text()
+        .await?;
     println!("{text}");
 
     agent.shutdown().await?;
@@ -56,7 +60,7 @@ use agy_bridge::{AgyBridge, config::AgentConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
     // bridge.agent() returns an AgentBuilder — chain .tools() / .hooks()
@@ -97,8 +101,7 @@ use agy_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
-
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
 
@@ -138,7 +141,7 @@ fn get_weather(
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
     let mut registry = ToolRegistry::new();
@@ -217,7 +220,7 @@ use agy_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
     // 1. Register lifecycle hooks
@@ -278,21 +281,20 @@ use agy_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
-    # std::fs::create_dir_all("/tmp/workspace")?;
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
-    let periodic = TriggerEntry {
-        name: "poll_status".into(),
-        config: TriggerConfig::every_secs(30),
-        message_template: "Check deployment status".into(),
-    };
+    let periodic = TriggerEntry::new(
+        "poll_status",
+        TriggerConfig::every_secs(30),
+        "Check deployment status",
+    );
 
-    let file_watch = TriggerEntry {
-        name: "watch_workspace".into(),
-        config: TriggerConfig::on_file_change(std::env::current_dir()?),
-        message_template: "Files changed: {changes}".into(),
-    };
+    let file_watch = TriggerEntry::new(
+        "watch_workspace",
+        TriggerConfig::on_file_change(std::env::current_dir()?),
+        "Files changed: {changes}",
+    );
 
     let config = AgentConfig::builder()
         .triggers(vec![periodic, file_watch])
@@ -305,7 +307,6 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     println!("{text}");
 
     agent.shutdown().await?;
-    # let _ = std::fs::remove_dir_all("/tmp/workspace");
     Ok(())
 }
 ```
@@ -323,7 +324,7 @@ use agy_bridge::{AgyBridge, config::AgentConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
-    # agy_bridge::load_dotenv();
+    agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
     let parent = bridge.agent(

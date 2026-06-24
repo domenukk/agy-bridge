@@ -42,7 +42,6 @@ tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 [lints]
 workspace = true
 
-
 [[example]]
 name = "getting_started_hello_world"
 path = "examples/getting_started/hello_world.rs"
@@ -102,6 +101,10 @@ path = "examples/getting_started/structured_output.rs"
 [[example]]
 name = "getting_started_mcp_tools"
 path = "examples/getting_started/mcp_tools.rs"
+
+[[example]]
+name = "getting_started_template_tools"
+path = "examples/getting_started/template_tools.rs"
 
 [[example]]
 name = "getting_started_subagents"

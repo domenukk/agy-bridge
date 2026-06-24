@@ -21,7 +21,6 @@ use crate::{
 /// and returns text on subsequent calls, enabling tests of the `chat_text()`
 /// agentic loop without a live Python runtime.
 pub struct ToolAwareMockRuntime {
-    next_id: AtomicU64,
     /// Counts how many times `chat()` has been called per agent.
     /// First call → tool call; subsequent calls → text response.
     chat_count: std::sync::Mutex<std::collections::HashMap<AgentId, u32>>,
@@ -35,10 +34,11 @@ pub struct ToolAwareMockRuntime {
     quota_registry: crate::quota::QuotaRegistry,
 }
 
+static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
+
 impl ToolAwareMockRuntime {
     pub(crate) fn new() -> Self {
         Self {
-            next_id: AtomicU64::new(1),
             chat_count: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_create: AtomicBool::new(false),
             fail_quota: AtomicBool::new(false),
@@ -61,9 +61,7 @@ impl Runtime for ToolAwareMockRuntime {
                 message: "invalid config: missing system instructions".to_owned(),
             });
         }
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = NEXT_AGENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(id)
     }
 
@@ -733,5 +731,164 @@ mod tests {
 
         let idle = agent.is_idle().await.expect("is_idle");
         assert!(idle, "mock should report idle");
+    }
+
+    // ── Multi-agent isolation tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn multiple_agents_same_runtime_have_distinct_ids() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let a = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent a");
+        let b = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent b");
+
+        assert_ne!(a.id(), b.id(), "agents must have distinct IDs");
+        a.shutdown().await.expect("shutdown a");
+        b.shutdown().await.expect("shutdown b");
+    }
+
+    #[tokio::test]
+    async fn shutdown_one_agent_does_not_affect_another() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let a = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent a");
+        let b = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent b");
+
+        let a_id = a.id();
+        let b_id = b.id();
+
+        // Both agents have bridge state entries.
+        {
+            let map = crate::runtime::bridge_state()
+                .read()
+                .expect("read bridge state");
+            assert!(map.contains_key(&a_id), "agent a must have bridge state");
+            assert!(map.contains_key(&b_id), "agent b must have bridge state");
+        }
+
+        // Shut down agent a.
+        a.shutdown().await.expect("shutdown a");
+        drop(a);
+
+        // Agent b's bridge state must still be present.
+        {
+            let map = crate::runtime::bridge_state()
+                .read()
+                .expect("read bridge state");
+            assert!(
+                !map.contains_key(&a_id),
+                "agent a bridge state should be cleaned up after shutdown+drop"
+            );
+            assert!(
+                map.contains_key(&b_id),
+                "agent b bridge state must survive agent a's shutdown"
+            );
+        }
+
+        // Agent b still works.
+        let text = b.chat("hello").await.expect("chat b");
+        let content = text.text().await.expect("text b");
+        assert!(!content.is_empty(), "agent b should return non-empty text");
+
+        b.shutdown().await.expect("shutdown b");
+    }
+
+    #[tokio::test]
+    async fn agents_on_different_runtimes_are_isolated() {
+        let rt1 = Arc::new(ToolAwareMockRuntime::new());
+        let rt2 = Arc::new(ToolAwareMockRuntime::new());
+
+        let a = AgentHandle::new(rt1, test_config(), None, None, None)
+            .await
+            .expect("agent a");
+        let b = AgentHandle::new(rt2, test_config(), None, None, None)
+            .await
+            .expect("agent b");
+
+        // Both should have bridge state.
+        {
+            let map = crate::runtime::bridge_state()
+                .read()
+                .expect("read bridge state");
+            assert!(map.contains_key(&a.id()), "agent a bridge state");
+            assert!(map.contains_key(&b.id()), "agent b bridge state");
+        }
+
+        // Chat on both concurrently.
+        let (res_a, res_b) = tokio::join!(a.chat("hello"), b.chat("world"));
+        let text_a = res_a.expect("chat a").text().await.expect("text a");
+        let text_b = res_b.expect("chat b").text().await.expect("text b");
+        assert!(!text_a.is_empty());
+        assert!(!text_b.is_empty());
+
+        a.shutdown().await.expect("shutdown a");
+        b.shutdown().await.expect("shutdown b");
+    }
+
+    #[tokio::test]
+    async fn multiple_agents_with_different_configs() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+
+        let config_a = AgentConfig::builder().model("model-alpha").build();
+        let config_b = AgentConfig::builder().model("model-beta").build();
+
+        let a = AgentHandle::new(Arc::clone(&rt), config_a, None, None, None)
+            .await
+            .expect("agent a");
+        let b = AgentHandle::new(Arc::clone(&rt), config_b, None, None, None)
+            .await
+            .expect("agent b");
+
+        assert_ne!(a.id(), b.id());
+
+        // Each agent maintains its own config.
+        assert_eq!(a.config().model, "model-alpha");
+        assert_eq!(b.config().model, "model-beta");
+
+        a.shutdown().await.expect("shutdown a");
+        b.shutdown().await.expect("shutdown b");
+    }
+
+    #[tokio::test]
+    async fn dropping_one_agent_preserves_others_bridge_state() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+
+        let a = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent a");
+        let b = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent b");
+        let c = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("agent c");
+
+        let b_id = b.id();
+        let c_id = c.id();
+
+        // Drop a without shutdown (best-effort path).
+        drop(a);
+
+        // b and c must still be fully functional.
+        {
+            let map = crate::runtime::bridge_state()
+                .read()
+                .expect("read bridge state");
+            assert!(map.contains_key(&b_id), "agent b bridge state must survive");
+            assert!(map.contains_key(&c_id), "agent c bridge state must survive");
+        }
+
+        let text = b.chat("test").await.expect("chat b");
+        let content = text.text().await.expect("text b");
+        assert!(!content.is_empty());
+
+        b.shutdown().await.expect("shutdown b");
+        c.shutdown().await.expect("shutdown c");
     }
 }

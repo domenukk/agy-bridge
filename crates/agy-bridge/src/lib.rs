@@ -1,12 +1,3 @@
-// SAFETY: PyO3 proc macros generate `unsafe fn` wrappers for `#[pyfunction]`
-// and `#[pymethods]` callbacks. The `unsafe_op_in_unsafe_fn` lint (default-warn
-// in edition 2024) would require `unsafe {}` blocks inside every generated body.
-// Suppressing crate-wide avoids noise without reducing actual safety guarantees,
-// since all hand-written unsafe blocks already use explicit `unsafe {}` scoping.
-#![expect(
-    unsafe_op_in_unsafe_fn,
-    reason = "PyO3 proc macros generate unsafe fn wrappers that would require redundant unsafe blocks"
-)]
 #![doc = include_str!("../README.md")]
 //! agy-bridge: Standalone reusable `PyO3` bridge for the Google Antigravity SDK.
 
@@ -31,6 +22,8 @@ pub mod policies;
 pub mod quota;
 /// Python runtime bridge: command dispatch over a dedicated thread.
 pub mod runtime;
+/// Safety filter detection heuristics and confidence hierarchy.
+pub mod safety;
 /// Streaming response channels for text, thought, and tool-call events.
 pub mod streaming;
 /// Custom Rust tool dispatch and definition types.
@@ -57,6 +50,7 @@ pub use hooks::{HookCallback, HookEntry, HookPoint, HookResult, HookSet, Hooks};
 pub use llm_tool_macros::llm_tool;
 pub use policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet};
 pub use runtime::RuntimeConfig;
+pub use safety::{Confidence, SafetyVerdict, detect_safety_interference};
 pub use streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk};
 pub use tools::{RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
 pub use triggers::{TriggerConfig, TriggerEntry};

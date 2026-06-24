@@ -13,19 +13,19 @@ use super::super::{
 use crate::error::Error;
 
 const GET_HISTORY_FN_NAME: &str = "_get_history";
-static GET_HISTORY_FN: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
+static GET_HISTORY_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 const GET_TURN_COUNT_FN_NAME: &str = "_get_turn_count";
-static GET_TURN_COUNT_FN: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
+static GET_TURN_COUNT_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 const GET_TOTAL_USAGE_FN_NAME: &str = "_get_total_usage";
-static GET_TOTAL_USAGE_FN: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
+static GET_TOTAL_USAGE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 const GET_LAST_TURN_USAGE_FN_NAME: &str = "_get_last_turn_usage";
-static GET_LAST_TURN_USAGE_FN: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
+static GET_LAST_TURN_USAGE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 const IS_IDLE_FN_NAME: &str = "_is_idle";
-static IS_IDLE_FN: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
+static IS_IDLE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 /// A cloned pair of Python references: `(context_manager, agent_instance)`.
 type PyAgentRef = (Py<PyAny>, Py<PyAny>);
@@ -46,7 +46,7 @@ fn lock_agent_instance(
     })?;
     Ok(guard
         .get(&agent_id)
-        .map(|(c, a)| Python::with_gil(|py| (c.clone_ref(py), a.clone_ref(py)))))
+        .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py)))))
 }
 
 /// Extract conversation history from the agent's conversation object.
@@ -73,7 +73,7 @@ pub(in crate::runtime) fn handle_get_history(
         return;
     };
 
-    let result = Python::with_gil(
+    let result = Python::attach(
         |py| -> Result<Vec<crate::types::ConversationMessage>, Error> {
             let helper_fn = get_or_compile_py_helper(
                 &GET_HISTORY_FN,
@@ -121,7 +121,7 @@ pub(in crate::runtime) fn handle_get_turn_count(
         return;
     };
 
-    let result = Python::with_gil(|py| -> Result<u32, Error> {
+    let result = Python::attach(|py| -> Result<u32, Error> {
         let helper_fn = get_or_compile_py_helper(
             &GET_TURN_COUNT_FN,
             PYTHON_GET_TURN_COUNT_SCRIPT,
@@ -179,7 +179,7 @@ fn handle_get_usage_impl(
     registry: &AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<crate::types::UsageMetadata, Error>>,
-    cache: &'static std::sync::OnceLock<PyObject>,
+    cache: &'static std::sync::OnceLock<Py<PyAny>>,
     script: &str,
     fn_name: &str,
     label: &str,
@@ -202,7 +202,7 @@ fn handle_get_usage_impl(
         return;
     };
 
-    let result = Python::with_gil(|py| -> Result<crate::types::UsageMetadata, Error> {
+    let result = Python::attach(|py| -> Result<crate::types::UsageMetadata, Error> {
         let helper_fn = get_or_compile_py_helper(cache, script, fn_name)
             .map_err(|e| Error::BackendError { message: e })?;
         let helper_bound = helper_fn.bind(py);
@@ -247,7 +247,7 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
         return;
     };
 
-    let result = Python::with_gil(|py| -> Result<Vec<u32>, Error> {
+    let result = Python::attach(|py| -> Result<Vec<u32>, Error> {
         let agent_bound = agent_instance.bind(py);
         if !agent_bound.hasattr("conversation")? {
             return Ok(Vec::new());
@@ -292,7 +292,7 @@ pub(in crate::runtime) fn handle_get_last_response(
         return;
     };
 
-    let result = Python::with_gil(|py| -> Result<Option<String>, Error> {
+    let result = Python::attach(|py| -> Result<Option<String>, Error> {
         let agent_bound = agent_instance.bind(py);
         if !agent_bound.hasattr("conversation")? {
             return Ok(None);
@@ -340,7 +340,7 @@ pub(in crate::runtime) fn handle_is_idle(
         return;
     };
 
-    let result = Python::with_gil(|py| -> Result<bool, Error> {
+    let result = Python::attach(|py| -> Result<bool, Error> {
         let helper_fn =
             get_or_compile_py_helper(&IS_IDLE_FN, PYTHON_IS_IDLE_SCRIPT, IS_IDLE_FN_NAME)
                 .map_err(|e| Error::BackendError { message: e })?;

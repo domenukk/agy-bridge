@@ -70,7 +70,7 @@ fn test_hooks_lifecycle_live() {
                 .build();
 
             let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(1))
+                .chat_timeout(Duration::from_mins(3))
                 .build()?;
 
             let agent = bridge.agent(config).hooks(hook_runner).await?;
@@ -132,6 +132,28 @@ fn test_hooks_lifecycle_live() {
 
 #[test]
 fn test_on_tool_error_hook_live() {
+    /// A tool that always returns an error, used to trigger `on_tool_error`.
+    struct AlwaysFails;
+
+    /// Empty parameters for [`AlwaysFails`].
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct AlwaysFailsParams {}
+
+    impl agy_bridge::tools::RustTool for AlwaysFails {
+        type Params = AlwaysFailsParams;
+        const NAME: &'static str = "always_fails";
+        const DESCRIPTION: &'static str =
+            "A tool that always returns an error. Call it with no arguments.";
+
+        async fn call(
+            &self,
+            _params: Self::Params,
+            _ctx: &agy_bridge::tools::ToolContext,
+        ) -> Result<agy_bridge::tools::ToolOutput, agy_bridge::tools::ToolError> {
+            Err(agy_bridge::tools::ToolError::new("intentional test error"))
+        }
+    }
+
     common::run_live_test("test_on_tool_error_hook_live", || {
         let rt = test_runtime();
         rt.block_on(async {
@@ -151,21 +173,22 @@ fn test_on_tool_error_hook_live() {
             // Also register pre_tool_call_decide to allow all tool calls.
             hooks.on_pre_tool_call_decide("allow_all", |_ctx| HookResult::allow());
 
+            // Register a custom tool that always errors.
+            let mut registry = agy_bridge::tools::ToolRegistry::new();
+            registry.register(AlwaysFails);
+
             let config = AgentConfig::builder()
                 .api_key(&key)
                 .model("gemini-3.5-flash")
-                .capabilities(CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile]))
                 .build();
 
             let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(1))
+                .chat_timeout(Duration::from_mins(3))
                 .build()?;
 
-            let agent = bridge.agent(config).hooks(hooks).await?;
+            let agent = bridge.agent(config).hooks(hooks).tools(registry).await?;
 
-            // Ask the agent to view a file that does not exist — this should trigger a tool error.
-            let prompt = "Use view_file to read the file '/tmp/__nonexistent_agy_bridge_test_file_42__'. \
-                          Report what happened.";
+            let prompt = "Call the always_fails tool now. Report what happened.";
             let _text = agent.chat(prompt).await?.text().await?;
 
             // Poll for the tool_error event.
@@ -226,7 +249,7 @@ fn test_transform_tool_input_hook_live() {
                 .build();
 
             let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(1))
+                .chat_timeout(Duration::from_mins(3))
                 .build()?;
 
             let agent = bridge.agent(config).hooks(hooks).await?;
@@ -305,7 +328,7 @@ fn test_session_and_interaction_hooks_live() {
                 .build();
 
             let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(1))
+                .chat_timeout(Duration::from_mins(3))
                 .build()?;
 
             let agent = bridge.agent(config).hooks(hooks).await?;

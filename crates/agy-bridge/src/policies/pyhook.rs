@@ -1,9 +1,4 @@
 //! `PyO3` pre-tool-call hook for workspace confinement.
-// pyo3::pymethods proc-macro generates PyErr→PyErr conversions from `?`
-#![expect(
-    clippy::useless_conversion,
-    reason = "PyO3 proc-macro generates PyErr→PyErr conversions"
-)]
 
 use std::path::PathBuf;
 
@@ -14,11 +9,22 @@ use super::path::is_path_in_workspace;
 const HOOKS_MODULE_PATH: &str = "google.antigravity.hooks.hooks";
 const HOOK_RESULT_CLASS: &str = "HookResult";
 const ARGS_ATTR_NAME: &str = "args";
-const PATH_KEYS_TO_CHECK: [&str; 3] = ["path", "file_path", "dir_path"];
+const PATH_KEYS_TO_CHECK: [&str; 10] = [
+    "path",
+    "file_path",
+    "dir_path",
+    "target_path",
+    "source_path",
+    "destination",
+    "filename",
+    "directory",
+    "source",
+    "target",
+];
 const ALLOW_ATTR: &str = "allow";
 const MESSAGE_ATTR: &str = "message";
 
-#[pyo3::pyclass(unsendable)]
+#[pyo3::pyclass(unsendable, skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PreToolCallDecideHook {
     workspaces: Vec<PathBuf>,
@@ -41,18 +47,29 @@ impl PreToolCallDecideHook {
 
         let mut paths_to_check = Vec::new();
         for key in PATH_KEYS_TO_CHECK {
-            if let Ok(Some(val)) = args.get_item(key)
-                && let Ok(s) = val.extract::<String>()
-            {
-                paths_to_check.push(s);
+            match args.get_item(key) {
+                Ok(Some(val)) => match val.extract::<String>() {
+                    Ok(s) => paths_to_check.push(s),
+                    Err(e) => tracing::warn!(
+                        key,
+                        error = %e,
+                        "Workspace confinement: failed to extract path arg as String"
+                    ),
+                },
+                Ok(None) => {} // key not present — expected
+                Err(e) => tracing::warn!(
+                    key,
+                    error = %e,
+                    "Workspace confinement: failed to read item from args dict"
+                ),
             }
         }
 
         for p in paths_to_check {
             if !is_path_in_workspace(&p, &self.workspaces) {
-                let hooks_mod = py.import_bound(HOOKS_MODULE_PATH)?;
+                let hooks_mod = py.import(HOOKS_MODULE_PATH)?;
                 let hook_result_cls = hooks_mod.getattr(HOOK_RESULT_CLASS)?;
-                let kwargs = pyo3::types::PyDict::new_bound(py);
+                let kwargs = pyo3::types::PyDict::new(py);
                 kwargs.set_item(ALLOW_ATTR, false)?;
                 kwargs.set_item(
                     MESSAGE_ATTR,
@@ -62,9 +79,9 @@ impl PreToolCallDecideHook {
             }
         }
 
-        let hooks_mod = py.import_bound(HOOKS_MODULE_PATH)?;
+        let hooks_mod = py.import(HOOKS_MODULE_PATH)?;
         let hook_result_cls = hooks_mod.getattr(HOOK_RESULT_CLASS)?;
-        let kwargs = pyo3::types::PyDict::new_bound(py);
+        let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item(ALLOW_ATTR, true)?;
         hook_result_cls.call((), Some(&kwargs))
     }

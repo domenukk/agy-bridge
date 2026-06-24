@@ -222,7 +222,7 @@ pub struct RuntimeConfig {
     pub shutdown_timeout: Duration,
     /// Timeout for a single `agent.chat()` round-trip.
     ///
-    /// Defaults to the value of `AGI_CHAT_TIMEOUT_SECS` (env var), or 600 s.
+    /// Defaults to the value of `AGI_CHAT_TIMEOUT_SECS` (env var), or 120 s.
     pub chat_timeout: Duration,
     /// Delay injected between successive chat commands to prevent burst requests.
     pub inter_agent_delay: Duration,
@@ -433,15 +433,19 @@ impl Drop for PythonRuntime {
 
 /// Entry point for the dedicated Python thread.
 fn python_thread_main(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) {
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
 
     // Environment variables are already loaded by load_dotenv() at bridge
     // construction time, before any threads are spawned.
 
     // Configure sys.path so the venv's site-packages are importable.
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         if let Err(e) = venv::configure_python_sys_path(py) {
-            tracing::warn!("Failed to configure Python sys.path in runtime thread: {e}");
+            tracing::error!(
+                error = %e,
+                "Failed to configure Python sys.path in runtime thread — \
+                 venv imports will likely fail"
+            );
         }
     });
 
@@ -455,12 +459,10 @@ fn python_thread_main(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig)
 /// Live SDK thread: creates an asyncio event loop and dispatches commands
 /// to the real Antigravity SDK via `pyo3_async_runtimes`.
 fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) -> Result<(), Error> {
-    Python::with_gil(|py| {
-        let asyncio = py
-            .import_bound("asyncio")
-            .map_err(|e| Error::BackendError {
-                message: format!("Failed to import asyncio: {e}"),
-            })?;
+    Python::attach(|py| {
+        let asyncio = py.import("asyncio").map_err(|e| Error::BackendError {
+            message: format!("Failed to import asyncio: {e}"),
+        })?;
         let event_loop =
             asyncio
                 .call_method0("new_event_loop")
@@ -474,7 +476,7 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
             })?;
 
         // Register event_loop in globals for access from any thread
-        let sys = py.import_bound("sys").map_err(|e| Error::BackendError {
+        let sys = py.import("sys").map_err(|e| Error::BackendError {
             message: format!("Failed to import sys: {e}"),
         })?;
         let sys_modules = sys.getattr("modules").map_err(|e| Error::BackendError {
@@ -491,7 +493,7 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                     message: format!("Failed to get _agy_bridge_globals: {e}"),
                 })?
         } else {
-            let types = py.import_bound("types").map_err(|e| Error::BackendError {
+            let types = py.import("types").map_err(|e| Error::BackendError {
                 message: format!("Failed to import types: {e}"),
             })?;
             let module = types
@@ -520,9 +522,16 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 
         let chat_timeout = config.chat_timeout;
         let inter_agent_delay = config.inter_agent_delay;
+        let event_loop_obj = event_loop.clone().unbind();
         let run_fut =
             pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), async move {
-                command_loop::run_async_command_loop(cmd_rx, chat_timeout, inter_agent_delay).await
+                command_loop::run_async_command_loop(
+                    event_loop_obj,
+                    cmd_rx,
+                    chat_timeout,
+                    inter_agent_delay,
+                )
+                .await
             });
 
         if let Err(e) = run_fut {
@@ -843,22 +852,22 @@ mod tests {
 
     #[test]
     fn safety_error_structural() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let globals = pyo3::types::PyDict::new_bound(py);
-            py.run_bound(
-                r#"
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = pyo3::types::PyDict::new(py);
+            py.run(
+                c"
 class StopCandidateException(Exception):
     pass
-err = StopCandidateException("dummy")
-"#,
+err = StopCandidateException(\"dummy\")
+",
                 Some(&globals),
                 None,
             )
             .unwrap();
 
             let err_obj = globals.get_item("err").unwrap().unwrap();
-            let err = PyErr::from_value_bound(err_obj);
+            let err = PyErr::from_value(err_obj);
 
             let mapped = crate::error::classify_py_error(py, &err);
 
@@ -871,22 +880,22 @@ err = StopCandidateException("dummy")
 
     #[test]
     fn maxtokens_error_structural() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let globals = pyo3::types::PyDict::new_bound(py);
-            py.run_bound(
-                r#"
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = pyo3::types::PyDict::new(py);
+            py.run(
+                c"
 class MaxTokensException(Exception):
     pass
-err = MaxTokensException("dummy")
-"#,
+err = MaxTokensException(\"dummy\")
+",
                 Some(&globals),
                 None,
             )
             .unwrap();
 
             let err_obj = globals.get_item("err").unwrap().unwrap();
-            let err = PyErr::from_value_bound(err_obj);
+            let err = PyErr::from_value(err_obj);
 
             let mapped = crate::error::classify_py_error(py, &err);
 

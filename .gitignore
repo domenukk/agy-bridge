@@ -6,3 +6,4 @@ target
 *.stderr
 ORIGINAL_REQUEST.md
 PROJECT.md
+.pytest_cache

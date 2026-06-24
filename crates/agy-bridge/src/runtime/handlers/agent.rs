@@ -1,4 +1,5 @@
 /// Agent lifecycle handlers: creation and shutdown.
+use std::ffi::CString;
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -21,13 +22,13 @@ const DISPATCH_RUST_POLICY_CONFIRM_ATTR: &str = "dispatch_rust_policy_confirm";
 
 /// Prepares the `_agy_bridge_globals` module and registers the Rust tool registry.
 fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
-    let sys = py.import_bound("sys")?;
+    let sys = py.import("sys")?;
     let sys_modules = sys.getattr("modules")?;
 
     let agy_bridge_globals = if sys_modules.contains(AGY_BRIDGE_GLOBALS_MODULE)? {
         sys_modules.get_item(AGY_BRIDGE_GLOBALS_MODULE)?
     } else {
-        let types = py.import_bound("types")?;
+        let types = py.import("types")?;
         let module = types
             .getattr("ModuleType")?
             .call1((AGY_BRIDGE_GLOBALS_MODULE,))?;
@@ -35,15 +36,14 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
         module
     };
 
-    let globals_module = agy_bridge_globals.downcast::<pyo3::types::PyModule>()?;
-    let func = pyo3::wrap_pyfunction_bound!(dispatch_rust_tool, globals_module)?;
+    let globals_module = agy_bridge_globals.cast::<pyo3::types::PyModule>()?;
+    let func = pyo3::wrap_pyfunction!(dispatch_rust_tool, globals_module)?;
     agy_bridge_globals.setattr(DISPATCH_RUST_TOOL_ATTR, func)?;
 
-    let hook_func =
-        pyo3::wrap_pyfunction_bound!(crate::runtime::dispatch_rust_hook, globals_module)?;
+    let hook_func = pyo3::wrap_pyfunction!(crate::runtime::dispatch_rust_hook, globals_module)?;
     agy_bridge_globals.setattr(DISPATCH_RUST_HOOK_ATTR, hook_func)?;
 
-    let confirm_func = pyo3::wrap_pyfunction_bound!(dispatch_rust_policy_confirm, globals_module)?;
+    let confirm_func = pyo3::wrap_pyfunction!(dispatch_rust_policy_confirm, globals_module)?;
     agy_bridge_globals.setattr(DISPATCH_RUST_POLICY_CONFIRM_ATTR, confirm_func)?;
 
     globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;
@@ -55,11 +55,17 @@ fn init_agent_instance(
     py: Python<'_>,
     config_json: &str,
     next_id: u64,
-) -> PyResult<(PyObject, PyObject)> {
-    let globals = pyo3::types::PyDict::new_bound(py);
-    py.run_bound(PYTHON_AGENT_INIT_SCRIPT, Some(&globals), None)?;
+    event_loop: &Py<PyAny>,
+) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+    let globals = pyo3::types::PyDict::new(py);
+    let c_script = CString::new(PYTHON_AGENT_INIT_SCRIPT).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Python init script contains null byte: {e}"
+        ))
+    })?;
+    py.run(c_script.as_c_str(), Some(&globals), None)?;
 
-    let agent_mod = py.import_bound("google.antigravity.agent")?;
+    let agent_mod = py.import("google.antigravity.agent")?;
     let agent_cls = agent_mod.getattr("Agent")?;
     let init_agent_fn = globals.get_item("init_agent")?.ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
@@ -67,11 +73,11 @@ fn init_agent_instance(
         )
     })?;
 
-    let val = init_agent_fn.call1((config_json, next_id, agent_cls))?;
+    let val = init_agent_fn.call1((config_json, next_id, agent_cls, event_loop.bind(py)))?;
     let agent_ctx = val.get_item(0)?;
     let aenter_coro = val.get_item(1)?;
-    let ctx_py = agent_ctx.to_object(py);
-    let aenter_coro_py = aenter_coro.to_object(py);
+    let ctx_py = agent_ctx.clone().unbind();
+    let aenter_coro_py = aenter_coro.clone().unbind();
     Ok((ctx_py, aenter_coro_py))
 }
 
@@ -81,15 +87,15 @@ fn init_agent_instance(
 /// processes that accumulate until fork exhaustion.
 async fn attempt_aexit_cleanup(ctx_py: &Py<PyAny>, cleanup_timeout: Duration) {
     let cleanup_result: Result<(), String> = async {
-        let aexit_coro_py = Python::with_gil(|py| {
+        let aexit_coro_py = Python::attach(|py| {
             let ctx_bound = ctx_py.bind(py);
             let none = py.None();
             let coro = ctx_bound
                 .call_method1("__aexit__", (&none, &none, &none))
                 .map_err(|e| format!("failed to call __aexit__: {e}"))?;
-            Ok::<_, String>(coro.to_object(py))
+            Ok::<_, String>(coro.clone().unbind())
         })?;
-        let aexit_fut = Python::with_gil(|py| {
+        let aexit_fut = Python::attach(|py| {
             let coro = aexit_coro_py.into_bound(py);
             pyo3_async_runtimes::tokio::into_future(coro)
                 .map_err(|e| format!("failed to convert __aexit__ coro: {e}"))
@@ -100,7 +106,10 @@ async fn attempt_aexit_cleanup(ctx_py: &Py<PyAny>, cleanup_timeout: Duration) {
                 Ok(())
             }
             Ok(Err(e)) => Err(format!("__aexit__ returned error: {e}")),
-            Err(_) => Err("__aexit__ cleanup itself timed out".to_string()),
+            Err(_elapsed) => Err(format!(
+                "__aexit__ cleanup itself timed out after {cleanup_timeout:?}"
+            )
+            .to_string()),
         }
     }
     .await;
@@ -112,6 +121,7 @@ async fn attempt_aexit_cleanup(ctx_py: &Py<PyAny>, cleanup_timeout: Duration) {
 /// Initialize a Python agent via the SDK, run `__aenter__`, and register it.
 pub(in crate::runtime) async fn handle_create_agent(
     registry: AgentRegistry,
+    event_loop: Py<PyAny>,
     chat_timeout: Duration,
     config_json: String,
     reply: oneshot::Sender<Result<AgentId, Error>>,
@@ -120,9 +130,9 @@ pub(in crate::runtime) async fn handle_create_agent(
     tracing::info!("Live-SDK: CreateAgent command received");
     let next_id = AGENT_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let init_result = Python::with_gil(|py| {
+    let init_result = Python::attach(|py| {
         prepare_agent_globals(py)?;
-        init_agent_instance(py, &config_json, next_id)
+        init_agent_instance(py, &config_json, next_id, &event_loop)
     });
 
     let (ctx_py, aenter_coro_py) = match init_result {
@@ -136,7 +146,7 @@ pub(in crate::runtime) async fn handle_create_agent(
         }
     };
 
-    let aenter_fut = match Python::with_gil(|py| {
+    let aenter_fut = match Python::attach(|py| {
         let coro = aenter_coro_py.into_bound(py);
         pyo3_async_runtimes::tokio::into_future(coro)
     }) {
@@ -231,18 +241,15 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
         return;
     };
 
-    // Clean up the global bridge state for this agent.
-    if let Ok(mut map) = super::super::bridge_state().write() {
-        map.remove(&agent_id.0);
-    } else {
-        tracing::warn!(agent_id = ?agent_id, "Failed to lock BRIDGE_STATE for cleanup");
-    }
+    // Bridge state cleanup is handled by AgentHandle::shutdown() after this
+    // handler returns, ensuring hooks dispatched during __aexit__ (e.g.
+    // on_session_end) can still find the hook runner.
 
-    let aexit_coro_res = Python::with_gil(|py| {
+    let aexit_coro_res = Python::attach(|py| {
         let ctx_bound = ctx_py.bind(py);
         let none = py.None();
         let coro = ctx_bound.call_method1("__aexit__", (&none, &none, &none))?;
-        Ok::<_, PyErr>(coro.to_object(py))
+        Ok::<_, PyErr>(coro.clone().unbind())
     });
 
     let aexit_coro_py = match aexit_coro_res {
@@ -256,7 +263,7 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
         }
     };
 
-    let aexit_fut = match Python::with_gil(|py| {
+    let aexit_fut = match Python::attach(|py| {
         let coro = aexit_coro_py.into_bound(py);
         pyo3_async_runtimes::tokio::into_future(coro)
     }) {
@@ -287,6 +294,8 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
             return;
         }
     };
+
+    // Bridge state cleanup handled by AgentHandle::shutdown().
 
     match exit_res {
         Ok(_) => {

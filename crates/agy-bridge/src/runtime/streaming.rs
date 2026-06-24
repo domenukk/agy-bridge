@@ -31,9 +31,9 @@ const RATE_LIMIT_HIT_ATTR: &str = "RATE_LIMIT_HIT";
 /// Error message surfaced when a 429 quota error is intercepted.
 const QUOTA_EXCEEDED_MSG: &str = "429: You exceeded your current quota";
 
-static NEXT_STEP_FN: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
+static NEXT_STEP_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
-fn compile_next_step_helper() -> Result<PyObject, String> {
+fn compile_next_step_helper() -> Result<Py<PyAny>, String> {
     super::command_loop::get_or_compile_py_helper(
         &NEXT_STEP_FN,
         PYTHON_NEXT_STEP_SCRIPT,
@@ -244,11 +244,11 @@ enum StepIterationResult {
 /// Acquires the GIL, calls the helper function, and converts the resulting
 /// Python coroutine into a Rust future.
 fn create_next_step_future(
-    next_step_fn: &PyObject,
-    aiter_py: &PyObject,
+    next_step_fn: &Py<PyAny>,
+    aiter_py: &Py<PyAny>,
     timeout_secs: f64,
-) -> Result<impl std::future::Future<Output = PyResult<PyObject>>, String> {
-    Python::with_gil(|py| {
+) -> Result<impl std::future::Future<Output = PyResult<Py<PyAny>>>, String> {
+    Python::attach(|py| {
         let fn_bound = next_step_fn.bind(py);
         let aiter_bound = aiter_py.bind(py);
         let coro = fn_bound
@@ -265,12 +265,12 @@ fn create_next_step_future(
 /// `Error` for any other exception.
 fn classify_py_step_error(err: &pyo3::PyErr, agent_id: AgentId) -> StepIterationResult {
     let is_stop =
-        Python::with_gil(|py| err.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py));
+        Python::attach(|py| err.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py));
     if is_stop {
         tracing::debug!(agent_id = ?agent_id, "Step stream ended (StopAsyncIteration)");
         return StepIterationResult::Stop;
     }
-    let err_msg = Python::with_gil(|py| crate::error::classify_py_error(py, err).to_string());
+    let err_msg = Python::attach(|py| crate::error::classify_py_error(py, err).to_string());
     tracing::error!(agent_id = ?agent_id, error = %err_msg, "Python step iteration failed");
     StepIterationResult::Error(err_msg)
 }
@@ -279,8 +279,8 @@ fn classify_py_step_error(err: &pyo3::PyErr, agent_id: AgentId) -> StepIteration
 ///
 /// Returns `None` if the object is Python `None` or extraction fails
 /// (logged as a warning).
-fn extract_step_json(step_py: &PyObject, agent_id: AgentId) -> Option<String> {
-    Python::with_gil(|py| {
+fn extract_step_json(step_py: &Py<PyAny>, agent_id: AgentId) -> Option<String> {
+    Python::attach(|py| {
         let bound = step_py.bind(py);
         if bound.is_none() {
             return None;
@@ -304,14 +304,20 @@ fn extract_step_json(step_py: &PyObject, agent_id: AgentId) -> Option<String> {
 /// Reads `_agy_bridge_globals.RATE_LIMIT_HIT` and resets it to `false`
 /// if it was `true`.
 fn check_rate_limit_hit() -> bool {
-    Python::with_gil(|py| -> PyResult<bool> {
-        let sys = py.import_bound("sys")?;
+    Python::attach(|py| -> PyResult<bool> {
+        let sys = py.import("sys")?;
         let gm = sys
             .getattr("modules")?
             .get_item(super::command_loop::AGY_BRIDGE_GLOBALS_MODULE)?;
         let hit = gm.getattr(RATE_LIMIT_HIT_ATTR)?.extract::<bool>()?;
         if hit && let Err(e) = gm.setattr(RATE_LIMIT_HIT_ATTR, false) {
-            tracing::warn!("Failed to reset {RATE_LIMIT_HIT_ATTR} flag: {e}");
+            tracing::error!(
+                "Failed to reset {RATE_LIMIT_HIT_ATTR} flag: {e} — \
+                 returning false to prevent permanent stuck 429 state"
+            );
+            // If we can't reset the flag, pretend we didn't see a hit.
+            // Otherwise every future step iteration would falsely report 429.
+            return Ok(false);
         }
         Ok(hit)
     })
@@ -328,8 +334,8 @@ fn check_rate_limit_hit() -> bool {
 }
 
 async fn process_next_step_iteration(
-    next_step_fn: &PyObject,
-    aiter_py: &PyObject,
+    next_step_fn: &Py<PyAny>,
+    aiter_py: &Py<PyAny>,
     chat_timeout: Duration,
     agent_id: AgentId,
     step_count: u64,
@@ -390,7 +396,7 @@ pub async fn stream_steps_to_writer(
     writer: &crate::streaming::ChatResponseWriter,
     chat_timeout: Duration,
     agent_id: AgentId,
-    aiter_py: &PyObject,
+    aiter_py: &Py<PyAny>,
 ) {
     tracing::debug!(agent_id = ?agent_id, "Starting step streaming");
     let next_step_fn = match compile_next_step_helper() {

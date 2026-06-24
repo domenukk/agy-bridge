@@ -161,7 +161,7 @@ impl From<StreamError> for Error {
 #[doc(hidden)]
 impl From<PyErr> for Error {
     fn from(err: PyErr) -> Self {
-        Python::with_gil(|py| classify_py_error(py, &err))
+        Python::attach(|py| classify_py_error(py, &err))
     }
 }
 
@@ -193,41 +193,58 @@ pub(crate) fn classify_py_error(py: Python<'_>, err: &PyErr) -> Error {
 }
 
 fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    if let Ok(types_mod) = py.import_bound("google.antigravity.types") {
-        if let Ok(conn_err_cls) = types_mod.getattr("AntigravityConnectionError")
-            && err.is_instance_bound(py, &conn_err_cls)
-        {
-            return Some(Error::ConnectionError {
-                message: err.to_string(),
-            });
+    match py.import("google.antigravity.types") {
+        Ok(types_mod) => {
+            if let Ok(conn_err_cls) = types_mod.getattr("AntigravityConnectionError")
+                && err.is_instance(py, &conn_err_cls)
+            {
+                return Some(Error::ConnectionError {
+                    message: err.to_string(),
+                });
+            }
+            if let Ok(val_err_cls) = types_mod.getattr("AntigravityValidationError")
+                && err.is_instance(py, &val_err_cls)
+            {
+                return Some(Error::BackendError {
+                    message: err.to_string(),
+                });
+            }
         }
-        if let Ok(val_err_cls) = types_mod.getattr("AntigravityValidationError")
-            && err.is_instance_bound(py, &val_err_cls)
-        {
-            return Some(Error::BackendError {
-                message: err.to_string(),
-            });
+        Err(import_err) => {
+            tracing::debug!(
+                error = %import_err,
+                "antigravity.types not available, skipping AntigravityError classification"
+            );
         }
     }
     None
 }
 
 fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    if let Ok(pydantic) = py.import_bound("pydantic")
-        && let Ok(validation_err_cls) = pydantic.getattr("ValidationError")
-        && err.is_instance_bound(py, &validation_err_cls)
-    {
-        return Some(Error::BackendError {
-            message: err.to_string(),
-        });
+    match py.import("pydantic") {
+        Ok(pydantic) => {
+            if let Ok(validation_err_cls) = pydantic.getattr("ValidationError")
+                && err.is_instance(py, &validation_err_cls)
+            {
+                return Some(Error::BackendError {
+                    message: err.to_string(),
+                });
+            }
+        }
+        Err(import_err) => {
+            tracing::debug!(
+                error = %import_err,
+                "pydantic not available, skipping ValidationError classification"
+            );
+        }
     }
     None
 }
 
 fn check_builtin_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    if let Ok(builtins) = py.import_bound("builtins") {
+    if let Ok(builtins) = py.import("builtins") {
         if let Ok(import_err_cls) = builtins.getattr("ImportError")
-            && err.is_instance_bound(py, &import_err_cls)
+            && err.is_instance(py, &import_err_cls)
         {
             return Some(Error::BackendError {
                 message: err.to_string(),
@@ -243,15 +260,11 @@ fn check_builtin_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
 fn format_backend_error(py: Python<'_>, err: &PyErr) -> String {
     // Try to get the full traceback via traceback.format_exception.
     let formatted = py
-        .import_bound("traceback")
+        .import("traceback")
         .and_then(|tb_mod| {
             tb_mod.call_method1(
                 "format_exception",
-                (
-                    err.get_type_bound(py),
-                    err.value_bound(py),
-                    err.traceback_bound(py),
-                ),
+                (err.get_type(py), err.value(py), err.traceback(py)),
             )
         })
         .and_then(|lines| lines.extract::<Vec<String>>());
@@ -261,7 +274,7 @@ fn format_backend_error(py: Python<'_>, err: &PyErr) -> String {
         Err(fmt_err) => {
             tracing::warn!(error = %fmt_err, "Failed to format backend traceback, using fallback");
             // Fall back to the inline traceback format that map_py_error used.
-            let traceback = err.traceback_bound(py);
+            let traceback = err.traceback(py);
             traceback.as_ref().map_or_else(
                 || err.to_string(),
                 |tb| {
@@ -270,7 +283,7 @@ fn format_backend_error(py: Python<'_>, err: &PyErr) -> String {
                             tracing::warn!(error = %tb_fmt_err, "Failed to format Python traceback");
                             err.to_string()
                         },
-                        |tb_str| format!("{}\nTraceback:\n{}", err.value_bound(py), tb_str),
+                        |tb_str| format!("{}\nTraceback:\n{}", err.value(py), tb_str),
                     )
                 },
             )
@@ -429,10 +442,9 @@ mod tests {
 
     #[test]
     fn test_backend_error_from_pyerr() {
-        pyo3::prepare_freethreaded_python();
-        let err = Python::with_gil(|py| {
-            let result: PyResult<()> =
-                py.run_bound("raise ValueError('test error 42')", None, None);
+        Python::initialize();
+        let err = Python::attach(|py| {
+            let result: PyResult<()> = py.run(c"raise ValueError('test error 42')", None, None);
             result.unwrap_err()
         });
 

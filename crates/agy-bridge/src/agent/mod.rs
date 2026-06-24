@@ -202,33 +202,33 @@ impl<R: Runtime> AgentHandle<R> {
     ) -> Result<Self, Error> {
         let quota_key = config.effective_api_key().unwrap_or_default();
         let quota_state = runtime.quota_registry().state_for_key(&quota_key);
-        let id = if hook_runner.is_some() {
-            // Serialize the set→create→clear sequence so concurrent creates
-            // cannot overwrite each other's temporary hook runner.
-            //
-            // NOTE: These must remain process-global because the Python-side
-            // callback (`dispatch_rust_hook`) is itself process-global — it is
-            // registered in `sys.modules["_agy_bridge_globals"]` and has no way
-            // to identify which runtime instance triggered it. A per-runtime
-            // guard would not prevent cross-runtime races on the shared
-            // INITIALIZING_HOOK_RUNNER slot.
-            let _guard = crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await;
-            if let Ok(mut opt) = crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
-                *opt = hook_runner.as_ref().map(Arc::clone);
-            } else {
-                tracing::error!("INITIALIZING_HOOK_RUNNER mutex poisoned — hook may not fire");
-            }
-            let result = runtime.create_agent(config.clone()).await;
-            if let Ok(mut opt) = crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
-                *opt = None;
-            } else {
-                tracing::error!("INITIALIZING_HOOK_RUNNER mutex poisoned — stale hook may persist");
-            }
-            result?
+
+        // We must hold CREATE_AGENT_HOOK_GUARD across both agent creation and
+        // bridge_state insertion. This prevents a race where an asynchronous hook
+        // (like on_session_start) fires in Python after create_agent returns but
+        // before the agent is inserted into bridge_state.
+        let _guard = if hook_runner.is_some() {
+            Some(crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await)
         } else {
-            runtime.create_agent(config.clone()).await?
+            None
         };
 
+        if hook_runner.is_some() {
+            match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
+                Ok(mut opt) => {
+                    *opt = hook_runner.as_ref().map(Arc::clone);
+                }
+                Err(e) => {
+                    return Err(Error::BackendError {
+                        message: format!(
+                            "INITIALIZING_HOOK_RUNNER mutex poisoned — hooks cannot be installed: {e}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        let id = runtime.create_agent(config.clone()).await?;
         tracing::info!(agent_id = id, "Agent created successfully");
 
         // Build and insert per-agent bridge state in a single lock acquisition.
@@ -240,13 +240,53 @@ impl<R: Runtime> AgentHandle<R> {
             policy_handler: policy_handler.as_ref().map(Arc::clone),
             tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         };
-        if let Ok(mut map) = crate::runtime::bridge_state().write() {
-            map.insert(id, bridge_entry);
-        } else {
-            tracing::error!(
-                agent_id = id,
-                "Failed to acquire write lock on BRIDGE_STATE"
-            );
+        let bridge_insert_failed = match crate::runtime::bridge_state().write() {
+            Ok(mut map) => {
+                map.insert(id, bridge_entry);
+                false
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = id,
+                    error = %e,
+                    "Failed to acquire write lock on BRIDGE_STATE — agent would be unusable"
+                );
+                true
+            }
+        };
+        // Guard is dropped here — safe to .await below.
+        if bridge_insert_failed {
+            // Best-effort shutdown the agent we just created before returning the error.
+            if let Err(shutdown_err) = runtime.shutdown_agent(id).await {
+                tracing::error!(
+                    agent_id = id,
+                    error = ?shutdown_err,
+                    "Failed to shut down agent after BRIDGE_STATE lock failure"
+                );
+            }
+            return Err(Error::BackendError {
+                message: "BRIDGE_STATE RwLock poisoned during agent creation".to_string(),
+            });
+        }
+
+        if hook_runner.is_some() {
+            match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
+                Ok(mut opt) => {
+                    *opt = None;
+                }
+                Err(e) => {
+                    // The agent is already created at this point. Log at error
+                    // level — a stale hook runner may cause the next agent
+                    // creation to pick up the wrong hooks, but the current
+                    // agent is functional.
+                    tracing::error!(
+                        agent_id = id,
+                        error = %e,
+                        "INITIALIZING_HOOK_RUNNER mutex poisoned during cleanup — \
+                         stale hook runner may persist"
+                    );
+                }
+            }
         }
 
         let conversation_id = Mutex::new(config.conversation_id.clone());
@@ -310,10 +350,17 @@ impl<R: Runtime> AgentHandle<R> {
             });
         };
 
-        if let Ok(mut guard) = self.last_shared_state.lock() {
-            *guard = Some(Arc::clone(&handle.shared_state));
-        } else {
-            tracing::error!("last_shared_state mutex poisoned — streaming metadata may be stale");
+        match self.last_shared_state.lock() {
+            Ok(mut guard) => {
+                *guard = Some(Arc::clone(&handle.shared_state));
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = self.id,
+                    error = %e,
+                    "last_shared_state mutex poisoned — streaming metadata may be stale"
+                );
+            }
         }
         Ok(handle)
     }
@@ -367,10 +414,17 @@ impl<R: Runtime> AgentHandle<R> {
     /// Takes `&self` rather than `&mut self` so the handle can be shared
     /// across concurrent tasks.
     pub fn set_conversation_id(&self, id: String) {
-        if let Ok(mut guard) = self.conversation_id.lock() {
-            *guard = Some(id);
-        } else {
-            tracing::error!("Failed to acquire lock on conversation_id");
+        match self.conversation_id.lock() {
+            Ok(mut guard) => {
+                *guard = Some(id);
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = self.id,
+                    error = %e,
+                    "conversation_id mutex poisoned — ID will not be updated"
+                );
+            }
         }
     }
 
@@ -674,6 +728,23 @@ impl<R: Runtime> AgentHandle<R> {
         // Always mark as shut down so Drop doesn't warn, even on failure.
         self.is_shutdown.store(true, Ordering::SeqCst);
 
+        // Clean up bridge state AFTER the runtime's shutdown completes.
+        // In the live runtime, `__aexit__` fires hooks (e.g. on_session_end)
+        // that look up bridge state — so this must happen after, not before.
+        match crate::runtime::bridge_state().write() {
+            Ok(mut map) => {
+                map.remove(&self.id);
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = self.id,
+                    error = %e,
+                    "BRIDGE_STATE RwLock poisoned during shutdown cleanup — \
+                     bridge state entry may leak"
+                );
+            }
+        }
+
         match result {
             Ok(()) => {
                 tracing::info!(agent_id = self.id, "Agent shut down successfully");
@@ -725,18 +796,27 @@ impl<R: Runtime> Drop for AgentHandle<R> {
                 "AgentHandle dropped without explicit shutdown() — \
                  sending best-effort shutdown signal"
             );
+            // try_shutdown_agent fires a command that eventually calls
+            // handle_shutdown_agent, which cleans up bridge state AFTER
+            // __aexit__ completes (so on_session_end hooks can still
+            // find the hook runner). Do NOT clean up bridge state here.
             self.runtime.try_shutdown_agent(self.id);
-        }
-
-        // Clean up global bridge state entry.
-        if let Ok(mut map) = crate::runtime::bridge_state().write() {
-            map.remove(&self.id);
+        } else if self.is_shutdown.load(Ordering::SeqCst) {
+            // shutdown() was already called — handle_shutdown_agent
+            // already cleaned up bridge state after __aexit__. Nothing
+            // to do.
         } else {
-            tracing::error!(
-                agent_id = self.id,
-                "BRIDGE_STATE RwLock poisoned during Drop — \
-                 bridge state entry for this agent may leak"
-            );
+            // Agent was never started (e.g. creation failed). Clean up
+            // any partial bridge state that might have been registered.
+            if let Ok(mut map) = crate::runtime::bridge_state().write() {
+                map.remove(&self.id);
+            } else {
+                tracing::error!(
+                    agent_id = self.id,
+                    "BRIDGE_STATE RwLock poisoned during Drop — \
+                     bridge state entry for this agent may leak"
+                );
+            }
         }
     }
 }

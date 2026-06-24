@@ -48,10 +48,15 @@ impl QuotaRegistry {
     #[must_use]
     pub fn state_for_key(&self, key: &str) -> Arc<QuotaState> {
         // Fast path: read lock.
-        if let Ok(map) = self.inner.read()
-            && let Some(state) = map.get(key)
-        {
-            return Arc::clone(state);
+        match self.inner.read() {
+            Ok(map) => {
+                if let Some(state) = map.get(key) {
+                    return Arc::clone(state);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("QuotaRegistry RwLock poisoned on read path: {e}");
+            }
         }
         // Slow path: write lock.
         let mut map = self.inner.write().unwrap_or_else(|e| {

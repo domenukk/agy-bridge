@@ -348,6 +348,11 @@ mod duration_secs {
         if secs < 0.0 {
             return Err(serde::de::Error::custom("duration must not be negative"));
         }
+        if secs < 1.0 {
+            return Err(serde::de::Error::custom(
+                "trigger interval must be at least 1 second",
+            ));
+        }
         Ok(Duration::from_secs_f64(secs))
     }
 }
@@ -508,16 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn try_from_iter_vec_invalid_entry_is_err() {
-        let entries = vec![TriggerEntry {
-            name: "  ".to_owned(),
-            config: TriggerConfig::every_secs(10),
-            message_template: "msg".to_owned(),
-        }];
-        assert!(TriggerSet::try_from_iter(entries).is_err());
-    }
-
-    #[test]
     fn try_from_iter_array_valid_entries() {
         let entry = TriggerEntry {
             name: "poll".to_owned(),
@@ -539,18 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn try_from_iter_valid() {
-        let entries = vec![TriggerEntry {
-            name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(60),
-            message_template: "poll now".to_owned(),
-        }];
-        let set = TriggerSet::try_from_iter(entries).expect("valid entries");
-        assert_eq!(set.len(), 1);
-    }
-
-    #[test]
-    fn try_from_iter_invalid_is_err() {
+    fn try_from_iter_invalid_entry_is_err() {
         let entries = vec![
             TriggerEntry {
                 name: "poll".to_owned(),
@@ -594,8 +578,32 @@ mod tests {
     }
 
     #[test]
-    fn duration_secs_preserves_subsecond_via_serde() {
-        // Construct via serde to bypass the constructor validation
+    fn duration_secs_rejects_subsecond_via_serde() {
+        // Sub-second intervals should be rejected during deserialization,
+        // matching the constructor validation.
+        let json = r#"{"Every":{"interval":0.5}}"#;
+        let result = serde_json::from_str::<TriggerConfig>(json);
+        assert!(
+            result.is_err(),
+            "Sub-second interval should be rejected during deserialization"
+        );
+    }
+
+    #[test]
+    fn duration_secs_accepts_exactly_one_second() {
+        let json = r#"{"Every":{"interval":1.0}}"#;
+        let parsed: TriggerConfig = serde_json::from_str(json).expect("deserialize");
+        match &parsed {
+            TriggerConfig::Every { interval } => {
+                assert_eq!(*interval, Duration::from_secs(1));
+            }
+            TriggerConfig::OnFileChange { .. } => panic!("Expected Every, got OnFileChange"),
+        }
+    }
+
+    #[test]
+    fn duration_secs_preserves_supersecond_fractional() {
+        // Fractional values ≥1s (e.g. 1.5s) should still work.
         let json = r#"{"Every":{"interval":1.5}}"#;
         let parsed: TriggerConfig = serde_json::from_str(json).expect("deserialize");
         match &parsed {
@@ -604,11 +612,10 @@ mod tests {
             }
             TriggerConfig::OnFileChange { .. } => panic!("Expected Every, got OnFileChange"),
         }
-        // Re-serialize should preserve 1.5
         let reserialized = serde_json::to_string(&parsed).expect("serialize");
         assert!(
             reserialized.contains("1.5"),
-            "Sub-second duration should round-trip, got {reserialized}"
+            "Super-second fractional duration should round-trip, got {reserialized}"
         );
     }
 

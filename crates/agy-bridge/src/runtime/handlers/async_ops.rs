@@ -22,11 +22,15 @@ use super::super::{
 use crate::error::Error;
 
 /// Lock the agent registry, recovering from mutex poisoning.
+#[allow(clippy::type_complexity)]
 fn lock_registry(
     registry: &AgentRegistry,
 ) -> std::sync::MutexGuard<
     '_,
-    std::collections::HashMap<super::super::AgentId, (pyo3::PyObject, pyo3::PyObject)>,
+    std::collections::HashMap<
+        super::super::AgentId,
+        (pyo3::Py<pyo3::PyAny>, pyo3::Py<pyo3::PyAny>),
+    >,
 > {
     registry.lock().unwrap_or_else(|e| {
         tracing::error!("Agent registry mutex was poisoned, recovering: {e}");
@@ -38,16 +42,16 @@ fn lock_registry(
 ///
 /// Returns `None` if the agent is not present; never fails on a poisoned mutex
 /// (recovers via [`lock_registry`]).
-fn clone_agent_refs(registry: &AgentRegistry, agent_id: AgentId) -> Option<(PyObject, PyObject)> {
+fn clone_agent_refs(registry: &AgentRegistry, agent_id: AgentId) -> Option<(Py<PyAny>, Py<PyAny>)> {
     let lock = lock_registry(registry);
     lock.get(&agent_id)
-        .map(|(c, a)| Python::with_gil(|py| (c.clone_ref(py), a.clone_ref(py))))
+        .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py))))
 }
 
 /// Describes a Python async operation to run against an agent instance.
 struct PyAsyncOp<'a> {
     /// Compiled-function cache slot.
-    cache: &'static std::sync::OnceLock<PyObject>,
+    cache: &'static std::sync::OnceLock<Py<PyAny>>,
     /// Python source that defines the helper function.
     script: &'a str,
     /// Name of the function inside the script.
@@ -78,7 +82,7 @@ async fn run_py_async_op<T, F, E>(
 ) where
     T: Send + std::fmt::Debug + 'static,
     F: FnOnce(&Bound<'_, PyAny>, &Bound<'_, PyAny>) -> PyResult<Py<PyAny>>,
-    E: FnOnce(PyObject) -> T,
+    E: FnOnce(Py<PyAny>) -> T,
 {
     // 1. Look up the agent in the registry.
     let Some((_ctx, agent_instance)) = clone_agent_refs(&registry, agent_id) else {
@@ -99,7 +103,7 @@ async fn run_py_async_op<T, F, E>(
 
     // 2. Compile the Python helper and create a future from the coroutine.
     let fut = get_or_compile_py_helper(op.cache, op.script, op.fn_name).and_then(|helper_fn| {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let helper_bound = helper_fn.bind(py);
             let agent_bound = agent_instance.bind(py);
             let coro = build_args(helper_bound, agent_bound).map_err(|e| format!("{e}"))?;
@@ -317,9 +321,12 @@ pub(in crate::runtime) async fn handle_wait_for_wakeup(
         },
         |helper, agent| helper.call1((agent, timeout_secs)).map(Bound::unbind),
         |result| {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 result.bind(py).extract::<bool>().unwrap_or_else(|e| {
-                    tracing::warn!("Extraction failed: {}", e);
+                    tracing::error!(
+                        "wait_for_wakeup: failed to extract bool from Python result, \
+                         defaulting to false (not woken): {e}"
+                    );
                     false
                 })
             })

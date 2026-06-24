@@ -299,6 +299,11 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     let config = AgentConfig::builder()
         .triggers(vec![periodic, file_watch])
         .build();
+#   let config = agy_bridge::config::AgentConfig {
+#       system_instructions: Some(agy_bridge::config::SystemInstructions::custom("Reply with 'Hello!' and nothing else. Never use tools.")),
+#       capabilities: Some(agy_bridge::config::CapabilitiesConfig::custom_tools_only()),
+#       ..config
+#   };
 
     let agent = bridge.agent(config).await?;
 
