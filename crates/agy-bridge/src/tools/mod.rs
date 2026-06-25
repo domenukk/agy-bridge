@@ -10,13 +10,6 @@
 // appear in user-facing documentation.
 #[doc(hidden)]
 pub use llm_tool::__private;
-// Re-export prompt-templates types so
-// `#[llm_tool(prompt_file = "...", response_file = "...")]`
-// works out of the box for agy-bridge users.
-#[doc(hidden)]
-pub use llm_tool::__prompt_templates;
-#[doc(hidden)]
-pub use llm_tool::__prompt_templates_macros;
 pub use llm_tool::{
     EmptyParams, Json, JsonSchema, RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput,
     ToolRegistry, definition_of,
