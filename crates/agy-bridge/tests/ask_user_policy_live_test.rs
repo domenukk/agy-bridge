@@ -6,10 +6,7 @@
 //! 3. Allowing the confirmation successfully proceeds with tool execution.
 //! 4. Denying the confirmation blocks tool execution and returns a denial error.
 
-use std::time::Duration;
-
 use agy_bridge::{
-    AgyBridge,
     config::AgentConfig,
     llm_tool,
     policies::{AskUserHandler, PolicyRule},
@@ -20,13 +17,6 @@ mod common;
 
 fn api_key() -> String {
     common::api_key()
-}
-
-fn test_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
 }
 
 struct TestAskUserHandler;
@@ -62,7 +52,7 @@ fn do_secure_action(
 #[test]
 fn test_ask_user_policy_live_gating() {
     common::run_live_test("test_ask_user_policy_live_gating", || {
-        let rt = test_runtime();
+        let rt = common::test_runtime();
         rt.block_on(async {
             let key = api_key();
 
@@ -85,9 +75,7 @@ fn test_ask_user_policy_live_gating() {
                 .policies(policies)
                 .build();
 
-            let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(2))
-                .build()?;
+            let bridge = common::create_bridge();
 
             let handler = TestAskUserHandler;
 

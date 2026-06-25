@@ -16,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.2.0"
+agy-bridge = "0.2.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -352,43 +352,43 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
 ## Examples
 
-The [`examples/`](examples/) directory contains runnable programs for every feature:
+The [`crates/agy-bridge/examples/`](crates/agy-bridge/examples/) directory contains runnable programs for every feature:
 
 ### Getting Started
 
-| Example                                                                      | Description                            |
-| :--------------------------------------------------------------------------- | :------------------------------------- |
-| [`hello_world`](examples/getting_started/hello_world.rs)                     | Minimal agent — create, prompt, print  |
-| [`streaming`](examples/getting_started/streaming.rs)                         | Stream text tokens as they arrive      |
-| [`custom_tools`](examples/getting_started/custom_tools.rs)                   | `#[llm_tool]` proc macro               |
-| [`multimodal`](examples/getting_started/multimodal.rs)                       | Text + image input                     |
-| [`mcp_tools`](examples/getting_started/mcp_tools.rs)                         | MCP server integration                 |
-| [`structured_output`](examples/getting_started/structured_output.rs)         | JSON schema–constrained responses      |
-| [`hooks`](examples/getting_started/hooks.rs)                                 | Lifecycle hooks                        |
-| [`policies`](examples/getting_started/policies.rs)                           | Declarative tool access control        |
-| [`triggers`](examples/getting_started/triggers.rs)                           | Periodic and file-change triggers      |
-| [`subagents`](examples/getting_started/subagents.rs)                         | Parent/child agent spawning            |
-| [`human_in_the_loop`](examples/getting_started/human_in_the_loop.rs)         | Human-in-the-loop chat patterns        |
-| [`persistence`](examples/getting_started/persistence.rs)                     | Conversation persistence               |
-| [`observability`](examples/getting_started/observability.rs)                 | Tracing and usage metadata             |
-| [`error_handler`](examples/getting_started/error_handler.rs)                 | Structured error handling patterns     |
-| [`autonomous_shell`](examples/getting_started/autonomous_shell.rs)           | Autonomous shell command execution     |
-| [`persona_config`](examples/getting_started/persona_config.rs)               | Custom persona and model configuration |
-| [`agent_skills`](examples/getting_started/agent_skills.rs)                   | Agent skill registration               |
-| [`app_data_dir_override`](examples/getting_started/app_data_dir_override.rs) | Custom app data directory              |
+| Example                                                                                        | Description                            |
+| :--------------------------------------------------------------------------------------------- | :------------------------------------- |
+| [`hello_world`](crates/agy-bridge/examples/getting_started/hello_world.rs)                     | Minimal agent — create, prompt, print  |
+| [`streaming`](crates/agy-bridge/examples/getting_started/streaming.rs)                         | Stream text tokens as they arrive      |
+| [`custom_tools`](crates/agy-bridge/examples/getting_started/custom_tools.rs)                   | `#[llm_tool]` proc macro               |
+| [`multimodal`](crates/agy-bridge/examples/getting_started/multimodal.rs)                       | Text + image input                     |
+| [`mcp_tools`](crates/agy-bridge/examples/getting_started/mcp_tools.rs)                         | MCP server integration                 |
+| [`structured_output`](crates/agy-bridge/examples/getting_started/structured_output.rs)         | JSON schema–constrained responses      |
+| [`hooks`](crates/agy-bridge/examples/getting_started/hooks.rs)                                 | Lifecycle hooks                        |
+| [`policies`](crates/agy-bridge/examples/getting_started/policies.rs)                           | Declarative tool access control        |
+| [`triggers`](crates/agy-bridge/examples/getting_started/triggers.rs)                           | Periodic and file-change triggers      |
+| [`subagents`](crates/agy-bridge/examples/getting_started/subagents.rs)                         | Parent/child agent spawning            |
+| [`human_in_the_loop`](crates/agy-bridge/examples/getting_started/human_in_the_loop.rs)         | Human-in-the-loop chat patterns        |
+| [`persistence`](crates/agy-bridge/examples/getting_started/persistence.rs)                     | Conversation persistence               |
+| [`observability`](crates/agy-bridge/examples/getting_started/observability.rs)                 | Tracing and usage metadata             |
+| [`error_handler`](crates/agy-bridge/examples/getting_started/error_handler.rs)                 | Structured error handling patterns     |
+| [`autonomous_shell`](crates/agy-bridge/examples/getting_started/autonomous_shell.rs)           | Autonomous shell command execution     |
+| [`persona_config`](crates/agy-bridge/examples/getting_started/persona_config.rs)               | Custom persona and model configuration |
+| [`agent_skills`](crates/agy-bridge/examples/getting_started/agent_skills.rs)                   | Agent skill registration               |
+| [`app_data_dir_override`](crates/agy-bridge/examples/getting_started/app_data_dir_override.rs) | Custom app data directory              |
 
 ### Deep Dives
 
-| Example                                                                             | Description                          |
-| :---------------------------------------------------------------------------------- | :----------------------------------- |
-| [`async_chat`](examples/deep_dives/async_chat.rs)                                   | Advanced async chat patterns         |
-| [`round_based_chat`](examples/deep_dives/round_based_chat.rs)                       | Multi-round structured conversations |
-| [`agent_middleware`](examples/deep_dives/agent_middleware.rs)                       | Hook-based middleware pipeline       |
-| [`host_tool_hooks`](examples/deep_dives/host_tool_hooks.rs)                         | Host-side tool interception hooks    |
-| [`interactive_cli`](examples/deep_dives/interactive_cli.rs)                         | Multi-turn CLI chat application      |
-| [`multimodal_pipeline`](examples/deep_dives/multimodal_pipeline.rs)                 | Multi-stage multimodal processing    |
-| [`doc_maintenance_agent`](examples/deep_dives/doc_maintenance_agent.rs)             | Documentation maintenance agent      |
-| [`docstring_maintenance_agent`](examples/deep_dives/docstring_maintenance_agent.rs) | Code docstring maintenance agent     |
+| Example                                                                                               | Description                          |
+| :---------------------------------------------------------------------------------------------------- | :----------------------------------- |
+| [`async_chat`](crates/agy-bridge/examples/deep_dives/async_chat.rs)                                   | Advanced async chat patterns         |
+| [`round_based_chat`](crates/agy-bridge/examples/deep_dives/round_based_chat.rs)                       | Multi-round structured conversations |
+| [`agent_middleware`](crates/agy-bridge/examples/deep_dives/agent_middleware.rs)                       | Hook-based middleware pipeline       |
+| [`host_tool_hooks`](crates/agy-bridge/examples/deep_dives/host_tool_hooks.rs)                         | Host-side tool interception hooks    |
+| [`interactive_cli`](crates/agy-bridge/examples/deep_dives/interactive_cli.rs)                         | Multi-turn CLI chat application      |
+| [`multimodal_pipeline`](crates/agy-bridge/examples/deep_dives/multimodal_pipeline.rs)                 | Multi-stage multimodal processing    |
+| [`doc_maintenance_agent`](crates/agy-bridge/examples/deep_dives/doc_maintenance_agent.rs)             | Documentation maintenance agent      |
+| [`docstring_maintenance_agent`](crates/agy-bridge/examples/deep_dives/docstring_maintenance_agent.rs) | Code docstring maintenance agent     |
 
 ```bash
 cargo run --example getting_started_hello_world

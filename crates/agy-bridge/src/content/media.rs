@@ -201,6 +201,37 @@ pub mod mime {
     }
 }
 
+/// Shared implementation for loading media from a file path.
+///
+/// Extracts the file extension, looks up the MIME type, validates the prefix,
+/// reads the file, and returns `(data, mime_type)`.
+fn from_file_inner(
+    path: &std::path::Path,
+    type_label: &str,
+    mime_prefixes: &[&str],
+) -> std::io::Result<(Vec<u8>, String)> {
+    let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
+    })?;
+    let mime_type = mime::from_extension(ext).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unrecognized {type_label} extension: {ext}"),
+        )
+    })?;
+    if !mime_prefixes
+        .iter()
+        .any(|prefix| mime_type.starts_with(prefix))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("MIME type '{mime_type}' is not {type_label} type"),
+        ));
+    }
+    let data = std::fs::read(path)?;
+    Ok((data, mime_type.to_owned()))
+}
+
 // =============================================================================
 // Media convenience constructors
 // =============================================================================
@@ -280,23 +311,7 @@ impl Image {
     /// Returns `std::io::Error` if the file cannot be read or the extension
     /// is unrecognized.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
-        })?;
-        let mime_type = mime::from_extension(ext).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unrecognized image extension: {ext}"),
-            )
-        })?;
-        if !mime_type.starts_with("image/") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("MIME type '{mime_type}' is not an image type"),
-            ));
-        }
-        let data = std::fs::read(path)?;
+        let (data, mime_type) = from_file_inner(path.as_ref(), "an image", &["image/"])?;
         Ok(Self::new(data, mime_type))
     }
 }
@@ -360,23 +375,8 @@ impl Document {
     /// Returns `std::io::Error` if the file cannot be read or the extension
     /// is unrecognized.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
-        })?;
-        let mime_type = mime::from_extension(ext).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unrecognized document extension: {ext}"),
-            )
-        })?;
-        if !mime_type.starts_with("application/") && !mime_type.starts_with("text/") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("MIME type '{mime_type}' is not a document type"),
-            ));
-        }
-        let data = std::fs::read(path)?;
+        let (data, mime_type) =
+            from_file_inner(path.as_ref(), "a document", &["application/", "text/"])?;
         Ok(Self::new(data, mime_type))
     }
 }
@@ -454,23 +454,7 @@ impl Audio {
     /// Returns `std::io::Error` if the file cannot be read or the extension
     /// is unrecognized.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
-        })?;
-        let mime_type = mime::from_extension(ext).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unrecognized audio extension: {ext}"),
-            )
-        })?;
-        if !mime_type.starts_with("audio/") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("MIME type '{mime_type}' is not an audio type"),
-            ));
-        }
-        let data = std::fs::read(path)?;
+        let (data, mime_type) = from_file_inner(path.as_ref(), "an audio", &["audio/"])?;
         Ok(Self::new(data, mime_type))
     }
 }
@@ -528,23 +512,7 @@ impl Video {
     /// Returns `std::io::Error` if the file cannot be read or the extension
     /// is unrecognized.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
-        })?;
-        let mime_type = mime::from_extension(ext).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unrecognized video extension: {ext}"),
-            )
-        })?;
-        if !mime_type.starts_with("video/") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("MIME type '{mime_type}' is not a video type"),
-            ));
-        }
-        let data = std::fs::read(path)?;
+        let (data, mime_type) = from_file_inner(path.as_ref(), "a video", &["video/"])?;
         Ok(Self::new(data, mime_type))
     }
 }

@@ -624,6 +624,52 @@ mod tests {
         assert_eq!(so, Some(serde_json::json!({"answer": 42})));
     }
 
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct AnswerOutput {
+        answer: i64,
+    }
+
+    #[tokio::test]
+    async fn get_last_structured_output_as_typed_success() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("create agent");
+
+        let mut response = agent.chat("Hello").await.expect("chat should succeed");
+        {
+            let mut state = response.shared_state.lock().unwrap();
+            state.structured_output = Some(serde_json::json!({"answer": 42}));
+        }
+        response.finalize();
+        drop(response);
+
+        let typed = agent.get_last_structured_output_as::<AnswerOutput>();
+        assert_eq!(
+            typed.expect("some").expect("ok"),
+            AnswerOutput { answer: 42 }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_last_structured_output_as_typed_failure() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("create agent");
+
+        let mut response = agent.chat("Hello").await.expect("chat should succeed");
+        {
+            let mut state = response.shared_state.lock().unwrap();
+            state.structured_output = Some(serde_json::json!({"wrong_field": "hello"}));
+        }
+        response.finalize();
+        drop(response);
+
+        let typed = agent.get_last_structured_output_as::<AnswerOutput>();
+        assert!(typed.expect("some").is_err());
+    }
+
     #[tokio::test]
     async fn get_last_usage_none_initially() {
         let rt = Arc::new(ToolAwareMockRuntime::new());

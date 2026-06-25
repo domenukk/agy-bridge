@@ -240,25 +240,29 @@ def _extract(response, agent):
     if u is not None:
         if hasattr(u, 'model_dump_json'):
             u_json = u.model_dump_json()
+        elif hasattr(u, 'to_json'):
+            val = u.to_json()
+            u_json = val if isinstance(val, str) else json.dumps(val)
         elif hasattr(u, '__dict__'):
             u_json = json.dumps(u.__dict__)
         else:
             try:
                 u_json = json.dumps(dict(u))
             except Exception:
-                _log.warning('Failed to serialize usage_metadata via dict(), falling back to to_json()', exc_info=True)
-                u_json = getattr(u, 'to_json', lambda: None)()
+                _log.debug('Failed to serialize usage_metadata', exc_info=True)
     if s is not None:
         if hasattr(s, 'model_dump_json'):
             s_json = s.model_dump_json()
+        elif hasattr(s, 'to_json'):
+            val = s.to_json()
+            s_json = val if isinstance(val, str) else json.dumps(val)
         elif isinstance(s, dict):
             s_json = json.dumps(s)
         else:
             try:
                 s_json = json.dumps(dict(s))
             except Exception:
-                _log.warning('Failed to serialize structured_output via dict(), falling back to to_json()', exc_info=True)
-                s_json = getattr(s, 'to_json', lambda: None)()
+                _log.debug('Failed to serialize structured_output', exc_info=True)
     return (u_json, s_json)
 ";
 

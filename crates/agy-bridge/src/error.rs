@@ -385,7 +385,7 @@ const JITTER_MIN_SUBTRACT_DIVISOR: u64 = 4;
 ///
 /// Jitter is applied to avoid the thundering-herd problem when many callers
 /// retry simultaneously.
-fn backoff_duration(attempt: u32) -> Duration {
+pub(crate) fn backoff_duration(attempt: u32) -> Duration {
     let attempt = attempt.max(1);
     let base_secs = BACKOFF_EXPONENT_BASE
         .checked_shl(attempt.saturating_sub(1))

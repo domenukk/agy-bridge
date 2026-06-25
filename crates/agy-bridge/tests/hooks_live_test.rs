@@ -12,17 +12,7 @@ use agy_bridge::{
 };
 
 mod common;
-
-fn api_key() -> String {
-    common::api_key()
-}
-
-fn test_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-}
+use common::{api_key, test_runtime};
 
 #[test]
 fn test_hooks_lifecycle_live() {
@@ -69,9 +59,7 @@ fn test_hooks_lifecycle_live() {
                 .capabilities(CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile]))
                 .build();
 
-            let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(3))
-                .build()?;
+            let bridge = common::create_bridge();
 
             let agent = bridge.agent(config).hooks(hook_runner).await?;
 

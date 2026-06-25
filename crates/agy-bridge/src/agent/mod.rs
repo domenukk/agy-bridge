@@ -596,6 +596,17 @@ impl<R: Runtime> AgentHandle<R> {
         state.structured_output.clone()
     }
 
+    /// Return the structured output from the last chat response deserialized into `T`.
+    ///
+    /// Returns `None` if there was no structured output on the last response.
+    /// Returns `Some(Err(...))` if the structured output could not be deserialized as `T`.
+    pub fn get_last_structured_output_as<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Option<Result<T, serde_json::Error>> {
+        self.get_last_structured_output()
+            .map(serde_json::from_value)
+    }
+
     /// Return the usage metadata from the last chat response, if any.
     #[must_use]
     pub fn get_last_usage(&self) -> Option<UsageMetadata> {

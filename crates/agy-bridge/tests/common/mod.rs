@@ -35,6 +35,19 @@ pub fn api_key() -> String {
     );
 }
 
+pub fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+pub fn create_bridge() -> agy_bridge::AgyBridge {
+    agy_bridge::AgyBridge::builder()
+        .build()
+        .expect("Failed to create bridge")
+}
+
 // ── Bounded-concurrency gate ─────────────────────────────────────────────────
 
 /// Default number of live tests allowed to run concurrently.

@@ -16,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.2.0"
+agy-bridge = "0.2.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

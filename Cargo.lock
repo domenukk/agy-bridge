@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agy-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "fast_rands",
@@ -102,9 +102,9 @@ checksum = "18f12cc9948ed9604230cdddc7c86e270f9401ccbe3c2e98a4378c5e7632212f"
 
 [[package]]
 name = "convert_case"
-version = "0.7.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb402b8d4c85569410425650ce3eddc7d698ed96d39a73f941b08fb63082f1e7"
+checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -165,12 +165,6 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -290,24 +284,13 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
  "serde",
  "serde_core",
 ]
@@ -325,7 +308,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -348,24 +331,31 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-tool"
-version = "0.2.0"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9657afd32c91245a00eb4b7c7413a1aed2ff456c6dce1132483eae71dc8157eb"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown",
  "llm-tool-macros",
  "prompt-templates",
+ "prompt-templates-macros",
  "schemars",
  "serde",
  "serde_json",
- "spin 0.9.8",
+ "spin",
  "tracing",
 ]
 
 [[package]]
 name = "llm-tool-macros"
-version = "0.2.0"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f869bbabd53a6252622a7543204408ab00e49bbe4f038f1b188cbd472e9cc12d"
 dependencies = [
  "convert_case",
+ "hashbrown",
  "proc-macro2",
+ "prompt-templates",
  "quote",
  "syn 2.0.118",
 ]
@@ -447,16 +437,32 @@ dependencies = [
 
 [[package]]
 name = "prompt-templates"
-version = "0.2.0"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bbc026fd142bb023983f0d1530f1a179355d0201f78d7b267c61e973beda4e2"
 dependencies = [
  "ciborium",
  "const-str",
  "flexbuffers",
- "hashbrown 0.17.1",
+ "hashbrown",
  "itoa",
  "serde",
- "spin 0.12.1",
+ "spin",
  "thiserror",
+ "typed-builder",
+]
+
+[[package]]
+name = "prompt-templates-macros"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89a51913725006df3ac66efc05b3fbc818a810a428a84daa671d5b6f04ec042"
+dependencies = [
+ "hashbrown",
+ "proc-macro2",
+ "prompt-templates",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -698,12 +704,6 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
-
-[[package]]
-name = "spin"
-version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spin"

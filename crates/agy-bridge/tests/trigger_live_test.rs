@@ -59,13 +59,10 @@ fn trigger_config_on_file_change_validates() {
 fn test_trigger_agent_creation() {
     common::run_live_test("test_trigger_agent_creation", || {
         let _key = common::api_key();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build runtime");
+        let rt = common::test_runtime();
 
         rt.block_on(async {
-            let bridge = agy_bridge::AgyBridge::builder().build()?;
+            let bridge = common::create_bridge();
             let triggers = vec![agy_bridge::triggers::TriggerEntry::new(
                 "test_every",
                 agy_bridge::triggers::TriggerConfig::every_secs(10),

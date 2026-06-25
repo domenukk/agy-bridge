@@ -375,17 +375,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_exponential_backoff_progression() {
-        // Verify the exponential progression: 2→4→8→16→32→64→120 (capped)
-        let d1 = exponential_backoff_with_jitter(1);
-        let d2 = exponential_backoff_with_jitter(2);
-        let d3 = exponential_backoff_with_jitter(3);
-        let d7 = exponential_backoff_with_jitter(7);
+        // Verify the exponential progression via shared backoff_duration:
+        // 2→4→8→16→32→64→120 (capped), with ±25% jitter.
+        use crate::error::backoff_duration;
+        let d1 = backoff_duration(1);
+        let d2 = backoff_duration(2);
+        let d3 = backoff_duration(3);
+        let d7 = backoff_duration(7);
 
-        // Base: 2s, 4s, 8s, ... capped at 120s. Plus jitter (< 5000ms).
-        assert!(d1 >= Duration::from_secs(2) && d1 < Duration::from_secs(7));
-        assert!(d2 >= Duration::from_secs(4) && d2 < Duration::from_secs(9));
-        assert!(d3 >= Duration::from_secs(8) && d3 < Duration::from_secs(13));
-        assert!(d7 >= Duration::from_mins(2) && d7 < Duration::from_secs(125));
+        // Base: 2s, 4s, 8s, ... capped at 120s. Jitter is ±25%.
+        assert!(d1 >= Duration::from_millis(1500) && d1 <= Duration::from_millis(2500));
+        assert!(d2 >= Duration::from_secs(3) && d2 <= Duration::from_secs(5));
+        assert!(d3 >= Duration::from_secs(6) && d3 <= Duration::from_secs(10));
+        assert!(d7 >= Duration::from_secs(90) && d7 <= Duration::from_secs(150));
     }
 
     #[tokio::test]
@@ -433,40 +435,21 @@ mod tests {
     }
 
     #[test]
-    fn test_jitter_is_nondeterministic_for_same_attempt() {
-        // Call jitter_ms 10 times with the same context; at least 2 distinct
-        // values should appear (statistical: probability of all-same ≈ 0).
-        let values: Vec<u64> = (0..10).map(|_i| jitter_ms()).collect();
-        let distinct: std::collections::HashSet<u64> = values.iter().copied().collect();
-        assert!(
-            distinct.len() >= 2,
-            "Expected at least 2 distinct jitter values, got {values:?}"
-        );
-    }
-
-    #[test]
-    fn test_jitter_bounded() {
-        // Every jitter value must be in [0, MAX_JITTER_MS)
-        for _ in 0..100 {
-            let j = jitter_ms();
-            assert!(j < MAX_JITTER_MS, "jitter {j} should be < {MAX_JITTER_MS}");
-        }
-    }
-
-    #[test]
     fn test_backoff_with_jitter_bounded() {
-        // Full backoff duration must be within [base, base + MAX_JITTER_MS)
-        for attempt in 1..=20 {
-            let d = exponential_backoff_with_jitter(attempt);
+        // Full backoff duration must be within ±25% of base.
+        use crate::error::{MAX_BACKOFF_SECS, backoff_duration};
+        for attempt in 1..=20u32 {
+            let d = backoff_duration(attempt);
             let base_secs = 2u64
                 .checked_shl(attempt.saturating_sub(1))
                 .unwrap_or(MAX_BACKOFF_SECS)
                 .min(MAX_BACKOFF_SECS);
-            let base = Duration::from_secs(base_secs);
-            let max_with_jitter = Duration::from_millis(base_secs * 1000 + MAX_JITTER_MS);
+            let base_ms = base_secs * 1000;
+            let lo = Duration::from_millis(base_ms * 3 / 4);
+            let hi = Duration::from_millis(base_ms * 5 / 4);
             assert!(
-                d >= base && d < max_with_jitter,
-                "attempt {attempt}: {d:?} not in [{base:?}, {max_with_jitter:?})"
+                d >= lo && d <= hi,
+                "attempt {attempt}: {d:?} not in [{lo:?}, {hi:?}]"
             );
         }
     }
