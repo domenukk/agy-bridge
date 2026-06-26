@@ -172,7 +172,7 @@ pub struct AgentHandle<R: Runtime + 'static> {
     _registry: Option<Arc<crate::tools::ToolRegistry>>,
     /// Kept alive to preserve a strong reference to the policy confirmation handler.
     policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
-    conversation_id: Mutex<Option<String>>,
+    conversation_id: Arc<Mutex<Option<String>>>,
     is_started: AtomicBool,
     is_shutdown: AtomicBool,
     /// Shared state from the last completed chat response, used to surface
@@ -193,6 +193,10 @@ impl<R: Runtime> AgentHandle<R> {
     ///
     /// Returns a [`Error`] if agent creation fails (e.g. invalid config,
     /// Python error, or quota exceeded).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Agent initialization is a sequential multi-step setup"
+    )]
     pub async fn new(
         runtime: Arc<R>,
         config: AgentConfig,
@@ -203,28 +207,38 @@ impl<R: Runtime> AgentHandle<R> {
         let quota_key = config.effective_api_key().unwrap_or_default();
         let quota_state = runtime.quota_registry().state_for_key(&quota_key);
 
+        let mut config = config;
+        let has_session_start = config
+            .hooks
+            .iter()
+            .any(|h| h.point == crate::hooks::HookPoint::OnSessionStart);
+        if !has_session_start {
+            config.hooks.push(crate::hooks::HookEntry {
+                name: "builtin_session_sync".to_string(),
+                point: crate::hooks::HookPoint::OnSessionStart,
+                callback_id: "builtin_session_sync".to_string(),
+            });
+        }
+
         // We must hold CREATE_AGENT_HOOK_GUARD across both agent creation and
         // bridge_state insertion. This prevents a race where an asynchronous hook
         // (like on_session_start) fires in Python after create_agent returns but
         // before the agent is inserted into bridge_state.
-        let _guard = if hook_runner.is_some() {
-            Some(crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await)
-        } else {
-            None
-        };
+        let _guard = crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await;
 
-        if hook_runner.is_some() {
-            match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
-                Ok(mut opt) => {
-                    *opt = hook_runner.as_ref().map(Arc::clone);
-                }
-                Err(e) => {
-                    return Err(Error::BackendError {
-                        message: format!(
-                            "INITIALIZING_HOOK_RUNNER mutex poisoned — hooks cannot be installed: {e}"
-                        ),
-                    });
-                }
+        let effective_hook_runner =
+            hook_runner.unwrap_or_else(|| Arc::new(crate::hooks::Hooks::new()));
+
+        match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
+            Ok(mut opt) => {
+                *opt = Some(Arc::clone(&effective_hook_runner));
+            }
+            Err(e) => {
+                return Err(Error::BackendError {
+                    message: format!(
+                        "INITIALIZING_HOOK_RUNNER mutex poisoned — hooks cannot be installed: {e}"
+                    ),
+                });
             }
         }
 
@@ -233,12 +247,21 @@ impl<R: Runtime> AgentHandle<R> {
 
         // Build and insert per-agent bridge state in a single lock acquisition.
         let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
+        let mut initial_conv_id = config.conversation_id.clone();
+        if initial_conv_id.is_none()
+            && let Ok(mut guard) = crate::runtime::PENDING_CONVERSATION_IDS.lock()
+            && let Some(pending_id) = guard.remove(&id)
+        {
+            initial_conv_id = Some(pending_id);
+        }
+        let conversation_id = Arc::new(Mutex::new(initial_conv_id));
         let bridge_entry = crate::runtime::AgentBridgeState {
             registry: registry.as_ref().map(Arc::clone),
-            hook_runner: hook_runner.as_ref().map(Arc::clone),
+            hook_runner: Some(effective_hook_runner),
             policies: policies_set,
             policy_handler: policy_handler.as_ref().map(Arc::clone),
             tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            conversation_id: Arc::clone(&conversation_id),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
             Ok(mut map) => {
@@ -269,27 +292,24 @@ impl<R: Runtime> AgentHandle<R> {
             });
         }
 
-        if hook_runner.is_some() {
-            match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
-                Ok(mut opt) => {
-                    *opt = None;
-                }
-                Err(e) => {
-                    // The agent is already created at this point. Log at error
-                    // level — a stale hook runner may cause the next agent
-                    // creation to pick up the wrong hooks, but the current
-                    // agent is functional.
-                    tracing::error!(
-                        agent_id = id,
-                        error = %e,
-                        "INITIALIZING_HOOK_RUNNER mutex poisoned during cleanup — \
-                         stale hook runner may persist"
-                    );
-                }
+        match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
+            Ok(mut opt) => {
+                *opt = None;
+            }
+            Err(e) => {
+                // The agent is already created at this point. Log at error
+                // level — a stale hook runner may cause the next agent
+                // creation to pick up the wrong hooks, but the current
+                // agent is functional.
+                tracing::error!(
+                    agent_id = id,
+                    error = %e,
+                    "INITIALIZING_HOOK_RUNNER mutex poisoned during cleanup — \
+                     stale hook runner may persist"
+                );
             }
         }
 
-        let conversation_id = Mutex::new(config.conversation_id.clone());
         Ok(Self {
             id,
             runtime,

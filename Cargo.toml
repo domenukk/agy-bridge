@@ -54,3 +54,9 @@ all = { level = "deny", priority = -1 }
 
 [workspace.lints.rust]
 warnings = "deny"
+
+[patch.crates-io]
+prompt-templates = { path = "../prompt-templates/crates/prompt-templates" }
+prompt-templates-macros = { path = "../prompt-templates/crates/prompt-templates-macros" }
+llm-tool = { path = "../llm-tool/crates/llm-tool" }
+llm-tool-macros = { path = "../llm-tool/crates/llm-tool-macros" }

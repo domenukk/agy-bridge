@@ -32,6 +32,8 @@ pub(crate) struct AgentBridgeState {
     pub(crate) policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     /// Shared key-value state persisted across tool calls for this agent.
     pub(crate) tool_state: Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
+    /// Shared conversation/session identifier synced from Python side.
+    pub(crate) conversation_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Single global registry of per-agent bridge state, keyed by agent ID.

@@ -10,6 +10,12 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
         )
         import asyncio
 
+        if not hasattr(LocalConnection, "_CURRENT_AGENT_ID"):
+            import contextvars
+            LocalConnection._CURRENT_AGENT_ID = contextvars.ContextVar("current_agent_id", default=None)
+
+        LocalConnection._CURRENT_AGENT_ID.set(agent_id_u64)
+
         if not getattr(LocalConnection, "_is_monkeypatched", False):
             logger.info(
                 "[MONKEYPATCH] Applying LocalConnection fix for turn context and idle event race"
@@ -40,6 +46,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
             def patched_init(self, *args, **kwargs):
                 original_init(self, *args, **kwargs)
+                self._agent_id = LocalConnection._CURRENT_AGENT_ID.get()
                 original_event = self._is_idle
 
                 class PatchedEvent:
@@ -70,6 +77,51 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                 self._idle_deferred = False
 
             LocalConnection.__init__ = patched_init
+
+            @property
+            def _cascade_id(self):
+                return getattr(self, "_real_cascade_id", None)
+
+            @_cascade_id.setter
+            def _cascade_id(self, value):
+                old_val = getattr(self, "_real_cascade_id", None)
+                self._real_cascade_id = value
+                if value and value != old_val:
+                    agent_id = getattr(self, "_agent_id", None)
+                    logger.info(
+                        "[MONKEYPATCH] Detected dynamic cascade_id change: %r -> %r for agent %r",
+                        old_val,
+                        value,
+                        agent_id,
+                    )
+                    if agent_id is not None:
+                        globals_mod = sys.modules.get("_agy_bridge_globals")
+                        if globals_mod and hasattr(globals_mod, "dispatch_rust_hook"):
+                            payload = {
+                                "session": {
+                                    "session_id": str(value),
+                                    "agent_id": int(agent_id),
+                                }
+                            }
+                            import json
+                            ctx_json = json.dumps(payload)
+                            logger.info(
+                                "[MONKEYPATCH] Syncing dynamic conversation ID %s to Rust for agent %s",
+                                value,
+                                agent_id,
+                            )
+                            try:
+                                globals_mod.dispatch_rust_hook(
+                                    int(agent_id), "on_session_start", ctx_json
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "[MONKEYPATCH] Failed to sync conversation ID: %s",
+                                    e,
+                                    exc_info=True,
+                                )
+
+            LocalConnection._cascade_id = _cascade_id
 
             original_tool_result_to_dict = LocalConnection._tool_result_to_dict
 

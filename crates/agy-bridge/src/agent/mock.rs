@@ -315,6 +315,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ffi_session_start_updates_conversation_id() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(rt, test_config(), None, None, None)
+            .await
+            .expect("create should succeed");
+
+        assert!(agent.conversation_id().is_none());
+
+        // Simulate the dispatch_rust_hook callback for on_session_start
+        let ctx = crate::hooks::OnSessionStartContext {
+            session: crate::hooks::SessionContext {
+                session_id: "dynamically-generated-session-123".to_owned(),
+                agent_id: agent.id(),
+                started_at: std::time::SystemTime::now(),
+            },
+        };
+        let ctx_json = serde_json::to_string(&ctx).unwrap();
+
+        // Simulate hook callback execution using the internal dispatch function
+        let hook_runner = {
+            let map = crate::runtime::bridge_state().read().unwrap();
+            let entry = map.get(&agent.id()).unwrap();
+            Arc::clone(entry.hook_runner.as_ref().unwrap())
+        };
+
+        crate::runtime::ffi_dispatch::dispatch_hook_by_name(
+            agent.id(),
+            &hook_runner,
+            "on_session_start",
+            &ctx_json,
+        )
+        .unwrap();
+
+        assert_eq!(
+            agent.conversation_id().as_deref(),
+            Some("dynamically-generated-session-123")
+        );
+
+        agent.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
     async fn double_shutdown_is_idempotent() {
         let rt = Arc::new(ToolAwareMockRuntime::new());
         let agent = AgentHandle::new(rt, test_config(), None, None, None)

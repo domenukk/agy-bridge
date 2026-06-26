@@ -54,8 +54,8 @@ pub(crate) mod venv;
 // Re-export items used by sibling modules and external crate consumers.
 pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state};
 pub(crate) use ffi_dispatch::{
-    CREATE_AGENT_HOOK_GUARD, INITIALIZING_HOOK_RUNNER, dispatch_rust_hook,
-    dispatch_rust_policy_confirm, dispatch_rust_tool,
+    CREATE_AGENT_HOOK_GUARD, INITIALIZING_HOOK_RUNNER, PENDING_CONVERSATION_IDS,
+    dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool,
 };
 
 /// Safety-net timeout for a single `send_command` round-trip.
@@ -955,6 +955,7 @@ err = MaxTokensException(\"dummy\")
                     Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>
                 ),
                 tool_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                conversation_id: Arc::new(std::sync::Mutex::new(None)),
             },
         );
 

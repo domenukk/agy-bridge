@@ -21,10 +21,19 @@ pub(crate) static INITIALIZING_HOOK_RUNNER: std::sync::Mutex<Option<Arc<crate::h
 pub(crate) static CREATE_AGENT_HOOK_GUARD: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+pub(crate) static PENDING_CONVERSATION_IDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Execute a hook by name, deserializing the context JSON and calling the
 /// appropriate method on the runner. Returns the serialized result (empty
 /// string for void hooks).
-fn dispatch_hook_by_name(
+#[expect(
+    clippy::too_many_lines,
+    reason = "Dispatch functions for all hooks necessarily contain a large match block"
+)]
+pub(crate) fn dispatch_hook_by_name(
+    agent_id: u64,
     hook_runner: &crate::hooks::Hooks,
     hook_point: &str,
     context_json: &str,
@@ -93,6 +102,18 @@ fn dispatch_hook_by_name(
                 .map_err(|e| crate::error::Error::BackendError {
                     message: format!("Failed to deserialize OnSessionStartContext: {e}"),
                 })?;
+            let mut synced = false;
+            if let Ok(map) = bridge_state().read()
+                && let Some(entry) = map.get(&agent_id)
+                && let Ok(mut guard) = entry.conversation_id.lock()
+            {
+                *guard = Some(ctx.session.session_id.clone());
+                synced = true;
+                tracing::info!(agent_id, session_id = %ctx.session.session_id, "Synced conversation_id from Python to AgentHandle");
+            }
+            if !synced && let Ok(mut guard) = PENDING_CONVERSATION_IDS.lock() {
+                guard.insert(agent_id, ctx.session.session_id.clone());
+            }
             hook_runner.run_on_session_start(&ctx);
         }
         "on_session_end" => {
@@ -172,7 +193,7 @@ pub(crate) fn dispatch_rust_hook(
         // this future to complete via `future_into_py`. Acquiring the GIL from
         // a blocking thread would deadlock.
         let result = tokio::task::spawn_blocking(move || {
-            dispatch_hook_by_name(&hook_runner, &hook_point, &context_json)
+            dispatch_hook_by_name(agent_id, &hook_runner, &hook_point, &context_json)
         })
         .await
         .map_err(|e| {
