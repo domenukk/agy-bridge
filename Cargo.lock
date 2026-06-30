@@ -331,12 +331,14 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-tool"
-version = "0.3.1"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "682bf6b8123e9565ca9a2b6cc87048aa9740f359755cec7b7e96d73bfe584793"
 dependencies = [
  "hashbrown",
  "llm-tool-macros",
- "prompt-templates",
- "prompt-templates-macros",
+ "md-tmpl",
+ "md-tmpl-macros",
  "schemars",
  "serde",
  "serde_json",
@@ -346,12 +348,44 @@ dependencies = [
 
 [[package]]
 name = "llm-tool-macros"
-version = "0.3.1"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054693a6e5ec2d1c73a775f47fe70aaf4cd301084929de7c48cb0b960810b85a"
 dependencies = [
  "convert_case",
  "hashbrown",
+ "md-tmpl",
  "proc-macro2",
- "prompt-templates",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "md-tmpl"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf1775076e1a792399f60a22af77912f33fb6879a18d74de0810213af7de928"
+dependencies = [
+ "ciborium",
+ "const-str",
+ "flexbuffers",
+ "hashbrown",
+ "itoa",
+ "serde",
+ "spin",
+ "thiserror",
+ "typed-builder",
+]
+
+[[package]]
+name = "md-tmpl-macros"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67da50682f8ae4988cd13beebc5aa6fc483c74412e379910b849ef4fc06c8983"
+dependencies = [
+ "hashbrown",
+ "md-tmpl",
+ "proc-macro2",
  "quote",
  "syn 2.0.118",
 ]
@@ -429,36 +463,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "prompt-templates"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db180ec14e7c419079e4554392c15c231b5eabaf3ed3a0f81ba9f6b3ba7b8fe"
-dependencies = [
- "ciborium",
- "const-str",
- "flexbuffers",
- "hashbrown",
- "itoa",
- "serde",
- "spin",
- "thiserror",
- "typed-builder",
-]
-
-[[package]]
-name = "prompt-templates-macros"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b90b4bec6f54ca396135c0fd5451751d22c42340d5329b99aa85fb1f38c6a94"
-dependencies = [
- "hashbrown",
- "proc-macro2",
- "prompt-templates",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]

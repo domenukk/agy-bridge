@@ -43,7 +43,8 @@ tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 workspace = true
 
 [features]
-prompt-templates = ["llm-tool/prompt-templates"]
+md-tmpl = ["llm-tool/md-tmpl"]
+prompt-templates = ["md-tmpl"]
 
 [[example]]
 name = "getting_started_hello_world"
