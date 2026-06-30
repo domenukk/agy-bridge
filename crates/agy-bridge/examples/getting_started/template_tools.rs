@@ -1,4 +1,4 @@
-//! Demonstrates `prompt-templates` integration with `#[llm_tool]`.
+//! Demonstrates `md-tmpl` integration with `#[llm_tool]`.
 //!
 //! - `search_files` uses `prompt_file` to load its description from a `.tmpl.md` file.
 //! - `search_files` uses `response_file` to render tool output through a template.

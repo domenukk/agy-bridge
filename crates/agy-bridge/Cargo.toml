@@ -1,6 +1,6 @@
 [package]
 name = "agy-bridge"
-version = "0.3.1"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Rust bridge for the Google Antigravity SDK (Python) via PyO3"
@@ -44,7 +44,6 @@ workspace = true
 
 [features]
 md-tmpl = ["llm-tool/md-tmpl"]
-prompt-templates = ["md-tmpl"]
 
 [[example]]
 name = "getting_started_hello_world"
@@ -109,7 +108,7 @@ path = "examples/getting_started/mcp_tools.rs"
 [[example]]
 name = "getting_started_template_tools"
 path = "examples/getting_started/template_tools.rs"
-required-features = ["prompt-templates"]
+required-features = ["md-tmpl"]
 
 [[example]]
 name = "getting_started_subagents"
