@@ -22,16 +22,9 @@ use super::super::{
 use crate::error::Error;
 
 /// Lock the agent registry, recovering from mutex poisoning.
-#[allow(clippy::type_complexity)]
 fn lock_registry(
     registry: &AgentRegistry,
-) -> std::sync::MutexGuard<
-    '_,
-    std::collections::HashMap<
-        super::super::AgentId,
-        (pyo3::Py<pyo3::PyAny>, pyo3::Py<pyo3::PyAny>),
-    >,
-> {
+) -> std::sync::MutexGuard<'_, super::super::command_loop::RegistryInner> {
     registry.lock().unwrap_or_else(|e| {
         tracing::error!("Agent registry mutex was poisoned, recovering: {e}");
         e.into_inner()

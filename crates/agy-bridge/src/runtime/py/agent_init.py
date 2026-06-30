@@ -12,7 +12,10 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
         if not hasattr(LocalConnection, "_CURRENT_AGENT_ID"):
             import contextvars
-            LocalConnection._CURRENT_AGENT_ID = contextvars.ContextVar("current_agent_id", default=None)
+
+            LocalConnection._CURRENT_AGENT_ID = contextvars.ContextVar(
+                "current_agent_id", default=None
+            )
 
         LocalConnection._CURRENT_AGENT_ID.set(agent_id_u64)
 
@@ -104,6 +107,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                                 }
                             }
                             import json
+
                             ctx_json = json.dumps(payload)
                             logger.info(
                                 "[MONKEYPATCH] Syncing dynamic conversation ID %s to Rust for agent %s",

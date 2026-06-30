@@ -1,5 +1,10 @@
 ---
-params: [matches = list<path = str>, query = str]
+allow_unused: true
+types:
+  - FileMatch = struct(path = str)
+params:
+  - matches = list(FileMatch)
+  - query = str
 ---
 
 Results for "{{ query }}":

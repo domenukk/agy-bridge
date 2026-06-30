@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agy-bridge"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "base64",
  "fast_rands",
@@ -331,9 +331,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-tool"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9657afd32c91245a00eb4b7c7413a1aed2ff456c6dce1132483eae71dc8157eb"
+version = "0.3.1"
 dependencies = [
  "hashbrown",
  "llm-tool-macros",
@@ -348,9 +346,7 @@ dependencies = [
 
 [[package]]
 name = "llm-tool-macros"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f869bbabd53a6252622a7543204408ab00e49bbe4f038f1b188cbd472e9cc12d"
+version = "0.3.1"
 dependencies = [
  "convert_case",
  "hashbrown",
@@ -437,9 +433,9 @@ dependencies = [
 
 [[package]]
 name = "prompt-templates"
-version = "0.2.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bbc026fd142bb023983f0d1530f1a179355d0201f78d7b267c61e973beda4e2"
+checksum = "6db180ec14e7c419079e4554392c15c231b5eabaf3ed3a0f81ba9f6b3ba7b8fe"
 dependencies = [
  "ciborium",
  "const-str",
@@ -454,9 +450,9 @@ dependencies = [
 
 [[package]]
 name = "prompt-templates-macros"
-version = "0.2.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89a51913725006df3ac66efc05b3fbc818a810a428a84daa671d5b6f04ec042"
+checksum = "7b90b4bec6f54ca396135c0fd5451751d22c42340d5329b99aa85fb1f38c6a94"
 dependencies = [
  "hashbrown",
  "proc-macro2",
