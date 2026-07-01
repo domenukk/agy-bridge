@@ -331,9 +331,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-tool"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c286036214c2ab77a08f5e185075938b8f49e1b46f9b35e9d5d6073b5f370a9"
+checksum = "ce991f222b2ee1edf1f43346da706aaf60f10b3e883071ac87964c30b9adcc54"
 dependencies = [
  "hashbrown",
  "llm-tool-macros",
@@ -348,9 +348,9 @@ dependencies = [
 
 [[package]]
 name = "llm-tool-macros"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a58a49b45b610b59477178b2cd17dca4c4f19d8c4e2a2ea8c58d1804b8afd19"
+checksum = "0f434f9aa2a48ac40044cce6b25784daf969fdbbdfb312d6e22649a391950b9d"
 dependencies = [
  "convert_case",
  "hashbrown",
