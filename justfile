@@ -28,12 +28,16 @@ fmt-just:
 
 # ── Lint ──────────────────────────────────────────────────────────────
 
-# Lint all code (Rust clippy, TOML, Markdown, Justfile)
-lint: lint-rust lint-toml lint-markdown lint-just
+# Lint all code (Rust clippy, Rust fmt, TOML, Markdown, Justfile)
+lint: lint-rust lint-rust-fmt lint-toml lint-markdown lint-just
 
 # Lint Rust with clippy
 lint-rust:
     cargo clippy --all-targets -- -D warnings
+
+# Lint Rust formatting
+lint-rust-fmt:
+    cargo +nightly fmt --check
 
 # Lint TOML files
 lint-toml:

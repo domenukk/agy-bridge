@@ -178,6 +178,11 @@ pub fn run_live_test<F>(test_name: &str, f: F)
 where
     F: Fn() -> Result<(), agy_bridge::error::Error>,
 {
+    if std::env::var("AGY_BRIDGE_SKIP_LIVE_TESTS").is_ok() {
+        eprintln!("[SKIP] '{test_name}' skipped (AGY_BRIDGE_SKIP_LIVE_TESTS is set)");
+        return;
+    }
+
     // Acquire a concurrency permit *before* the budget timer starts so that
     // queued tests do not exhaust their retry window while waiting.
     let _permit = live_gate().acquire();
