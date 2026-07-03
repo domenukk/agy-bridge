@@ -36,7 +36,9 @@ jobs:
           pip install google-antigravity watchfiles black
 
       - name: Install just and taplo
-        uses: taiki-e/install-action@just,taplo
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,taplo
 
       - name: Run just check
         env:
