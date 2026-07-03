@@ -22,8 +22,7 @@ pub mod policies;
 pub mod quota;
 /// Python runtime bridge: command dispatch over a dedicated thread.
 pub mod runtime;
-/// Safety filter detection heuristics and confidence hierarchy.
-pub mod safety;
+
 /// Streaming response channels for text, thought, and tool-call events.
 pub mod streaming;
 /// Custom Rust tool dispatch and definition types.
@@ -50,7 +49,6 @@ pub use hooks::{HookCallback, HookEntry, HookPoint, HookResult, HookSet, Hooks};
 pub use llm_tool_macros::llm_tool;
 pub use policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet};
 pub use runtime::RuntimeConfig;
-pub use safety::{Confidence, SafetyVerdict, detect_safety_interference};
 pub use streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk};
 pub use tools::{RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
 pub use triggers::{TriggerConfig, TriggerEntry};

@@ -406,15 +406,8 @@ impl<R: Runtime> AgentHandle<R> {
     /// Returns [`Error`] if the chat turn fails or stream errors occur.
     pub async fn chat_text(&self, message: impl Into<Content>) -> Result<String, Error> {
         let response = self.chat(message.into()).await?;
-        let text = response.text().await.map_err(|e| {
-            let converted = Error::from(e);
-            if matches!(converted, Error::Safety) {
-                converted
-            } else {
-                Error::BackendError {
-                    message: format!("Failed to read response text: {converted}"),
-                }
-            }
+        let text = response.text().await.map_err(|e| Error::BackendError {
+            message: format!("Failed to read response text: {}", Error::from(e)),
         })?;
         Ok(text.into_string())
     }

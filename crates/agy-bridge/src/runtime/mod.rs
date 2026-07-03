@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn safety_error_structural() {
+    fn stop_candidate_exception_is_backend_error() {
         Python::initialize();
         Python::attach(|py| {
             let globals = pyo3::types::PyDict::new(py);
@@ -872,14 +872,14 @@ err = StopCandidateException(\"dummy\")
             let mapped = crate::error::classify_py_error(py, &err);
 
             assert!(
-                !matches!(mapped, crate::error::Error::Safety),
-                "Failed: matched Error::Safety based purely on the string name StopCandidateException!"
+                matches!(mapped, crate::error::Error::BackendError { .. }),
+                "StopCandidateException should be classified as BackendError, got: {mapped:?}"
             );
         });
     }
 
     #[test]
-    fn maxtokens_error_structural() {
+    fn max_tokens_exception_is_backend_error() {
         Python::initialize();
         Python::attach(|py| {
             let globals = pyo3::types::PyDict::new(py);
@@ -900,8 +900,8 @@ err = MaxTokensException(\"dummy\")
             let mapped = crate::error::classify_py_error(py, &err);
 
             assert!(
-                !matches!(mapped, crate::error::Error::MaxTokens),
-                "Failed: matched Error::MaxTokens based purely on the string name MaxTokensException!"
+                matches!(mapped, crate::error::Error::BackendError { .. }),
+                "MaxTokensException should be classified as BackendError, got: {mapped:?}"
             );
         });
     }

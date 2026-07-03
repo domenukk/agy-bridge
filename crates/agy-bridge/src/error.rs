@@ -42,14 +42,6 @@ pub enum Error {
         message: String,
     },
 
-    /// The agent request was blocked due to safety violations.
-    #[error("Blocked by safety filter")]
-    Safety,
-
-    /// The agent request reached the max tokens limit.
-    #[error("Max tokens reached")]
-    MaxTokens,
-
     /// Connection was permanently closed.
     #[error("Connection permanently closed: {message}")]
     ConnectionClosed {
@@ -147,14 +139,7 @@ impl From<std::io::Error> for Error {
 
 impl From<StreamError> for Error {
     fn from(err: StreamError) -> Self {
-        let msg = err.message.to_lowercase();
-        if msg.contains("safety") {
-            Self::Safety
-        } else if msg.contains("max tokens") || msg.contains("token limit") {
-            Self::MaxTokens
-        } else {
-            Self::Stream(err)
-        }
+        Self::Stream(err)
     }
 }
 
@@ -416,17 +401,25 @@ mod tests {
 
     #[test]
     fn test_stream_error_conversion() {
+        // All StreamErrors should pass through as Error::Stream — the bridge
+        // does not interpret or reclassify stream error messages.
         let safety_err = StreamError {
             message: "Step error (status=ERROR): Candidate blocked by safety".to_string(),
         };
         let mapped_safety = Error::from(safety_err);
-        assert!(matches!(mapped_safety, Error::Safety));
+        assert!(
+            matches!(mapped_safety, Error::Stream(_)),
+            "StreamError with 'safety' should pass through as Error::Stream"
+        );
 
         let max_tokens_err = StreamError {
             message: "Step error (status=ERROR): Max tokens reached".to_string(),
         };
         let mapped_max_tokens = Error::from(max_tokens_err);
-        assert!(matches!(mapped_max_tokens, Error::MaxTokens));
+        assert!(
+            matches!(mapped_max_tokens, Error::Stream(_)),
+            "StreamError with 'max tokens' should pass through as Error::Stream"
+        );
 
         let other_err = StreamError {
             message: "Some other connection issue".to_string(),
