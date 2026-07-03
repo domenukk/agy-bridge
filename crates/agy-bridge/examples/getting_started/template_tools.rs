@@ -1,21 +1,24 @@
 //! Demonstrates `md-tmpl` integration with `#[llm_tool]`.
 //!
-//! - `search_files` uses `prompt_file` to load its description from a `.tmpl.md` file.
-//! - `search_files` uses `response_file` to render tool output through a template.
+//! - `prompt_file` loads the tool **description** (shown to the LLM) from a
+//!   `.tmpl.md` template. Compile-time `params(...)` are baked into the
+//!   description at zero runtime cost.
+//! - `response_file` renders the tool's **return value** through a template
+//!   before the LLM sees it, keeping output formatting out of Rust code.
 
 use agy_bridge::{AgyBridge, config::AgentConfig, prelude::*, tools::ToolRegistry};
 use serde::Serialize;
 
-/// A single search match returned by the tool.
+/// A single file match returned by the search tool.
 #[derive(Serialize)]
-struct Match {
+struct FileMatch {
     path: String,
 }
 
-/// The full result set returned by the tool.
+/// The full result set returned by the search tool.
 #[derive(Serialize)]
 struct SearchResult {
-    matches: Vec<Match>,
+    matches: Vec<FileMatch>,
     query: String,
 }
 
@@ -30,20 +33,21 @@ fn search_files(
     /// Root directory to search from.
     directory: &str,
 ) -> Result<SearchResult, String> {
-    // Simulate finding some files.
-    let fake_matches = vec![
-        Match {
+    // In a real tool this would walk the filesystem; here we return
+    // hard-coded paths so the example is self-contained.
+    let results = vec![
+        FileMatch {
             path: format!("{directory}/README.md"),
         },
-        Match {
+        FileMatch {
             path: format!("{directory}/src/main.rs"),
         },
-        Match {
+        FileMatch {
             path: format!("{directory}/docs/{pattern}.md"),
         },
     ];
     Ok(SearchResult {
-        matches: fake_matches,
+        matches: results,
         query: pattern.to_string(),
     })
 }
@@ -74,13 +78,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_search_files_description() {
+    fn description_comes_from_template() {
         let desc = <SearchFiles as RustTool>::DESCRIPTION;
-        assert!(desc.contains("Search for files matching a pattern in a directory."));
+        assert!(
+            desc.contains("Search for files matching a pattern in a directory."),
+            "Expected template body in DESCRIPTION, got: {desc}"
+        );
     }
 
     #[tokio::test]
-    async fn test_search_files_execution() {
+    async fn basic_execution() {
         let tool = SearchFiles;
         let ctx = ToolContext::new(None);
         let output = tool
@@ -99,7 +106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_files_exact_output() {
+    async fn exact_output_format() {
         let tool = SearchFiles;
         let ctx = ToolContext::new(None);
         let output = tool
@@ -113,40 +120,44 @@ mod tests {
             .await
             .unwrap();
         let content = output.content();
-        // Verify the exact formatting produced by search_results.tmpl.md
         let expected = "\nResults for \"test.rs\":\n- /dir/README.md\n- /dir/src/main.rs\n- /dir/docs/test.rs.md\n";
         assert_eq!(content, expected);
     }
 
     #[tokio::test]
-    async fn test_search_files_stress_edge_cases() {
+    async fn template_injection_is_literal() {
         let tool = SearchFiles;
         let ctx = ToolContext::new(None);
 
-        // 1. Template injection resilience
-        let injection_pattern = "{{ 7 * 7 }} {% for x in y %} <script>";
+        // Values containing template syntax must be treated as literal strings,
+        // never re-evaluated by the template engine.
+        let injection = "{{ 7 * 7 }} {% for x in y %} <script>";
         let output = tool
             .call(
                 SearchFilesParams {
-                    pattern: injection_pattern.to_string(),
+                    pattern: injection.to_string(),
                     directory: "/sec".to_string(),
                 },
                 &ctx,
             )
             .await
             .unwrap();
-        let content = output.content();
         assert!(
-            content.contains(injection_pattern),
-            "Should treat pattern as literal string without double evaluation"
+            output.content().contains(injection),
+            "Template syntax in user data must pass through unchanged"
         );
+    }
 
-        // 2. Unicode and special characters
-        let unicode_pattern = "🦀_test_\"quotes\"_\n_newline";
+    #[tokio::test]
+    async fn unicode_and_special_characters() {
+        let tool = SearchFiles;
+        let ctx = ToolContext::new(None);
+
+        let pattern = "🦀_test_\"quotes\"_\n_newline";
         let output = tool
             .call(
                 SearchFilesParams {
-                    pattern: unicode_pattern.to_string(),
+                    pattern: pattern.to_string(),
                     directory: "/🦀".to_string(),
                 },
                 &ctx,
@@ -156,13 +167,18 @@ mod tests {
         let content = output.content();
         assert!(content.contains("🦀_test_\"quotes\"_\n_newline"));
         assert!(content.contains("- /🦀/README.md"));
+    }
 
-        // 3. Empty strings
+    #[tokio::test]
+    async fn empty_inputs() {
+        let tool = SearchFiles;
+        let ctx = ToolContext::new(None);
+
         let output = tool
             .call(
                 SearchFilesParams {
-                    pattern: "".to_string(),
-                    directory: "".to_string(),
+                    pattern: String::new(),
+                    directory: String::new(),
                 },
                 &ctx,
             )

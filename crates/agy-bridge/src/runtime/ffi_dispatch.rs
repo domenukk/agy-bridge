@@ -28,127 +28,150 @@ pub(crate) static PENDING_CONVERSATION_IDS: std::sync::LazyLock<
 /// Execute a hook by name, deserializing the context JSON and calling the
 /// appropriate method on the runner. Returns the serialized result (empty
 /// string for void hooks).
-#[expect(
-    clippy::too_many_lines,
-    reason = "Dispatch functions for all hooks necessarily contain a large match block"
-)]
 pub(crate) fn dispatch_hook_by_name(
     agent_id: u64,
     hook_runner: &crate::hooks::Hooks,
     hook_point: &str,
     context_json: &str,
 ) -> Result<String, crate::error::Error> {
-    let mut result_json = String::new();
     match hook_point {
-        "pre_turn" => {
-            let ctx = serde_json::from_str::<crate::hooks::PreTurnContext>(context_json).map_err(
-                |e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize PreTurnContext: {e}"),
-                },
-            )?;
-            hook_runner.run_pre_turn(&ctx);
-        }
-        "post_turn" => {
-            let ctx = serde_json::from_str::<crate::hooks::PostTurnContext>(context_json).map_err(
-                |e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize PostTurnContext: {e}"),
-                },
-            )?;
-            hook_runner.run_post_turn(&ctx);
-        }
-        "pre_tool_call_decide" => {
-            let ctx = serde_json::from_str::<crate::hooks::PreToolCallDecideContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize PreToolCallDecideContext: {e} | JSON was: {context_json}"),
-                })?;
-            // Run transform hooks first to get possibly-modified args.
-            let transformed_args = hook_runner.run_transform_tool_input(&ctx);
-            let hook_result = hook_runner.run_pre_tool_call_decide(&ctx);
-            // Combine the decide result with any transformed args.
-            let mut result_val = serde_json::to_value(&hook_result).map_err(|e| {
-                crate::error::Error::BackendError {
-                    message: format!("Failed to serialize PreToolCallDecide result: {e}"),
-                }
-            })?;
-            if transformed_args != ctx.tool_args
-                && let serde_json::Value::Object(ref mut map) = result_val
-            {
-                map.insert("transformed_args".to_owned(), transformed_args);
-            }
-            result_json = serde_json::to_string(&result_val).map_err(|e| {
-                crate::error::Error::BackendError {
-                    message: format!("Failed to serialize PreToolCallDecide result: {e}"),
-                }
-            })?;
-        }
-        "post_tool_call" => {
-            let ctx = serde_json::from_str::<crate::hooks::PostToolCallContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!(
-                        "Failed to deserialize PostToolCallContext: {e} | JSON was: {context_json}"
-                    ),
-                })?;
-            hook_runner.run_post_tool_call(&ctx);
-        }
-        "on_compaction" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnCompactionContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnCompactionContext: {e}"),
-                })?;
-            hook_runner.run_on_compaction(&ctx);
-        }
-        "on_session_start" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnSessionStartContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnSessionStartContext: {e}"),
-                })?;
-            let mut synced = false;
-            if let Ok(map) = bridge_state().read()
-                && let Some(entry) = map.get(&agent_id)
-                && let Ok(mut guard) = entry.conversation_id.lock()
-            {
-                *guard = Some(ctx.session.session_id.clone());
-                synced = true;
-                tracing::info!(agent_id, session_id = %ctx.session.session_id, "Synced conversation_id from Python to AgentHandle");
-            }
-            if !synced && let Ok(mut guard) = PENDING_CONVERSATION_IDS.lock() {
-                guard.insert(agent_id, ctx.session.session_id.clone());
-            }
-            hook_runner.run_on_session_start(&ctx);
-        }
-        "on_session_end" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnSessionEndContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnSessionEndContext: {e}"),
-                })?;
-            hook_runner.run_on_session_end(&ctx);
-        }
-        "on_tool_error" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnToolErrorContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnToolErrorContext: {e}"),
-                })?;
-            hook_runner.run_on_tool_error(&ctx);
-        }
-        "on_interaction" => {
-            let ctx = serde_json::from_str::<crate::hooks::OnInteractionContext>(context_json)
-                .map_err(|e| crate::error::Error::BackendError {
-                    message: format!("Failed to deserialize OnInteractionContext: {e}"),
-                })?;
-            let hook_result = hook_runner.run_on_interaction(&ctx);
-            result_json = serde_json::to_string(&hook_result).map_err(|e| {
-                crate::error::Error::BackendError {
-                    message: format!("Failed to serialize OnInteraction result: {e}"),
-                }
-            })?;
-        }
+        "pre_turn" => handle_pre_turn(hook_runner, context_json)?,
+        "post_turn" => handle_post_turn(hook_runner, context_json)?,
+        "pre_tool_call_decide" => return handle_pre_tool_call_decide(hook_runner, context_json),
+        "post_tool_call" => handle_post_tool_call(hook_runner, context_json)?,
+        "on_compaction" => handle_on_compaction(hook_runner, context_json)?,
+        "on_session_start" => handle_on_session_start(agent_id, hook_runner, context_json)?,
+        "on_session_end" => handle_on_session_end(hook_runner, context_json)?,
+        "on_tool_error" => handle_on_tool_error(hook_runner, context_json)?,
+        "on_interaction" => return handle_on_interaction(hook_runner, context_json),
         _ => {
             return Err(crate::error::Error::BackendError {
                 message: format!("Unknown hook point: {hook_point}"),
             });
         }
     }
-    Ok(result_json)
+    Ok(String::new())
+}
+
+fn deserialize_ctx<'a, T: serde::Deserialize<'a>>(
+    context_json: &'a str,
+    name: &str,
+) -> Result<T, crate::error::Error> {
+    serde_json::from_str(context_json).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Failed to deserialize {name}: {e} | JSON was: {context_json}"),
+    })
+}
+
+fn handle_pre_turn(runner: &crate::hooks::Hooks, json: &str) -> Result<(), crate::error::Error> {
+    let ctx = deserialize_ctx(json, "PreTurnContext")?;
+    runner.run_pre_turn(&ctx);
+    Ok(())
+}
+
+fn handle_post_turn(runner: &crate::hooks::Hooks, json: &str) -> Result<(), crate::error::Error> {
+    let ctx = deserialize_ctx(json, "PostTurnContext")?;
+    runner.run_post_turn(&ctx);
+    Ok(())
+}
+
+fn handle_post_tool_call(
+    runner: &crate::hooks::Hooks,
+    json: &str,
+) -> Result<(), crate::error::Error> {
+    let ctx = deserialize_ctx(json, "PostToolCallContext")?;
+    runner.run_post_tool_call(&ctx);
+    Ok(())
+}
+
+fn handle_on_compaction(
+    runner: &crate::hooks::Hooks,
+    json: &str,
+) -> Result<(), crate::error::Error> {
+    let ctx = deserialize_ctx(json, "OnCompactionContext")?;
+    runner.run_on_compaction(&ctx);
+    Ok(())
+}
+
+fn handle_on_session_end(
+    runner: &crate::hooks::Hooks,
+    json: &str,
+) -> Result<(), crate::error::Error> {
+    let ctx = deserialize_ctx(json, "OnSessionEndContext")?;
+    runner.run_on_session_end(&ctx);
+    Ok(())
+}
+
+fn handle_on_tool_error(
+    runner: &crate::hooks::Hooks,
+    json: &str,
+) -> Result<(), crate::error::Error> {
+    let ctx = deserialize_ctx(json, "OnToolErrorContext")?;
+    runner.run_on_tool_error(&ctx);
+    Ok(())
+}
+
+fn handle_on_interaction(
+    runner: &crate::hooks::Hooks,
+    json: &str,
+) -> Result<String, crate::error::Error> {
+    let ctx = deserialize_ctx(json, "OnInteractionContext")?;
+    let hook_result = runner.run_on_interaction(&ctx);
+    serde_json::to_string(&hook_result).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Failed to serialize OnInteraction result: {e}"),
+    })
+}
+
+fn handle_pre_tool_call_decide(
+    hook_runner: &crate::hooks::Hooks,
+    context_json: &str,
+) -> Result<String, crate::error::Error> {
+    let ctx = serde_json::from_str::<crate::hooks::PreToolCallDecideContext>(context_json)
+        .map_err(|e| crate::error::Error::BackendError {
+            message: format!(
+                "Failed to deserialize PreToolCallDecideContext: {e} | JSON was: {context_json}"
+            ),
+        })?;
+    let transformed_args = hook_runner.run_transform_tool_input(&ctx);
+    let hook_result = hook_runner.run_pre_tool_call_decide(&ctx);
+    let mut result_val =
+        serde_json::to_value(&hook_result).map_err(|e| crate::error::Error::BackendError {
+            message: format!("Failed to serialize PreToolCallDecide result: {e}"),
+        })?;
+    if transformed_args != ctx.tool_args
+        && let serde_json::Value::Object(ref mut map) = result_val
+    {
+        map.insert("transformed_args".to_owned(), transformed_args);
+    }
+    serde_json::to_string(&result_val).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Failed to serialize PreToolCallDecide result: {e}"),
+    })
+}
+
+fn handle_on_session_start(
+    agent_id: u64,
+    hook_runner: &crate::hooks::Hooks,
+    context_json: &str,
+) -> Result<(), crate::error::Error> {
+    let ctx =
+        serde_json::from_str::<crate::hooks::OnSessionStartContext>(context_json).map_err(|e| {
+            crate::error::Error::BackendError {
+                message: format!("Failed to deserialize OnSessionStartContext: {e}"),
+            }
+        })?;
+    let mut synced = false;
+    if let Ok(map) = bridge_state().read()
+        && let Some(entry) = map.get(&agent_id)
+        && let Ok(mut guard) = entry.conversation_id.lock()
+    {
+        *guard = Some(ctx.session.session_id.clone());
+        synced = true;
+        tracing::info!(agent_id, session_id = %ctx.session.session_id, "Synced conversation_id from Python to AgentHandle");
+    }
+    if !synced && let Ok(mut guard) = PENDING_CONVERSATION_IDS.lock() {
+        guard.insert(agent_id, ctx.session.session_id.clone());
+    }
+    hook_runner.run_on_session_start(&ctx);
+    Ok(())
 }
 
 /// Dispatches a Rust hook call from the Python thread.

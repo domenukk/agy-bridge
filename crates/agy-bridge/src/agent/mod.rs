@@ -193,10 +193,6 @@ impl<R: Runtime> AgentHandle<R> {
     ///
     /// Returns a [`Error`] if agent creation fails (e.g. invalid config,
     /// Python error, or quota exceeded).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Agent initialization is a sequential multi-step setup"
-    )]
     pub async fn new(
         runtime: Arc<R>,
         config: AgentConfig,
@@ -220,10 +216,6 @@ impl<R: Runtime> AgentHandle<R> {
             });
         }
 
-        // We must hold CREATE_AGENT_HOOK_GUARD across both agent creation and
-        // bridge_state insertion. This prevents a race where an asynchronous hook
-        // (like on_session_start) fires in Python after create_agent returns but
-        // before the agent is inserted into bridge_state.
         let _guard = crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await;
 
         let effective_hook_runner =
@@ -245,62 +237,25 @@ impl<R: Runtime> AgentHandle<R> {
         let id = runtime.create_agent(config.clone()).await?;
         tracing::info!(agent_id = id, "Agent created successfully");
 
-        // Build and insert per-agent bridge state in a single lock acquisition.
-        let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
-        let mut initial_conv_id = config.conversation_id.clone();
-        if initial_conv_id.is_none()
-            && let Ok(mut guard) = crate::runtime::PENDING_CONVERSATION_IDS.lock()
-            && let Some(pending_id) = guard.remove(&id)
+        let conversation_id = match Self::setup_bridge_state(
+            &runtime,
+            id,
+            &config,
+            registry.as_ref(),
+            effective_hook_runner,
+            policy_handler.as_ref(),
+        )
+        .await
         {
-            initial_conv_id = Some(pending_id);
-        }
-        let conversation_id = Arc::new(Mutex::new(initial_conv_id));
-        let bridge_entry = crate::runtime::AgentBridgeState {
-            registry: registry.as_ref().map(Arc::clone),
-            hook_runner: Some(effective_hook_runner),
-            policies: policies_set,
-            policy_handler: policy_handler.as_ref().map(Arc::clone),
-            tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            conversation_id: Arc::clone(&conversation_id),
+            Ok(conv_id) => conv_id,
+            Err(e) => return Err(e),
         };
-        let bridge_insert_failed = match crate::runtime::bridge_state().write() {
-            Ok(mut map) => {
-                map.insert(id, bridge_entry);
-                false
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent_id = id,
-                    error = %e,
-                    "Failed to acquire write lock on BRIDGE_STATE — agent would be unusable"
-                );
-                true
-            }
-        };
-        // Guard is dropped here — safe to .await below.
-        if bridge_insert_failed {
-            // Best-effort shutdown the agent we just created before returning the error.
-            if let Err(shutdown_err) = runtime.shutdown_agent(id).await {
-                tracing::error!(
-                    agent_id = id,
-                    error = ?shutdown_err,
-                    "Failed to shut down agent after BRIDGE_STATE lock failure"
-                );
-            }
-            return Err(Error::BackendError {
-                message: "BRIDGE_STATE RwLock poisoned during agent creation".to_string(),
-            });
-        }
 
         match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
             Ok(mut opt) => {
                 *opt = None;
             }
             Err(e) => {
-                // The agent is already created at this point. Log at error
-                // level — a stale hook runner may cause the next agent
-                // creation to pick up the wrong hooks, but the current
-                // agent is functional.
                 tracing::error!(
                     agent_id = id,
                     error = %e,
@@ -322,6 +277,60 @@ impl<R: Runtime> AgentHandle<R> {
             is_shutdown: AtomicBool::new(false),
             last_shared_state: Mutex::new(None),
         })
+    }
+
+    async fn setup_bridge_state(
+        runtime: &Arc<R>,
+        id: AgentId,
+        config: &AgentConfig,
+        registry: Option<&Arc<crate::tools::ToolRegistry>>,
+        effective_hook_runner: Arc<crate::hooks::Hooks>,
+        policy_handler: Option<&Arc<dyn crate::policies::AskUserHandler>>,
+    ) -> Result<Arc<Mutex<Option<String>>>, Error> {
+        let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
+        let mut initial_conv_id = config.conversation_id.clone();
+        if initial_conv_id.is_none()
+            && let Ok(mut guard) = crate::runtime::PENDING_CONVERSATION_IDS.lock()
+            && let Some(pending_id) = guard.remove(&id)
+        {
+            initial_conv_id = Some(pending_id);
+        }
+        let conversation_id = Arc::new(Mutex::new(initial_conv_id));
+        let bridge_entry = crate::runtime::AgentBridgeState {
+            registry: registry.map(Arc::clone),
+            hook_runner: Some(effective_hook_runner),
+            policies: policies_set,
+            policy_handler: policy_handler.map(Arc::clone),
+            tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            conversation_id: Arc::clone(&conversation_id),
+        };
+        let bridge_insert_failed = match crate::runtime::bridge_state().write() {
+            Ok(mut map) => {
+                map.insert(id, bridge_entry);
+                false
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = id,
+                    error = %e,
+                    "Failed to acquire write lock on BRIDGE_STATE — agent would be unusable"
+                );
+                true
+            }
+        };
+        if bridge_insert_failed {
+            if let Err(shutdown_err) = runtime.shutdown_agent(id).await {
+                tracing::error!(
+                    agent_id = id,
+                    error = ?shutdown_err,
+                    "Failed to shut down agent after BRIDGE_STATE lock failure"
+                );
+            }
+            return Err(Error::BackendError {
+                message: "BRIDGE_STATE RwLock poisoned during agent creation".to_string(),
+            });
+        }
+        Ok(conversation_id)
     }
 
     /// Send a message and receive a streaming response.

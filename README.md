@@ -16,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.4"
+agy-bridge = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -376,6 +376,7 @@ The [`crates/agy-bridge/examples/`](crates/agy-bridge/examples/) directory conta
 | [`persona_config`](crates/agy-bridge/examples/getting_started/persona_config.rs)               | Custom persona and model configuration |
 | [`agent_skills`](crates/agy-bridge/examples/getting_started/agent_skills.rs)                   | Agent skill registration               |
 | [`app_data_dir_override`](crates/agy-bridge/examples/getting_started/app_data_dir_override.rs) | Custom app data directory              |
+| [`template_tools`](crates/agy-bridge/examples/getting_started/template_tools.rs)               | `md-tmpl` prompt/response templates    |
 
 ### Deep Dives
 

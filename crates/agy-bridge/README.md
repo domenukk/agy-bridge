@@ -16,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.4"
+agy-bridge = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -381,6 +381,7 @@ The [`examples/`](examples/) directory contains runnable programs for every feat
 | [`persona_config`](examples/getting_started/persona_config.rs)               | Custom persona and model configuration |
 | [`agent_skills`](examples/getting_started/agent_skills.rs)                   | Agent skill registration               |
 | [`app_data_dir_override`](examples/getting_started/app_data_dir_override.rs) | Custom app data directory              |
+| [`template_tools`](examples/getting_started/template_tools.rs)               | `md-tmpl` prompt/response templates    |
 
 ### Deep Dives
 
