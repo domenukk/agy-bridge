@@ -54,9 +54,9 @@ impl ToolAwareMockRuntime {
     }
 }
 
-#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl Runtime for ToolAwareMockRuntime {
     async fn create_agent(&self, _config: AgentConfig) -> Result<AgentId, Error> {
+        ::core::future::ready(()).await;
         if self.fail_create.load(Ordering::SeqCst) {
             return Err(Error::BackendError {
                 message: "invalid config: missing system instructions".to_owned(),
@@ -513,7 +513,6 @@ mod tests {
             type Params = Params;
             const NAME: &'static str = "test_tool";
             const DESCRIPTION: &'static str = "A test tool";
-            #[allow(unknown_lints, clippy::unused_async_trait_impl)]
             async fn call(
                 &self,
                 params: Params,

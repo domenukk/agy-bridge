@@ -32,12 +32,12 @@ impl RustTool for GetDeviceSerial {
     const NAME: &'static str = "get_device_serial";
     const DESCRIPTION: &'static str = "Returns the serial number for a device.";
 
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
     ) -> Result<ToolOutput, ToolError> {
+        ::core::future::ready(()).await;
         let normalized = params.device_name.to_lowercase().replace(' ', "_");
         let serial = match normalized.as_str() {
             "pixel_9" => "SERIAL-PX9-001",
@@ -68,12 +68,12 @@ impl RustTool for CheckBuildStatus {
     const NAME: &'static str = "check_build_status";
     const DESCRIPTION: &'static str = "Checks the status of a build job.";
 
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
     ) -> Result<ToolOutput, ToolError> {
+        ::core::future::ready(()).await;
         let result = match params.build_id.as_str() {
             "build-42" => serde_json::json!({
                 "build_id": "build-42",
@@ -113,12 +113,12 @@ impl RustTool for AddNumbers {
     const NAME: &'static str = "add_numbers";
     const DESCRIPTION: &'static str = "Adds two numbers together.";
 
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
     ) -> Result<ToolOutput, ToolError> {
+        ::core::future::ready(()).await;
         Ok(format!("{}", params.x + params.y).into())
     }
 }
