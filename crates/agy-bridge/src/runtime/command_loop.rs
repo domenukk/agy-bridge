@@ -1,5 +1,4 @@
 /// Async command loop and handlers.
-use std::ffi::CString;
 use std::time::Duration;
 
 use futures::stream::StreamExt;
@@ -14,52 +13,8 @@ use super::{
 /// Timeout applied to `handle_send`, `handle_signal_idle`, and `handle_wait_for_wakeup`.
 pub(super) const HANDLER_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Compile a Python helper function once, caching the result in a `OnceLock`.
-pub(crate) fn get_or_compile_py_helper(
-    cache: &'static std::sync::OnceLock<Py<PyAny>>,
-    script: &str,
-    fn_name: &str,
-) -> Result<Py<PyAny>, String> {
-    if let Some(cached) = cache.get() {
-        return Python::attach(|py| Ok(cached.clone_ref(py)));
-    }
-    Python::attach(|py| {
-        let locals = pyo3::types::PyDict::new(py);
-        let c_script = CString::new(script).map_err(|e| e.to_string())?;
-        py.run(c_script.as_c_str(), None, Some(&locals))
-            .map_err(|e| e.to_string())?;
-        let fn_obj = locals
-            .get_item(fn_name)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Failed to define {fn_name} helper"))?;
-        let py_obj = fn_obj.clone().unbind();
-        // Ignore set error if another thread raced us.
-        if let Err(e) = cache.set(py_obj.clone_ref(py)) {
-            tracing::debug!("Cache was already set: {:?}", e);
-        }
-        Ok(py_obj)
-    })
-}
-
 /// Python module name used for Rust ↔ Python global state.
 pub(crate) const AGY_BRIDGE_GLOBALS_MODULE: &str = "_agy_bridge_globals";
-
-pub(super) const CANCEL_FN_NAME: &str = "_cancel";
-pub(super) static CANCEL_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const WAIT_FOR_IDLE_FN_NAME: &str = "_wait_for_idle";
-pub(super) static WAIT_FOR_IDLE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const SEND_FN_NAME: &str = "_send";
-pub(super) static SEND_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const SIGNAL_IDLE_FN_NAME: &str = "_signal_idle";
-pub(super) static SIGNAL_IDLE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const WAIT_FOR_WAKEUP_FN_NAME: &str = "_wait_for_wakeup";
-pub(super) static WAIT_FOR_WAKEUP_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const CLEAR_HISTORY_FN_NAME: &str = "_clear_history";
-pub(super) static CLEAR_HISTORY_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const DELETE_FN_NAME: &str = "_delete";
-pub(super) static DELETE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-pub(super) const DISCONNECT_FN_NAME: &str = "_disconnect";
-pub(super) static DISCONNECT_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 /// Type alias for the agent registry mapping IDs to their Python context
 /// manager and live agent instance objects.
@@ -406,10 +361,7 @@ fn dispatch_agent_operation(
             });
         }
         PyCommand::ClearHistory { agent_id, reply } => {
-            let registry = registry.clone();
-            spawn_agent_task(active_tasks, async move {
-                async_ops::handle_clear_history(registry, agent_id, reply).await;
-            });
+            async_ops::handle_clear_history(registry, agent_id, reply);
         }
         PyCommand::Send {
             agent_id,

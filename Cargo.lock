@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agy-bridge"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64",
  "fast_rands",
@@ -332,8 +332,6 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "llm-tool"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b26f666636eade74bf9a5568551a70b84b9e47aca29d9ec26921d6f962a9a6fd"
 dependencies = [
  "hashbrown",
  "llm-tool-macros",
@@ -349,8 +347,6 @@ dependencies = [
 [[package]]
 name = "llm-tool-macros"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbc59d5127fc756b038efe1502e5356ee8fac1979a1d678449d19b5423660080"
 dependencies = [
  "convert_case",
  "hashbrown",

@@ -2,30 +2,8 @@
 use pyo3::prelude::*;
 use tokio::sync::oneshot;
 
-use super::super::{
-    AgentId,
-    command_loop::{AgentRegistry, get_or_compile_py_helper},
-    py_scripts::{
-        PYTHON_GET_HISTORY_SCRIPT, PYTHON_GET_LAST_TURN_USAGE_SCRIPT,
-        PYTHON_GET_TOTAL_USAGE_SCRIPT, PYTHON_GET_TURN_COUNT_SCRIPT, PYTHON_IS_IDLE_SCRIPT,
-    },
-};
+use super::super::{AgentId, command_loop::AgentRegistry};
 use crate::error::Error;
-
-const GET_HISTORY_FN_NAME: &str = "_get_history";
-static GET_HISTORY_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-
-const GET_TURN_COUNT_FN_NAME: &str = "_get_turn_count";
-static GET_TURN_COUNT_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-
-const GET_TOTAL_USAGE_FN_NAME: &str = "_get_total_usage";
-static GET_TOTAL_USAGE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-
-const GET_LAST_TURN_USAGE_FN_NAME: &str = "_get_last_turn_usage";
-static GET_LAST_TURN_USAGE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-
-const IS_IDLE_FN_NAME: &str = "_is_idle";
-static IS_IDLE_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
 /// A cloned pair of Python references: `(context_manager, agent_instance)`.
 type PyAgentRef = (Py<PyAny>, Py<PyAny>);
@@ -58,43 +36,65 @@ pub(in crate::runtime) fn handle_get_history(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            if let Err(send_err) = reply.send(Err(e)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?send_err, "GetHistory reply receiver dropped (lock error)");
-            }
+            let _ = reply.send(Err(e));
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        if let Err(e) = reply.send(Err(Error::BackendError {
+        let _ = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
-        })) {
-            tracing::warn!(agent_id = ?agent_id, error = ?e, "GetHistory reply receiver dropped (not found)");
-        }
+        }));
         return;
     };
 
     let result = Python::attach(
         |py| -> Result<Vec<crate::types::ConversationMessage>, Error> {
-            let helper_fn = get_or_compile_py_helper(
-                &GET_HISTORY_FN,
-                PYTHON_GET_HISTORY_SCRIPT,
-                GET_HISTORY_FN_NAME,
-            )
-            .map_err(|e| Error::BackendError { message: e })?;
-            let helper_bound = helper_fn.bind(py);
-
             let agent_bound = agent_instance.bind(py);
-            let result = helper_bound.call1((agent_bound,))?;
-            let json_str: String = result.extract()?;
-            serde_json::from_str(&json_str).map_err(|e| Error::BackendError {
-                message: format!("Failed to parse history JSON: {e}"),
-            })
+            if !agent_bound.hasattr("conversation")? {
+                return Ok(Vec::new());
+            }
+            let conv = agent_bound.getattr("conversation")?;
+            if conv.is_none() || !conv.hasattr("history")? {
+                return Ok(Vec::new());
+            }
+            let history_py = conv.getattr("history")?;
+            let history_list = history_py.cast::<pyo3::types::PyList>().map_err(|e| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "history attribute is not a list: {e}"
+                ))
+            })?;
+            let mut messages = Vec::new();
+            for item in history_list.iter() {
+                // Extract role
+                let source_py = item.getattr("source")?;
+                let role_str = if source_py.hasattr("value")? {
+                    source_py.getattr("value")?.extract::<String>()?
+                } else if source_py.hasattr("name")? {
+                    source_py.getattr("name")?.extract::<String>()?
+                } else {
+                    source_py
+                        .extract::<String>()
+                        .unwrap_or_else(|_| "unknown".to_owned())
+                };
+                let role = match role_str.to_lowercase().as_str() {
+                    "user" => crate::types::MessageRole::User,
+                    "model" => crate::types::MessageRole::Model,
+                    "system" => crate::types::MessageRole::System,
+                    other => crate::types::MessageRole::Unknown(other.to_owned()),
+                };
+
+                // Extract content
+                let content = item
+                    .getattr("content")?
+                    .extract::<String>()
+                    .unwrap_or_default();
+                messages.push(crate::types::ConversationMessage { role, content });
+            }
+            Ok(messages)
         },
     );
 
-    if let Err(e) = reply.send(result) {
-        tracing::warn!(agent_id = ?agent_id, error = ?e, "GetHistory reply receiver dropped");
-    }
+    let _ = reply.send(result);
 }
 
 /// Query the turn count from the agent's conversation object.
@@ -106,38 +106,31 @@ pub(in crate::runtime) fn handle_get_turn_count(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            if let Err(send_err) = reply.send(Err(e)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?send_err, "GetTurnCount reply receiver dropped (lock error)");
-            }
+            let _ = reply.send(Err(e));
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        if let Err(e) = reply.send(Err(Error::BackendError {
+        let _ = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
-        })) {
-            tracing::warn!(agent_id = ?agent_id, error = ?e, "GetTurnCount reply receiver dropped (not found)");
-        }
+        }));
         return;
     };
 
     let result = Python::attach(|py| -> Result<u32, Error> {
-        let helper_fn = get_or_compile_py_helper(
-            &GET_TURN_COUNT_FN,
-            PYTHON_GET_TURN_COUNT_SCRIPT,
-            GET_TURN_COUNT_FN_NAME,
-        )
-        .map_err(|e| Error::BackendError { message: e })?;
-        let helper_bound = helper_fn.bind(py);
-
         let agent_bound = agent_instance.bind(py);
-        let result = helper_bound.call1((agent_bound,))?;
-        Ok(result.extract::<u32>()?)
+        if !agent_bound.hasattr("conversation")? {
+            return Ok(0);
+        }
+        let conv = agent_bound.getattr("conversation")?;
+        if conv.is_none() || !conv.hasattr("turn_count")? {
+            return Ok(0);
+        }
+        let tc = conv.getattr("turn_count")?.extract::<u32>()?;
+        Ok(tc)
     });
 
-    if let Err(e) = reply.send(result) {
-        tracing::warn!(agent_id = ?agent_id, error = ?e, "GetTurnCount reply receiver dropped");
-    }
+    let _ = reply.send(result);
 }
 
 /// Query cumulative token usage from the agent's conversation object.
@@ -146,15 +139,7 @@ pub(in crate::runtime) fn handle_get_total_usage(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<crate::types::UsageMetadata, Error>>,
 ) {
-    handle_get_usage_impl(
-        registry,
-        agent_id,
-        reply,
-        &GET_TOTAL_USAGE_FN,
-        PYTHON_GET_TOTAL_USAGE_SCRIPT,
-        GET_TOTAL_USAGE_FN_NAME,
-        "GetTotalUsage",
-    );
+    handle_get_usage_impl(registry, agent_id, reply, "total_usage", "GetTotalUsage");
 }
 
 /// Query last-turn token usage from the agent's conversation object.
@@ -167,9 +152,7 @@ pub(in crate::runtime) fn handle_get_last_turn_usage(
         registry,
         agent_id,
         reply,
-        &GET_LAST_TURN_USAGE_FN,
-        PYTHON_GET_LAST_TURN_USAGE_SCRIPT,
-        GET_LAST_TURN_USAGE_FN_NAME,
+        "last_turn_usage",
         "GetLastTurnUsage",
     );
 }
@@ -179,40 +162,39 @@ fn handle_get_usage_impl(
     registry: &AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<crate::types::UsageMetadata, Error>>,
-    cache: &'static std::sync::OnceLock<Py<PyAny>>,
-    script: &str,
-    fn_name: &str,
+    attribute: &'static str,
     label: &str,
 ) {
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            if let Err(send_err) = reply.send(Err(e)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?send_err, label, "reply receiver dropped (lock error)");
-            }
+            let _ = reply.send(Err(e));
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        if let Err(e) = reply.send(Err(Error::BackendError {
+        let _ = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
-        })) {
-            tracing::warn!(agent_id = ?agent_id, label, error = ?e, "reply receiver dropped (not found)");
-        }
+        }));
         return;
     };
 
     let result = Python::attach(|py| -> Result<crate::types::UsageMetadata, Error> {
-        let helper_fn = get_or_compile_py_helper(cache, script, fn_name)
-            .map_err(|e| Error::BackendError { message: e })?;
-        let helper_bound = helper_fn.bind(py);
-
         let agent_bound = agent_instance.bind(py);
-        let result = helper_bound.call1((agent_bound,))?;
-        let json_str: String = result.extract()?;
-        serde_json::from_str(&json_str).map_err(|e| Error::BackendError {
-            message: format!("Failed to parse usage JSON: {e}"),
-        })
+        if !agent_bound.hasattr("conversation")? {
+            return Ok(crate::types::UsageMetadata::default());
+        }
+        let conv = agent_bound.getattr("conversation")?;
+        if conv.is_none() || !conv.hasattr(attribute)? {
+            return Ok(crate::types::UsageMetadata::default());
+        }
+        let usage_py = conv.getattr(attribute)?;
+        if usage_py.is_none() {
+            return Ok(crate::types::UsageMetadata::default());
+        }
+        let usage_dict = super::super::py_scripts::to_dict_py(&usage_py)?;
+        let usage = usage_dict.extract::<crate::types::UsageMetadata>()?;
+        Ok(usage)
     });
 
     if let Err(e) = reply.send(result) {
@@ -232,18 +214,14 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            if let Err(send_err) = reply.send(Err(e)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?send_err, "GetCompactionIndices reply receiver dropped (lock error)");
-            }
+            let _ = reply.send(Err(e));
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        if let Err(e) = reply.send(Err(Error::BackendError {
+        let _ = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
-        })) {
-            tracing::warn!(agent_id = ?agent_id, error = ?e, "GetCompactionIndices reply receiver dropped (not found)");
-        }
+        }));
         return;
     };
 
@@ -253,16 +231,14 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
             return Ok(Vec::new());
         }
         let conv = agent_bound.getattr("conversation")?;
-        if !conv.hasattr("compaction_indices")? {
+        if conv.is_none() || !conv.hasattr("compaction_indices")? {
             return Ok(Vec::new());
         }
         let indices = conv.getattr("compaction_indices")?;
         Ok(indices.extract::<Vec<u32>>()?)
     });
 
-    if let Err(e) = reply.send(result) {
-        tracing::warn!(agent_id = ?agent_id, error = ?e, "GetCompactionIndices reply receiver dropped");
-    }
+    let _ = reply.send(result);
 }
 
 /// Return the text of the last model response.
@@ -277,18 +253,14 @@ pub(in crate::runtime) fn handle_get_last_response(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            if let Err(send_err) = reply.send(Err(e)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?send_err, "GetLastResponse reply receiver dropped (lock error)");
-            }
+            let _ = reply.send(Err(e));
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        if let Err(e) = reply.send(Err(Error::BackendError {
+        let _ = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
-        })) {
-            tracing::warn!(agent_id = ?agent_id, error = ?e, "GetLastResponse reply receiver dropped (not found)");
-        }
+        }));
         return;
     };
 
@@ -298,7 +270,7 @@ pub(in crate::runtime) fn handle_get_last_response(
             return Ok(None);
         }
         let conv = agent_bound.getattr("conversation")?;
-        if !conv.hasattr("last_response")? {
+        if conv.is_none() || !conv.hasattr("last_response")? {
             return Ok(None);
         }
         let response_str: String = conv.getattr("last_response")?.extract()?;
@@ -308,9 +280,7 @@ pub(in crate::runtime) fn handle_get_last_response(
         Ok(Some(response_str))
     });
 
-    if let Err(e) = reply.send(result) {
-        tracing::warn!(agent_id = ?agent_id, error = ?e, "GetLastResponse reply receiver dropped");
-    }
+    let _ = reply.send(result);
 }
 
 /// Check whether the agent is currently idle (not running a turn).
@@ -325,33 +295,29 @@ pub(in crate::runtime) fn handle_is_idle(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            if let Err(send_err) = reply.send(Err(e)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?send_err, "IsIdle reply receiver dropped (lock error)");
-            }
+            let _ = reply.send(Err(e));
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        if let Err(e) = reply.send(Err(Error::BackendError {
+        let _ = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
-        })) {
-            tracing::warn!(agent_id = ?agent_id, error = ?e, "IsIdle reply receiver dropped (not found)");
-        }
+        }));
         return;
     };
 
     let result = Python::attach(|py| -> Result<bool, Error> {
-        let helper_fn =
-            get_or_compile_py_helper(&IS_IDLE_FN, PYTHON_IS_IDLE_SCRIPT, IS_IDLE_FN_NAME)
-                .map_err(|e| Error::BackendError { message: e })?;
-        let helper_bound = helper_fn.bind(py);
-
         let agent_bound = agent_instance.bind(py);
-        let result = helper_bound.call1((agent_bound,))?;
-        Ok(result.extract::<bool>()?)
+        if !agent_bound.hasattr("conversation")? {
+            return Ok(true);
+        }
+        let conv = agent_bound.getattr("conversation")?;
+        if conv.is_none() || !conv.hasattr("is_idle")? {
+            return Ok(true);
+        }
+        let is_idle = conv.getattr("is_idle")?.extract::<bool>()?;
+        Ok(is_idle)
     });
 
-    if let Err(e) = reply.send(result) {
-        tracing::warn!(agent_id = ?agent_id, error = ?e, "IsIdle reply receiver dropped");
-    }
+    let _ = reply.send(result);
 }

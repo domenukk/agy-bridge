@@ -10,15 +10,6 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
         )
         import asyncio
 
-        if not hasattr(LocalConnection, "_CURRENT_AGENT_ID"):
-            import contextvars
-
-            LocalConnection._CURRENT_AGENT_ID = contextvars.ContextVar(
-                "current_agent_id", default=None
-            )
-
-        LocalConnection._CURRENT_AGENT_ID.set(agent_id_u64)
-
         if not getattr(LocalConnection, "_is_monkeypatched", False):
             logger.info(
                 "[MONKEYPATCH] Applying LocalConnection fix for turn context and idle event race"
@@ -49,7 +40,6 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
             def patched_init(self, *args, **kwargs):
                 original_init(self, *args, **kwargs)
-                self._agent_id = LocalConnection._CURRENT_AGENT_ID.get()
                 original_event = self._is_idle
 
                 class PatchedEvent:
@@ -144,16 +134,6 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     except Exception as e:
         logger.warning("Failed to apply LocalConnection monkeypatch: %s", e)
 
-    class RateLimitInterceptor(logging.Handler):
-        def emit(self, record):
-            msg = self.format(record)
-            if "HTTP 429" in msg or "HTTP 503" in msg or "quota" in msg.lower():
-                gm = sys.modules.get("_agy_bridge_globals")
-                if gm:
-                    gm.RATE_LIMIT_HIT = True
-
-    intercept = RateLimitInterceptor()
-    logging.getLogger().addHandler(intercept)
     if "_agy_bridge_globals" not in sys.modules:
         import types
 
@@ -848,6 +828,10 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                 delattr(agent, "_agy_pending_base_url")
 
             async with agent:
+                if hasattr(agent, "conversation") and hasattr(
+                    agent.conversation, "connection"
+                ):
+                    agent.conversation.connection._agent_id = agent_id_u64
                 result_holder["instance"] = agent
                 enter_event.set()
                 await exit_event.wait()

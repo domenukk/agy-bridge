@@ -7,17 +7,8 @@ use tokio::{sync::oneshot, time::timeout};
 
 use super::super::{
     AgentId,
-    command_loop::{
-        AgentRegistry, CANCEL_FN, CANCEL_FN_NAME, CLEAR_HISTORY_FN, CLEAR_HISTORY_FN_NAME,
-        DELETE_FN, DELETE_FN_NAME, DISCONNECT_FN, DISCONNECT_FN_NAME, HANDLER_TIMEOUT, SEND_FN,
-        SEND_FN_NAME, SIGNAL_IDLE_FN, SIGNAL_IDLE_FN_NAME, WAIT_FOR_IDLE_FN, WAIT_FOR_IDLE_FN_NAME,
-        WAIT_FOR_WAKEUP_FN, WAIT_FOR_WAKEUP_FN_NAME, get_or_compile_py_helper,
-    },
-    py_scripts::{
-        PYTHON_CANCEL_SCRIPT, PYTHON_CLEAR_HISTORY_SCRIPT, PYTHON_DELETE_SCRIPT,
-        PYTHON_DISCONNECT_SCRIPT, PYTHON_SEND_SCRIPT, PYTHON_SIGNAL_IDLE_SCRIPT,
-        PYTHON_WAIT_FOR_IDLE_SCRIPT, PYTHON_WAIT_FOR_WAKEUP_SCRIPT,
-    },
+    command_loop::{AgentRegistry, HANDLER_TIMEOUT},
+    py_scripts::decode_prompt_py,
 };
 use crate::error::Error;
 
@@ -41,40 +32,20 @@ fn clone_agent_refs(registry: &AgentRegistry, agent_id: AgentId) -> Option<(Py<P
         .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py))))
 }
 
-/// Describes a Python async operation to run against an agent instance.
-struct PyAsyncOp<'a> {
-    /// Compiled-function cache slot.
-    cache: &'static std::sync::OnceLock<Py<PyAny>>,
-    /// Python source that defines the helper function.
-    script: &'a str,
-    /// Name of the function inside the script.
-    fn_name: &'a str,
-    /// Rust-side timeout applied to the awaited future.
-    /// `None` means no timeout (just `.await` directly).
-    timeout: Option<Duration>,
-    /// Human-readable operation name for error messages (e.g. `"cancel"`).
-    op_label: &'a str,
-}
-
 /// Generic async-op executor that factors out the shared registry-lookup →
-/// compile → call → await → reply pattern used by every handler in this
+/// build-coro → convert-to-future → await → reply pattern used by every handler in this
 /// module.
-///
-/// `build_args` receives the bound helper function and the bound agent
-/// instance and must return the Python arguments tuple for the helper call.
-///
-/// `extract` converts the successful Python return value into the Rust
-/// reply type `T`.
 async fn run_py_async_op<T, F, E>(
     registry: AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<T, Error>>,
-    op: PyAsyncOp<'_>,
-    build_args: F,
+    timeout_duration: Option<Duration>,
+    op_label: &str,
+    build_coro: F,
     extract: E,
 ) where
     T: Send + std::fmt::Debug + 'static,
-    F: FnOnce(&Bound<'_, PyAny>, &Bound<'_, PyAny>) -> PyResult<Py<PyAny>>,
+    F: for<'py> FnOnce(Python<'py>, &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>,
     E: FnOnce(Py<PyAny>) -> T,
 {
     // 1. Look up the agent in the registry.
@@ -88,33 +59,29 @@ async fn run_py_async_op<T, F, E>(
             tracing::warn!(
                 agent_id = ?agent_id,
                 "{} reply receiver dropped (agent not found)",
-                op.op_label,
+                op_label,
             );
         }
         return;
     };
 
-    // 2. Compile the Python helper and create a future from the coroutine.
-    let fut = get_or_compile_py_helper(op.cache, op.script, op.fn_name).and_then(|helper_fn| {
-        Python::attach(|py| {
-            let helper_bound = helper_fn.bind(py);
-            let agent_bound = agent_instance.bind(py);
-            let coro = build_args(helper_bound, agent_bound).map_err(|e| format!("{e}"))?;
-            pyo3_async_runtimes::tokio::into_future(coro.into_bound(py)).map_err(|e| format!("{e}"))
+    // 2. Build the Python coroutine and convert it to a Rust future.
+    let fut = Python::attach(|py| -> Result<_, Error> {
+        let agent_bound = agent_instance.bind(py);
+        let coro = build_coro(py, agent_bound)?;
+        pyo3_async_runtimes::tokio::into_future(coro).map_err(|e| Error::BackendError {
+            message: e.to_string(),
         })
     });
 
     let fut = match fut {
         Ok(fut) => fut,
-        Err(err_msg) => {
-            if reply
-                .send(Err(Error::BackendError { message: err_msg }))
-                .is_err()
-            {
+        Err(e) => {
+            if reply.send(Err(e)).is_err() {
                 tracing::warn!(
                     agent_id = ?agent_id,
                     "{} reply receiver dropped (coro error)",
-                    op.op_label,
+                    op_label,
                 );
             }
             return;
@@ -122,27 +89,26 @@ async fn run_py_async_op<T, F, E>(
     };
 
     // 3. Await with optional timeout.
-    let py_result = if let Some(dur) = op.timeout {
+    let py_result = if let Some(dur) = timeout_duration {
         match timeout(dur, fut).await {
             Ok(result) => result,
             Err(_elapsed) => {
                 let err_msg = format!(
-                    "handle_{} timed out after {:.1}s for agent {agent_id}",
-                    op.op_label,
+                    "handle_{op_label} timed out after {:.1}s for agent {agent_id}",
                     dur.as_secs_f64(),
                 );
                 tracing::error!(agent_id = ?agent_id, "{err_msg}");
                 if reply
                     .send(Err(Error::Timeout {
                         duration: dur,
-                        operation: format!("{}(agent={agent_id})", op.op_label),
+                        operation: format!("{op_label}(agent={agent_id})"),
                     }))
                     .is_err()
                 {
                     tracing::warn!(
                         agent_id = ?agent_id,
                         "{} reply receiver dropped (timeout)",
-                        op.op_label,
+                        op_label,
                     );
                 }
                 return;
@@ -159,7 +125,7 @@ async fn run_py_async_op<T, F, E>(
                 tracing::warn!(
                     agent_id = ?agent_id,
                     "{} reply receiver dropped",
-                    op.op_label,
+                    op_label,
                 );
             }
         }
@@ -169,16 +135,11 @@ async fn run_py_async_op<T, F, E>(
                 tracing::warn!(
                     agent_id = ?agent_id,
                     "{} reply receiver dropped (error)",
-                    op.op_label,
+                    op_label,
                 );
             }
         }
     }
-}
-
-/// Helper to call a Python helper with just the agent instance (no extra args).
-fn call_agent_only(helper: &Bound<'_, PyAny>, agent: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-    helper.call1((agent,)).map(Bound::unbind)
 }
 
 pub(in crate::runtime) async fn handle_cancel(
@@ -190,14 +151,12 @@ pub(in crate::runtime) async fn handle_cancel(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &CANCEL_FN,
-            script: PYTHON_CANCEL_SCRIPT,
-            fn_name: CANCEL_FN_NAME,
-            timeout: Some(HANDLER_TIMEOUT),
-            op_label: "cancel",
+        Some(HANDLER_TIMEOUT),
+        "cancel",
+        |_, agent| {
+            let conv = agent.getattr("conversation")?;
+            conv.call_method0("cancel")
         },
-        call_agent_only,
         |_| (),
     )
     .await;
@@ -212,40 +171,42 @@ pub(in crate::runtime) async fn handle_wait_for_idle(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &WAIT_FOR_IDLE_FN,
-            script: PYTHON_WAIT_FOR_IDLE_SCRIPT,
-            fn_name: WAIT_FOR_IDLE_FN_NAME,
-            timeout: Some(HANDLER_TIMEOUT),
-            op_label: "wait_for_idle",
+        Some(HANDLER_TIMEOUT),
+        "wait_for_idle",
+        |_, agent| {
+            let conv = agent.getattr("conversation")?;
+            conv.call_method0("wait_for_idle")
         },
-        call_agent_only,
         |_| (),
     )
     .await;
 }
 
-/// Clear the conversation history via the async Python API.
-pub(in crate::runtime) async fn handle_clear_history(
-    registry: AgentRegistry,
+/// Clear the conversation history synchronously via `PyO3`.
+pub(in crate::runtime) fn handle_clear_history(
+    registry: &AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
-    run_py_async_op(
-        registry,
-        agent_id,
-        reply,
-        PyAsyncOp {
-            cache: &CLEAR_HISTORY_FN,
-            script: PYTHON_CLEAR_HISTORY_SCRIPT,
-            fn_name: CLEAR_HISTORY_FN_NAME,
-            timeout: None,
-            op_label: "clear_history",
-        },
-        call_agent_only,
-        |_| (),
-    )
-    .await;
+    let Some((_ctx, agent_instance)) = clone_agent_refs(registry, agent_id) else {
+        let _ = reply.send(Err(Error::BackendError {
+            message: format!("Agent ID {agent_id} not found in registry"),
+        }));
+        return;
+    };
+
+    let result = Python::attach(|py| -> Result<(), Error> {
+        let agent_bound = agent_instance.bind(py);
+        if agent_bound.hasattr("conversation")? {
+            let conv = agent_bound.getattr("conversation")?;
+            if !conv.is_none() && conv.hasattr("clear_history")? {
+                conv.call_method0("clear_history")?;
+            }
+        }
+        Ok(())
+    });
+
+    let _ = reply.send(result);
 }
 
 pub(in crate::runtime) async fn handle_send(
@@ -258,14 +219,13 @@ pub(in crate::runtime) async fn handle_send(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &SEND_FN,
-            script: &PYTHON_SEND_SCRIPT,
-            fn_name: SEND_FN_NAME,
-            timeout: Some(HANDLER_TIMEOUT),
-            op_label: "send",
+        Some(HANDLER_TIMEOUT),
+        "send",
+        |py, agent| {
+            let conv = agent.getattr("conversation")?;
+            let decoded = decode_prompt_py(py, &prompt)?;
+            conv.call_method1("send", (decoded,))
         },
-        |helper, agent| helper.call1((agent, &prompt)).map(Bound::unbind),
         |_| (),
     )
     .await;
@@ -280,14 +240,12 @@ pub(in crate::runtime) async fn handle_signal_idle(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &SIGNAL_IDLE_FN,
-            script: PYTHON_SIGNAL_IDLE_SCRIPT,
-            fn_name: SIGNAL_IDLE_FN_NAME,
-            timeout: Some(HANDLER_TIMEOUT),
-            op_label: "signal_idle",
+        Some(HANDLER_TIMEOUT),
+        "signal_idle",
+        |_, agent| {
+            let conv = agent.getattr("conversation")?;
+            conv.call_method0("signal_idle")
         },
-        call_agent_only,
         |_| (),
     )
     .await;
@@ -305,14 +263,12 @@ pub(in crate::runtime) async fn handle_wait_for_wakeup(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &WAIT_FOR_WAKEUP_FN,
-            script: PYTHON_WAIT_FOR_WAKEUP_SCRIPT,
-            fn_name: WAIT_FOR_WAKEUP_FN_NAME,
-            timeout: Some(wakeup_timeout),
-            op_label: "wait_for_wakeup",
+        Some(wakeup_timeout),
+        "wait_for_wakeup",
+        |_, agent| {
+            let conv = agent.getattr("conversation")?;
+            conv.call_method1("wait_for_wakeup", (timeout_secs,))
         },
-        |helper, agent| helper.call1((agent, timeout_secs)).map(Bound::unbind),
         |result| {
             Python::attach(|py| {
                 result.bind(py).extract::<bool>().unwrap_or_else(|e| {
@@ -338,14 +294,12 @@ pub(in crate::runtime) async fn handle_delete(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &DELETE_FN,
-            script: PYTHON_DELETE_SCRIPT,
-            fn_name: DELETE_FN_NAME,
-            timeout: Some(HANDLER_TIMEOUT),
-            op_label: "delete",
+        Some(HANDLER_TIMEOUT),
+        "delete",
+        |_, agent| {
+            let conv = agent.getattr("conversation")?;
+            conv.call_method0("delete")
         },
-        call_agent_only,
         |_| (),
     )
     .await;
@@ -361,14 +315,12 @@ pub(in crate::runtime) async fn handle_disconnect(
         registry,
         agent_id,
         reply,
-        PyAsyncOp {
-            cache: &DISCONNECT_FN,
-            script: PYTHON_DISCONNECT_SCRIPT,
-            fn_name: DISCONNECT_FN_NAME,
-            timeout: Some(HANDLER_TIMEOUT),
-            op_label: "disconnect",
+        Some(HANDLER_TIMEOUT),
+        "disconnect",
+        |_, agent| {
+            let conv = agent.getattr("conversation")?;
+            conv.call_method0("disconnect")
         },
-        call_agent_only,
         |_| (),
     )
     .await;
@@ -452,7 +404,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let agent_id = AgentId(77);
 
-        handle_clear_history(registry, agent_id, tx).await;
+        handle_clear_history(&registry, agent_id, tx);
 
         let result = rx.await.expect("reply channel should not be dropped");
         assert!(result.is_err());

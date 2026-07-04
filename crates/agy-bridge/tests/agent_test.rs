@@ -26,6 +26,7 @@ impl MockRuntime {
     }
 }
 
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl agy_bridge::agent::Runtime for MockRuntime {
     async fn create_agent(
         &self,

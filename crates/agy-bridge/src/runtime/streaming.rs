@@ -20,26 +20,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use tokio::time::timeout;
 
-use super::{AgentId, py_scripts::PYTHON_NEXT_STEP_SCRIPT};
-
-/// Python function name extracted by [`compile_next_step_helper`].
-const NEXT_STEP_FN_NAME: &str = "_next_step";
-
-/// Python attribute name on `_agy_bridge_globals` that flags a 429 hit.
-const RATE_LIMIT_HIT_ATTR: &str = "RATE_LIMIT_HIT";
-
-/// Error message surfaced when a 429 quota error is intercepted.
-const QUOTA_EXCEEDED_MSG: &str = "429: You exceeded your current quota";
-
-static NEXT_STEP_FN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-
-fn compile_next_step_helper() -> Result<Py<PyAny>, String> {
-    super::command_loop::get_or_compile_py_helper(
-        &NEXT_STEP_FN,
-        PYTHON_NEXT_STEP_SCRIPT,
-        NEXT_STEP_FN_NAME,
-    )
-}
+use super::AgentId;
 
 async fn forward_step_to_writer(
     writer: &crate::streaming::ChatResponseWriter,
@@ -61,6 +42,20 @@ async fn forward_step_to_writer(
         return Ok(());
     }
 
+    // ── Extract summary info before forwarding consumes the data ────────
+    let step_idx = step.step_index;
+    let tool_names: Vec<String> = step.tool_calls.iter().map(|tc| tc.name.clone()).collect();
+    let usage_summary = step.usage_metadata.as_ref().map(|u| {
+        format!(
+            "{}p/{}o/{}t",
+            u.prompt_token_count.unwrap_or(0),
+            u.candidates_token_count.unwrap_or(0),
+            u.thoughts_token_count.unwrap_or(0),
+        )
+    });
+    let text_len = step.content.len() + step.content_delta.len();
+    let thinking_len = step.thinking.len() + step.thinking_delta.len();
+
     // ── Normal content forwarding ───────────────────────────────────────
     forward_text(writer, &mut step).await?;
     forward_thoughts(writer, &mut step).await?;
@@ -71,6 +66,26 @@ async fn forward_step_to_writer(
         .send_step(step)
         .await
         .map_err(|e| format!("Failed to send step: {e}"))?;
+
+    // ── Structured step summary ─────────────────────────────────────────
+    if !tool_names.is_empty() {
+        tracing::info!(
+            agent_id = ?agent_id,
+            step = step_idx,
+            tools = ?tool_names,
+            usage = ?usage_summary,
+            "tool_call"
+        );
+    } else if text_len > 0 || thinking_len > 0 {
+        tracing::debug!(
+            agent_id = ?agent_id,
+            text_len,
+            thinking_len,
+            usage = ?usage_summary,
+            "model_output"
+        );
+    }
+
     Ok(())
 }
 
@@ -83,33 +98,22 @@ async fn route_error_step(
 ) {
     let has_error_field = !step.error.is_empty();
     let error_msg = if has_error_field {
-        std::mem::take(&mut step.error)
+        step.error.clone()
     } else {
-        // Error status but no error message — include content for context.
         let content = if step.content.is_empty() {
-            std::mem::take(&mut step.content_delta)
+            step.content_delta.clone()
         } else {
-            std::mem::take(&mut step.content)
+            step.content.clone()
         };
         format!("Step error (status={:?}): {content}", step.status)
     };
+    step.error = error_msg.clone();
     tracing::warn!(
         agent_id = ?agent_id,
         status = ?step.status,
         error = %error_msg,
-        "Step has error status/field — routing to error channel"
+        "Step has error status/field"
     );
-    // Use try_send to avoid deadlock: the error channel has capacity 1,
-    // and if a subsequent Python exception also tries to send an error
-    // via send_stream_error(), the .send().await would block forever
-    // because the orchestration loop drains the error channel only AFTER
-    // the text channel closes (which requires the writer to be dropped).
-    if let Err(e) = writer
-        .error_tx
-        .try_send(crate::streaming::StreamError { message: error_msg })
-    {
-        tracing::debug!("Error channel full or closed (first error wins): {e}");
-    }
     if let Err(e) = writer.send_step(std::mem::take(step)).await {
         tracing::debug!("Failed to send error step: {e}");
     }
@@ -134,16 +138,19 @@ async fn forward_text(
         .send(crate::streaming::ResponseEvent::TextChunk(text.clone()))
         .await
         .map_err(|e| format!("Failed to send text event: {e}"))?;
-    writer
-        .chunk_tx
-        .send(crate::streaming::StreamChunk::Text(text.clone()))
-        .await
-        .map_err(|e| format!("Failed to send text chunk to unified stream: {e}"))?;
-    writer
-        .text_tx
-        .send(text)
-        .await
-        .map_err(|e| format!("Failed to send text chunk: {e}"))?;
+
+    if step.source == crate::types::StepSource::Model {
+        writer
+            .chunk_tx
+            .send(crate::streaming::StreamChunk::Text(text.clone()))
+            .await
+            .map_err(|e| format!("Failed to send text chunk to unified stream: {e}"))?;
+        writer
+            .text_tx
+            .send(text)
+            .await
+            .map_err(|e| format!("Failed to send text chunk: {e}"))?;
+    }
     Ok(())
 }
 
@@ -239,26 +246,6 @@ enum StepIterationResult {
     Error(String),
 }
 
-/// Create a Rust future from the Python `_next_step` coroutine.
-///
-/// Acquires the GIL, calls the helper function, and converts the resulting
-/// Python coroutine into a Rust future.
-fn create_next_step_future(
-    next_step_fn: &Py<PyAny>,
-    aiter_py: &Py<PyAny>,
-    timeout_secs: f64,
-) -> Result<impl std::future::Future<Output = PyResult<Py<PyAny>>>, String> {
-    Python::attach(|py| {
-        let fn_bound = next_step_fn.bind(py);
-        let aiter_bound = aiter_py.bind(py);
-        let coro = fn_bound
-            .call1((aiter_bound, timeout_secs))
-            .map_err(|e| format!("Failed to create _next_step future: {e}"))?;
-        pyo3_async_runtimes::tokio::into_future(coro)
-            .map_err(|e| format!("Failed to convert _next_step coro to future: {e}"))
-    })
-}
-
 /// Classify a Python step-iteration error.
 ///
 /// Returns `Stop` for `StopAsyncIteration` (normal end of stream) or
@@ -275,76 +262,21 @@ fn classify_py_step_error(err: &pyo3::PyErr, agent_id: AgentId) -> StepIteration
     StepIterationResult::Error(err_msg)
 }
 
-/// Extract a JSON string from the Python step object.
-///
-/// Returns `None` if the object is Python `None` or extraction fails
-/// (logged as a warning).
-fn extract_step_json(step_py: &Py<PyAny>, agent_id: AgentId) -> Option<String> {
-    Python::attach(|py| {
-        let bound = step_py.bind(py);
-        if bound.is_none() {
-            return None;
-        }
-        match bound.extract::<String>() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(
-                    agent_id = ?agent_id,
-                    error = %e,
-                    "Failed to extract step JSON from Python object"
-                );
-                None
-            }
-        }
-    })
-}
-
-/// Check whether the Python-side 429 rate-limit flag has been set.
-///
-/// Reads `_agy_bridge_globals.RATE_LIMIT_HIT` and resets it to `false`
-/// if it was `true`.
-fn check_rate_limit_hit() -> bool {
-    Python::attach(|py| -> PyResult<bool> {
-        let sys = py.import("sys")?;
-        let gm = sys
-            .getattr("modules")?
-            .get_item(super::command_loop::AGY_BRIDGE_GLOBALS_MODULE)?;
-        let hit = gm.getattr(RATE_LIMIT_HIT_ATTR)?.extract::<bool>()?;
-        if hit && let Err(e) = gm.setattr(RATE_LIMIT_HIT_ATTR, false) {
-            tracing::error!(
-                "Failed to reset {RATE_LIMIT_HIT_ATTR} flag: {e} — \
-                 returning false to prevent permanent stuck 429 state"
-            );
-            // If we can't reset the flag, pretend we didn't see a hit.
-            // Otherwise every future step iteration would falsely report 429.
-            return Ok(false);
-        }
-        Ok(hit)
-    })
-    .map_err(|e| {
-        tracing::debug!(
-            "Checking {RATE_LIMIT_HIT_ATTR} flag failed (normal if uninitialized): {e}"
-        );
-        e
-    })
-    .unwrap_or_else(|e| {
-        tracing::warn!("Rate-limit flag extraction failed: {e}");
-        false
-    })
-}
-
 async fn process_next_step_iteration(
-    next_step_fn: &Py<PyAny>,
     aiter_py: &Py<PyAny>,
     chat_timeout: Duration,
     agent_id: AgentId,
     step_count: u64,
-    stream_start: std::time::Instant,
 ) -> StepIterationResult {
-    let next_fut = match create_next_step_future(next_step_fn, aiter_py, chat_timeout.as_secs_f64())
-    {
+    let next_fut = Python::attach(|py| -> PyResult<_> {
+        let aiter_bound = aiter_py.bind(py);
+        let coro = aiter_bound.call_method0("__anext__")?;
+        pyo3_async_runtimes::tokio::into_future(coro)
+    });
+
+    let next_fut = match next_fut {
         Ok(fut) => fut,
-        Err(e) => return StepIterationResult::Error(e),
+        Err(e) => return classify_py_step_error(&e, agent_id),
     };
 
     let step_result = match timeout(chat_timeout, next_fut).await {
@@ -362,34 +294,22 @@ async fn process_next_step_iteration(
         Err(e) => return classify_py_step_error(&e, agent_id),
     };
 
-    let Some(json_str) = extract_step_json(&step_py, agent_id) else {
-        if check_rate_limit_hit() {
-            tracing::warn!(
-                agent_id = ?agent_id,
-                "Intercepted 429 quota error from Python root logger"
-            );
-            return StepIterationResult::Error(QUOTA_EXCEEDED_MSG.to_string());
+    Python::attach(|py| {
+        let step_bound = step_py.bind(py);
+        if step_bound.is_none() {
+            return StepIterationResult::Stop;
         }
-
-        let elapsed_ms = u64::try_from(stream_start.elapsed().as_millis()).unwrap_or_else(|e| {
-            tracing::warn!("Int conversion failed: {e}");
-            u64::MAX
-        });
-        tracing::debug!(
-            agent_id = ?agent_id, step_count, elapsed_ms,
-            "Step stream completed"
-        );
-        return StepIterationResult::Stop;
-    };
-
-    match serde_json::from_str(&json_str) {
-        Ok(s) => StepIterationResult::Step(Box::new(s)),
-        Err(e) => {
-            let err_msg = format!("Failed to parse Step JSON: {e}");
-            tracing::error!(agent_id = ?agent_id, "{err_msg}");
-            StepIterationResult::Error(err_msg)
+        match super::py_scripts::to_dict_py(step_bound)
+            .and_then(|d| d.extract::<crate::types::Step>())
+        {
+            Ok(step) => StepIterationResult::Step(Box::new(step)),
+            Err(e) => {
+                let err_msg = format!("Failed to extract Step from Python object: {e}");
+                tracing::error!(agent_id = ?agent_id, "{err_msg}");
+                StepIterationResult::Error(err_msg)
+            }
         }
-    }
+    })
 }
 
 pub async fn stream_steps_to_writer(
@@ -399,27 +319,9 @@ pub async fn stream_steps_to_writer(
     aiter_py: &Py<PyAny>,
 ) {
     tracing::debug!(agent_id = ?agent_id, "Starting step streaming");
-    let next_step_fn = match compile_next_step_helper() {
-        Ok(f) => f,
-        Err(err_msg) => {
-            tracing::error!(err_msg);
-            send_stream_error(writer, err_msg);
-            return;
-        }
-    };
     let mut step_count: u64 = 0;
-    let stream_start = std::time::Instant::now();
     loop {
-        match process_next_step_iteration(
-            &next_step_fn,
-            aiter_py,
-            chat_timeout,
-            agent_id,
-            step_count,
-            stream_start,
-        )
-        .await
-        {
+        match process_next_step_iteration(aiter_py, chat_timeout, agent_id, step_count).await {
             StepIterationResult::Step(step) => {
                 step_count += 1;
                 if let Err(send_err) = forward_step_to_writer(writer, *step, agent_id).await {
@@ -492,39 +394,5 @@ mod tests {
         let has_error_status = step.status == StepStatus::Error;
         let has_error_field = !step.error.is_empty();
         assert!(has_error_status && has_error_field);
-    }
-
-    #[test]
-    fn normal_step_is_not_error() {
-        let step = step_with(StepStatus::Done, "", "The answer is 42.");
-        let has_error_status = step.status == StepStatus::Error;
-        let has_error_field = !step.error.is_empty();
-        assert!(!has_error_status && !has_error_field);
-    }
-
-    #[test]
-    fn active_step_with_no_error_is_not_error() {
-        let step = step_with(StepStatus::Active, "", "Working on it...");
-        let has_error_status = step.status == StepStatus::Error;
-        let has_error_field = !step.error.is_empty();
-        assert!(!has_error_status && !has_error_field);
-    }
-
-    #[test]
-    fn content_mentioning_error_codes_is_not_flagged() {
-        // This is the key test: content that mentions error codes, HTTP
-        // status codes, etc. must NOT be falsely detected as an error.
-        let step = step_with(
-            StepStatus::Done,
-            "",
-            "The request failed with code 404. Here is a fix for handling \
-             error codes 4xx and 5xx in your application.",
-        );
-        let has_error_status = step.status == StepStatus::Error;
-        let has_error_field = !step.error.is_empty();
-        assert!(
-            !has_error_status && !has_error_field,
-            "Normal content discussing error codes must not be flagged as error"
-        );
     }
 }

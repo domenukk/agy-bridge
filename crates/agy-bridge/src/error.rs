@@ -96,6 +96,7 @@ impl Error {
         match self {
             Self::ConnectionError { .. } | Self::QuotaExceeded { .. } => true,
             Self::BackendError { message } => message.contains("503"),
+            Self::Stream(se) => se.message.contains("503") || se.message.contains("429"),
             _ => false,
         }
     }
@@ -113,6 +114,12 @@ impl Error {
                 message.contains("429")
                     || message.contains("503")
                     || message.contains("RESOURCE_EXHAUSTED")
+            }
+            Self::Stream(se) => {
+                se.message.contains("429")
+                    || se.message.contains("503")
+                    || se.message.contains("quota")
+                    || se.message.contains("RESOURCE_EXHAUSTED")
             }
             _ => false,
         }
