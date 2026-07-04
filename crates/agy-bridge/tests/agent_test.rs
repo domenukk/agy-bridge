@@ -27,11 +27,11 @@ impl MockRuntime {
 }
 
 impl agy_bridge::agent::Runtime for MockRuntime {
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn create_agent(
         &self,
         _config: AgentConfig,
     ) -> Result<agy_bridge::agent::AgentId, Error> {
-        ::core::future::ready(()).await;
         Ok(1)
     }
 

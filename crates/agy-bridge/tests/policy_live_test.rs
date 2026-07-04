@@ -21,12 +21,12 @@ impl RustTool for SafeTool {
     const NAME: &'static str = "safe_tool";
     const DESCRIPTION: &'static str = "A safe no-op tool that returns a confirmation.";
 
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         _params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
     ) -> Result<ToolOutput, ToolError> {
-        ::core::future::ready(()).await;
         Ok("safe_tool was called".into())
     }
 }
