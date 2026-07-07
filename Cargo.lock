@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agy-bridge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "base64",
  "fast_rands",
@@ -331,7 +331,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-tool"
-version = "0.5.0"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76232320b31c1d663ec9d212fc78bb3353eb5542f219d0c680b79a4a0aaa7b0"
 dependencies = [
  "hashbrown",
  "llm-tool-macros",
@@ -342,11 +344,14 @@ dependencies = [
  "serde_json",
  "spin",
  "tracing",
+ "typed-builder",
 ]
 
 [[package]]
 name = "llm-tool-macros"
-version = "0.5.0"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "440581991aa3b6ac719ef21e066e2c26138bca484cd86b08489310a75da96f60"
 dependencies = [
  "convert_case",
  "hashbrown",
@@ -358,9 +363,19 @@ dependencies = [
 
 [[package]]
 name = "md-tmpl"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa149bfa4fd0f7dfb842cda89061813f84a1211c8b6260c5404c25db70648e3b"
+checksum = "34f6402f516c86be5c2f3c61c9b876a72834239e5c0981b9eeba5c7d2c70069a"
+dependencies = [
+ "md-tmpl-core",
+ "md-tmpl-macros",
+]
+
+[[package]]
+name = "md-tmpl-core"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae8fdd6cd6e1839eb4f56dd108adcca73ef4131842f8c88783ba35e6799407de"
 dependencies = [
  "ciborium",
  "const-str",
@@ -375,12 +390,12 @@ dependencies = [
 
 [[package]]
 name = "md-tmpl-macros"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ce7df91238126d42f7b1e41c3fb8feee8afe0db694b98d9103984aa10fe1f89"
+checksum = "94ee160ad4f276751d11b1a53a3bead6f6aa924143ad8c4fa70d63e5de205fb6"
 dependencies = [
  "hashbrown",
- "md-tmpl",
+ "md-tmpl-core",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -592,9 +607,9 @@ dependencies = [
 
 [[package]]
 name = "rustversion"
-version = "1.0.22"
+version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "schemars"
@@ -918,18 +933,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.52"
+version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
+checksum = "75726053136156d419e285b9b7eddaaea9e3fea6ce32eed44a89901f0bd98de1"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.52"
+version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
+checksum = "4714fd92cf900833d49538023a9b3915155210801d1c1169eba513b2addefd71"
 dependencies = [
  "proc-macro2",
  "quote",

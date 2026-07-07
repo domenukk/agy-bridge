@@ -88,8 +88,16 @@ fn extract_response_metadata(
                 None
             } else {
                 (|| {
-                    let dict = super::super::py_scripts::to_dict_py(&ob).ok()?;
-                    dict.extract::<UsageMetadata>().ok()
+                    let dict = super::super::py_scripts::to_dict_py(&ob)
+                        .inspect_err(|e| {
+                            tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to convert usage_metadata to dict");
+                        })
+                        .ok()?;
+                    dict.extract::<UsageMetadata>()
+                        .inspect_err(|e| {
+                            tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to extract UsageMetadata from dict");
+                        })
+                        .ok()
                 })()
             }
         });
@@ -101,7 +109,11 @@ fn extract_response_metadata(
                 None
             } else {
                 (|| {
-                    let dict = super::super::py_scripts::to_dict_py(&ob).ok()?;
+                    let dict = super::super::py_scripts::to_dict_py(&ob)
+                        .inspect_err(|e| {
+                            tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to convert structured_output to dict");
+                        })
+                        .ok()?;
                     match pythonize::depythonize::<serde_json::Value>(&dict) {
                         Ok(val) => Some(val),
                         Err(e) => {

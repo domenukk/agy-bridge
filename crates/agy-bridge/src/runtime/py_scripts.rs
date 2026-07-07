@@ -43,11 +43,22 @@ fn decode_content_value<'py>(
             if let Some(serde_json::Value::String(typ)) = map.get("type")
                 && matches!(typ.as_str(), "Image" | "Document" | "Audio" | "Video")
             {
-                let data_b64 = map.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let data_b64 = map.get("data").and_then(|v| v.as_str()).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "{typ} content is missing required 'data' field"
+                    ))
+                })?;
                 let raw_bytes = STANDARD.decode(data_b64).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!("Invalid base64: {e}"))
                 })?;
-                let mime_type = map.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
+                let mime_type = map
+                    .get("mime_type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "{typ} content is missing required 'mime_type' field"
+                        ))
+                    })?;
 
                 let types_mod = py.import("google.antigravity.types")?;
                 let kwargs = pyo3::types::PyDict::new(py);

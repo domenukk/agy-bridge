@@ -36,14 +36,21 @@ pub(in crate::runtime) fn handle_get_history(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            if reply.send(Err(e)).is_err() {
+                tracing::warn!(agent_id = ?agent_id, "get_history reply receiver dropped (lock error)");
+            }
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(agent_id = ?agent_id, "get_history reply receiver dropped (not found)");
+        }
         return;
     };
 
@@ -74,7 +81,10 @@ pub(in crate::runtime) fn handle_get_history(
                 } else {
                     source_py
                         .extract::<String>()
-                        .unwrap_or_else(|_| "unknown".to_owned())
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(agent_id = ?agent_id, error = %e, "failed to extract role, defaulting to 'unknown'");
+                            "unknown".to_owned()
+                        })
                 };
                 let role = match role_str.to_lowercase().as_str() {
                     "user" => crate::types::MessageRole::User,
@@ -87,14 +97,19 @@ pub(in crate::runtime) fn handle_get_history(
                 let content = item
                     .getattr("content")?
                     .extract::<String>()
-                    .unwrap_or_default();
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(agent_id = ?agent_id, error = %e, "failed to extract message content, defaulting to empty");
+                        String::new()
+                    });
                 messages.push(crate::types::ConversationMessage { role, content });
             }
             Ok(messages)
         },
     );
 
-    let _ = reply.send(result);
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "get_history reply receiver dropped");
+    }
 }
 
 /// Query the turn count from the agent's conversation object.
@@ -106,14 +121,21 @@ pub(in crate::runtime) fn handle_get_turn_count(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            if reply.send(Err(e)).is_err() {
+                tracing::warn!(agent_id = ?agent_id, "get_turn_count reply receiver dropped (lock error)");
+            }
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(agent_id = ?agent_id, "get_turn_count reply receiver dropped (not found)");
+        }
         return;
     };
 
@@ -130,7 +152,9 @@ pub(in crate::runtime) fn handle_get_turn_count(
         Ok(tc)
     });
 
-    let _ = reply.send(result);
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "get_turn_count reply receiver dropped");
+    }
 }
 
 /// Query cumulative token usage from the agent's conversation object.
@@ -168,14 +192,21 @@ fn handle_get_usage_impl(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            if reply.send(Err(e)).is_err() {
+                tracing::warn!(agent_id = ?agent_id, label, "usage reply receiver dropped (lock error)");
+            }
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(agent_id = ?agent_id, label, "usage reply receiver dropped (not found)");
+        }
         return;
     };
 
@@ -214,14 +245,21 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            if reply.send(Err(e)).is_err() {
+                tracing::warn!(agent_id = ?agent_id, "get_compaction_indices reply receiver dropped (lock error)");
+            }
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(agent_id = ?agent_id, "get_compaction_indices reply receiver dropped (not found)");
+        }
         return;
     };
 
@@ -238,7 +276,9 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
         Ok(indices.extract::<Vec<u32>>()?)
     });
 
-    let _ = reply.send(result);
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "get_compaction_indices reply receiver dropped");
+    }
 }
 
 /// Return the text of the last model response.
@@ -253,14 +293,21 @@ pub(in crate::runtime) fn handle_get_last_response(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            if reply.send(Err(e)).is_err() {
+                tracing::warn!(agent_id = ?agent_id, "get_last_response reply receiver dropped (lock error)");
+            }
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(agent_id = ?agent_id, "get_last_response reply receiver dropped (not found)");
+        }
         return;
     };
 
@@ -280,7 +327,9 @@ pub(in crate::runtime) fn handle_get_last_response(
         Ok(Some(response_str))
     });
 
-    let _ = reply.send(result);
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "get_last_response reply receiver dropped");
+    }
 }
 
 /// Check whether the agent is currently idle (not running a turn).
@@ -295,14 +344,21 @@ pub(in crate::runtime) fn handle_is_idle(
     let instance_opt = match lock_agent_instance(registry, agent_id) {
         Ok(opt) => opt,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            if reply.send(Err(e)).is_err() {
+                tracing::warn!(agent_id = ?agent_id, "is_idle reply receiver dropped (lock error)");
+            }
             return;
         }
     };
     let Some((_ctx, agent_instance)) = instance_opt else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(agent_id = ?agent_id, "is_idle reply receiver dropped (not found)");
+        }
         return;
     };
 
@@ -319,5 +375,7 @@ pub(in crate::runtime) fn handle_is_idle(
         Ok(is_idle)
     });
 
-    let _ = reply.send(result);
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "is_idle reply receiver dropped");
+    }
 }

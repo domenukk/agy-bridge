@@ -120,7 +120,12 @@ mod tests {
             .await
             .unwrap();
         let content = output.content();
-        let expected = "\nResults for \"test.rs\":\n- /dir/README.md\n- /dir/src/main.rs\n- /dir/docs/test.rs.md\n";
+        let expected = "
+Results for \"test.rs\":
+- /dir/README.md
+- /dir/src/main.rs
+- /dir/docs/test.rs.md
+";
         assert_eq!(content, expected);
     }
 
@@ -153,7 +158,8 @@ mod tests {
         let tool = SearchFiles;
         let ctx = ToolContext::new(None);
 
-        let pattern = "🦀_test_\"quotes\"_\n_newline";
+        let pattern = "🦀_test_\"quotes\"_
+_newline";
         let output = tool
             .call(
                 SearchFilesParams {
@@ -165,7 +171,10 @@ mod tests {
             .await
             .unwrap();
         let content = output.content();
-        assert!(content.contains("🦀_test_\"quotes\"_\n_newline"));
+        assert!(content.contains(
+            "🦀_test_\"quotes\"_
+_newline"
+        ));
         assert!(content.contains("- /🦀/README.md"));
     }
 

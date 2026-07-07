@@ -189,9 +189,17 @@ pub(in crate::runtime) fn handle_clear_history(
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
     let Some((_ctx, agent_instance)) = clone_agent_refs(registry, agent_id) else {
-        let _ = reply.send(Err(Error::BackendError {
-            message: format!("Agent ID {agent_id} not found in registry"),
-        }));
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            .is_err()
+        {
+            tracing::warn!(
+                agent_id = ?agent_id,
+                "clear_history reply receiver dropped (agent not found)",
+            );
+        }
         return;
     };
 
@@ -206,7 +214,9 @@ pub(in crate::runtime) fn handle_clear_history(
         Ok(())
     });
 
-    let _ = reply.send(result);
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "clear_history reply receiver dropped");
+    }
 }
 
 pub(in crate::runtime) async fn handle_send(
