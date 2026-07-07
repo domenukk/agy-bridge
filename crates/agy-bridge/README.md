@@ -26,6 +26,12 @@ Install the Python SDK:
 pip install google-antigravity watchfiles
 ```
 
+Set your API key (or put it in a `.env` file):
+
+```bash
+export GEMINI_API_KEY="your-key-here"
+```
+
 > `watchfiles` is only needed for file-change triggers; timer triggers
 > work without it.
 
@@ -158,6 +164,35 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agent.shutdown().await?;
     Ok(())
 }
+```
+
+### Structured Output
+
+Constrain agent responses to a typed Rust struct:
+
+```rust
+use agy_bridge::{AgyBridge, config::{AgentConfig, JsonSchema}};
+use schemars::JsonSchema as JsonSchemaTrait;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchemaTrait)]
+struct Summary {
+    title: String,
+    bullet_points: Vec<String>,
+}
+
+# fn main() -> Result<(), agy_bridge::error::Error> {
+let schema = serde_json::to_value(schemars::schema_for!(Summary))
+    .expect("schema serialization");
+
+let config = AgentConfig::builder()
+    .response_schema(JsonSchema::new(schema))
+    .build();
+
+// The agent's response will be valid JSON matching `Summary`.
+assert!(config.response_schema.is_some());
+# Ok(())
+# }
 ```
 
 For full control, implement the `RustTool` trait directly:
