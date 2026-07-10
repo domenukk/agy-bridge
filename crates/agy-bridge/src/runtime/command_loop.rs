@@ -181,13 +181,17 @@ async fn cleanup_single_agent(agent_id: AgentId, ctx_py: Py<PyAny>) {
     }
 
     // Also clean up the global bridge state for this agent.
-    if let Ok(mut map) = super::bridge_state().write() {
-        map.remove(&agent_id.0);
-    } else {
-        tracing::warn!(
-            agent_id = agent_id.0,
-            "BRIDGE_STATE RwLock poisoned during cleanup"
-        );
+    match super::bridge_state().write() {
+        Ok(mut map) => {
+            map.remove(&agent_id.0);
+        }
+        Err(e) => {
+            tracing::warn!(
+                agent_id = agent_id.0,
+                error = %e,
+                "BRIDGE_STATE RwLock poisoned during cleanup"
+            );
+        }
     }
 }
 

@@ -124,7 +124,7 @@ pub(in crate::runtime) async fn handle_create_agent(
     event_loop: Py<PyAny>,
     chat_timeout: Duration,
     config_json: String,
-    reply: oneshot::Sender<Result<AgentId, Error>>,
+    reply: oneshot::Sender<Result<(AgentId, Vec<RawToolInfo>), Error>>,
 ) {
     static AGENT_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     tracing::info!("Live-SDK: CreateAgent command received");
@@ -188,10 +188,11 @@ pub(in crate::runtime) async fn handle_create_agent(
     match enter_result {
         Ok(agent_instance_py) => {
             let aid = AgentId(next_id);
+            let tool_defs = extract_tool_definitions(&agent_instance_py);
             match registry.lock() {
                 Ok(mut guard) => {
                     guard.insert(aid, (ctx_py, agent_instance_py));
-                    if let Err(e) = reply.send(Ok(aid)) {
+                    if let Err(e) = reply.send(Ok((aid, tool_defs))) {
                         tracing::warn!(error = ?e, "CreateAgent reply receiver dropped");
                     }
                 }
@@ -212,6 +213,161 @@ pub(in crate::runtime) async fn handle_create_agent(
             }
         }
     }
+}
+
+/// Raw tool info extracted from the Python `ToolRunner`.
+///
+/// This is an intermediate representation — the caller tags each tool with
+/// the appropriate [`ToolSource`] and assembles the final [`AvailableTool`] list.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct RawToolInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "serde_json::Value::default")]
+    pub parameter_schema: serde_json::Value,
+}
+
+/// Extract tool definitions from the Python agent's `_tool_runner.tools`.
+///
+/// For each tool callable, extracts:
+/// - `__name__` → name
+/// - `__doc__` → description (may be empty)
+/// - `input_schema` → JSON schema (for `ToolWithSchema` subclasses; missing otherwise)
+///
+/// Falls back to an empty list if extraction fails (non-fatal).
+/// Logs warnings for tools that are missing descriptions or schemas.
+fn extract_tool_definitions(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
+    Python::attach(|py| {
+        let agent = agent_py.bind(py);
+        let tool_runner = match agent.getattr("_tool_runner") {
+            Ok(runner) => runner,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not access agent._tool_runner — available_tools will be empty"
+                );
+                return Vec::new();
+            }
+        };
+        let tools_dict = match tool_runner.getattr("tools") {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not access _tool_runner.tools — available_tools will be empty"
+                );
+                return Vec::new();
+            }
+        };
+
+        // Extract tool info from each callable in the dict by running
+        // a small Python helper that reads __name__, __doc__, input_schema.
+        let extract_fn = match py
+            .run(
+                pyo3::ffi::c_str!(
+                    r#"
+def _extract(tools_dict):
+    import json
+    result = []
+    for name, fn in tools_dict.items():
+        desc = getattr(fn, '__doc__', None) or ''
+        schema = getattr(fn, 'input_schema', None) or {}
+        result.append({'name': name, 'description': desc, 'parameter_schema': schema})
+    return json.dumps(result)
+"#
+                ),
+                None,
+                None,
+            )
+            .and_then(|()| py.eval(pyo3::ffi::c_str!("_extract"), None, None))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to define _extract helper — falling back to names only"
+                );
+                return extract_tool_names_fallback(agent_py);
+            }
+        };
+
+        let json_str = match extract_fn.call1((tools_dict,)) {
+            Ok(result) => match result.extract::<String>() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to extract JSON string from _extract — falling back to names only"
+                    );
+                    return extract_tool_names_fallback(agent_py);
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to call _extract — falling back to names only"
+                );
+                return extract_tool_names_fallback(agent_py);
+            }
+        };
+
+        match serde_json::from_str::<Vec<RawToolInfo>>(&json_str) {
+            Ok(infos) => {
+                for info in &infos {
+                    if info.description.is_empty() {
+                        tracing::warn!(
+                            tool = %info.name,
+                            "Tool has no description — consider adding a docstring"
+                        );
+                    }
+                    if info.parameter_schema.is_null()
+                        || info.parameter_schema == serde_json::json!({})
+                    {
+                        tracing::warn!(
+                            tool = %info.name,
+                            "Tool has no parameter schema"
+                        );
+                    }
+                }
+                infos
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to deserialize tool definitions JSON — falling back to names only"
+                );
+                extract_tool_names_fallback(agent_py)
+            }
+        }
+    })
+}
+
+/// Fallback: extract just the tool names (no descriptions/schemas) when
+/// the full extraction fails.
+fn extract_tool_names_fallback(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
+    Python::attach(|py| {
+        let agent = agent_py.bind(py);
+        let names: Vec<String> = agent
+            .getattr("_tool_runner")
+            .and_then(|r| r.getattr("tool_names"))
+            .and_then(|n| n.extract())
+            .unwrap_or_default();
+        names
+            .into_iter()
+            .map(|name| {
+                tracing::warn!(
+                    tool = %name,
+                    "Falling back to name-only tool info (no description or schema)"
+                );
+                RawToolInfo {
+                    name,
+                    description: String::new(),
+                    parameter_schema: serde_json::Value::Null,
+                }
+            })
+            .collect()
+    })
 }
 
 /// Remove the agent from the registry and run its `__aexit__` cleanup.

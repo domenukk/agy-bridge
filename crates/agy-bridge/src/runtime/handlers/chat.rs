@@ -51,10 +51,16 @@ fn get_step_iterator(agent_instance: &Py<PyAny>, response_py: &Py<PyAny>) -> PyR
         let conv = agent_bound.getattr("conversation")?;
         if !conv.hasattr("receive_steps")? {
             // Try to surface the error message from the response itself.
-            if let Ok(error_text) = response_bound.getattr("text")
-                && let Ok(desc_str) = error_text.extract::<String>()
-            {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(desc_str));
+            match response_bound.getattr("text") {
+                Ok(error_text) => {
+                    // NOLINT: extract failure means text isn't a string; fall through to generic error
+                    if let Ok(desc_str) = error_text.extract::<String>() {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(desc_str));
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("response has no 'text' attr to surface error: {e}");
+                }
             }
             return Err(pyo3::exceptions::PyAttributeError::new_err(
                 "Conversation object has no attribute receive_steps",
@@ -76,11 +82,13 @@ fn extract_response_metadata(
         let agent_bound = agent_instance.bind(py);
 
         // Get usage metadata
+        // NOLINT: `.ok()` — probing optional Python attr; absence is expected
         let mut usage_py = response_bound.getattr("usage_metadata").ok();
         if (usage_py.is_none() || usage_py.as_ref().unwrap().is_none())
             && let Ok(conv) = agent_bound.getattr("conversation")
             && !conv.is_none()
         {
+            // NOLINT: `.ok()` — probing optional Python attr; absence is expected
             usage_py = conv.getattr("last_turn_usage").ok();
         }
         let usage = usage_py.and_then(|ob| {
@@ -92,17 +100,20 @@ fn extract_response_metadata(
                         .inspect_err(|e| {
                             tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to convert usage_metadata to dict");
                         })
+                        // NOLINT: error already logged by inspect_err above
                         .ok()?;
                     dict.extract::<UsageMetadata>()
                         .inspect_err(|e| {
                             tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to extract UsageMetadata from dict");
                         })
+                        // NOLINT: error already logged by inspect_err above
                         .ok()
                 })()
             }
         });
 
         // Get structured output
+        // NOLINT: `.ok()` — probing optional Python attr; absence is expected
         let structured_py = response_bound.getattr("structured_output").ok();
         let structured = structured_py.and_then(|ob| {
             if ob.is_none() {
@@ -113,6 +124,7 @@ fn extract_response_metadata(
                         .inspect_err(|e| {
                             tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to convert structured_output to dict");
                         })
+                        // NOLINT: error already logged by inspect_err above
                         .ok()?;
                     match pythonize::depythonize::<serde_json::Value>(&dict) {
                         Ok(val) => Some(val),

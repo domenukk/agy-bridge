@@ -16,6 +16,7 @@ use fast_rands::Rand;
 ///
 /// Panics if the key is not found in either location.
 pub fn api_key() -> String {
+    // NOLINT: env var not set is expected — falls through to .env file below
     if let Ok(key) = std::env::var("GEMINI_API_KEY")
         && !key.is_empty()
     {
@@ -28,6 +29,7 @@ pub fn api_key() -> String {
     {
         return key.trim_matches('"').to_string();
     }
+    // NOLINT: test helper — cwd default is fine, path is only used in the panic message
     let dotenv_path = std::env::current_dir().unwrap_or_default().join(".env");
     panic!(
         "GEMINI_API_KEY not set in environment or in {dotenv}",
@@ -119,7 +121,9 @@ impl Drop for SemaphoreGuard<'_> {
 /// compiled-in default.
 fn max_concurrent_tests() -> usize {
     std::env::var("AGY_BRIDGE_MAX_CONCURRENT_TESTS")
+        // NOLINT: env var not set is expected — falls through to default
         .ok()
+        // NOLINT: invalid integer falls through to default concurrency limit
         .and_then(|v| v.parse::<usize>().ok())
         .map_or(DEFAULT_MAX_CONCURRENT, |n| n.max(1))
 }

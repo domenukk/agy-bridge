@@ -12,10 +12,12 @@ use agy_bridge::{AgyBridge, config::AgentConfig};
 
 fn read_user_input() -> Option<String> {
     print!("\n  You: ");
+    // NOLINT: example code — flush failure returns None, ending input gracefully
     std::io::stdout().flush().ok()?;
 
     let stdin = std::io::stdin();
     let mut line = String::new();
+    // NOLINT: example code — readline failure returns None, ending input gracefully
     stdin.lock().read_line(&mut line).ok()?;
 
     let trimmed = line.trim().to_owned();

@@ -1,7 +1,20 @@
 def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
-    import logging, sys
+    import logging, sys, json
 
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    # Extract and consume the backend log level injected by Rust.
+    # Default ("warn") matches upstream SDK behavior — only warnings and above.
+    _pre_parsed = json.loads(config_json)
+    _backend_log_level = _pre_parsed.pop("_backend_log_level", "warn")
+    config_json = json.dumps(_pre_parsed)
+
+    _LEVEL_MAP = {
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+    }
+    py_level = _LEVEL_MAP.get(_backend_log_level, logging.WARNING)
+    logging.basicConfig(level=py_level, stream=sys.stderr)
     logger = logging.getLogger("agy_bridge.init")
 
     try:

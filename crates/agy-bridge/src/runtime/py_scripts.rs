@@ -7,6 +7,7 @@ pub const PYTHON_AGENT_INIT_SCRIPT: &str = include_str!("py/agent_init.py");
 
 /// Decode multimodal prompt content from JSON and map it to Python SDK objects.
 pub fn decode_prompt_py<'py>(py: Python<'py>, prompt_str: &str) -> PyResult<Bound<'py, PyAny>> {
+    // NOLINT: plain-string fallback is intentional when JSON parse fails
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(prompt_str) {
         decode_content_value(py, &value)
     } else {

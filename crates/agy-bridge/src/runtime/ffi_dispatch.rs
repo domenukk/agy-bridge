@@ -21,10 +21,6 @@ pub(crate) static INITIALIZING_HOOK_RUNNER: std::sync::Mutex<Option<Arc<crate::h
 pub(crate) static CREATE_AGENT_HOOK_GUARD: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-pub(crate) static PENDING_CONVERSATION_IDS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u64, String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// Execute a hook by name, deserializing the context JSON and calling the
 /// appropriate method on the runner. Returns the serialized result (empty
 /// string for void hooks).
@@ -148,7 +144,7 @@ fn handle_pre_tool_call_decide(
 }
 
 fn handle_on_session_start(
-    agent_id: u64,
+    _agent_id: u64,
     hook_runner: &crate::hooks::Hooks,
     context_json: &str,
 ) -> Result<(), crate::error::Error> {
@@ -158,18 +154,11 @@ fn handle_on_session_start(
                 message: format!("Failed to deserialize OnSessionStartContext: {e}"),
             }
         })?;
-    let mut synced = false;
-    if let Ok(map) = bridge_state().read()
-        && let Some(entry) = map.get(&agent_id)
-        && let Ok(mut guard) = entry.conversation_id.lock()
-    {
-        *guard = Some(ctx.session.session_id.clone());
-        synced = true;
-        tracing::info!(agent_id, session_id = %ctx.session.session_id, "Synced conversation_id from Python to AgentHandle");
-    }
-    if !synced && let Ok(mut guard) = PENDING_CONVERSATION_IDS.lock() {
-        guard.insert(agent_id, ctx.session.session_id.clone());
-    }
+    // NOTE: Previously this function synced `ctx.session.session_id` into the
+    // agent's `conversation_id` field.  That was incorrect — `session_id` is
+    // the save-directory basename (e.g. "fixed_run_3"), NOT a real conversation
+    // handle.  The conversation_id must be set explicitly by the caller via
+    // `AgentHandle::set_conversation_id` or `AgentConfig::conversation_id`.
     hook_runner.run_on_session_start(&ctx);
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! in a global `RwLock<HashMap>` keyed by agent ID. See the module-level docs
 //! in `runtime/mod.rs` for the rationale behind global state.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 /// Opaque agent identifier returned by the runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,9 +31,8 @@ pub(crate) struct AgentBridgeState {
     /// Interactive confirmation handler for `NeedsConfirmation` policies.
     pub(crate) policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     /// Shared key-value state persisted across tool calls for this agent.
-    pub(crate) tool_state: Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
-    /// Shared conversation/session identifier synced from Python side.
-    pub(crate) conversation_id: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) tool_state:
+        Arc<std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>>,
 }
 
 /// Single global registry of per-agent bridge state, keyed by agent ID.

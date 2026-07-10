@@ -147,7 +147,9 @@ fn live_streaming_completion_metadata() {
 
             // ChatResult carries usage and structured output alongside text
             if let Some(usage) = result.usage() {
+                // NOLINT: test assertion — zero fallback makes the assert fail with a clear message
                 assert!(usage.total_token_count.unwrap_or(0) > 0, "Expected non-zero total tokens");
+                // NOLINT: test assertion — zero fallback makes the assert fail with a clear message
                 assert!(usage.prompt_token_count.unwrap_or(0) > 0, "Expected non-zero prompt tokens");
             } else {
                 eprintln!("Warning: usage metadata is None (known localharness issue with structured outputs)");

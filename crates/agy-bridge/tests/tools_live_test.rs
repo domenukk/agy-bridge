@@ -32,6 +32,7 @@ impl RustTool for GetDeviceSerial {
     const NAME: &'static str = "get_device_serial";
     const DESCRIPTION: &'static str = "Returns the serial number for a device.";
 
+    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
     #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
@@ -68,6 +69,7 @@ impl RustTool for CheckBuildStatus {
     const NAME: &'static str = "check_build_status";
     const DESCRIPTION: &'static str = "Checks the status of a build job.";
 
+    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
     #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
@@ -113,6 +115,7 @@ impl RustTool for AddNumbers {
     const NAME: &'static str = "add_numbers";
     const DESCRIPTION: &'static str = "Adds two numbers together.";
 
+    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
     #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,

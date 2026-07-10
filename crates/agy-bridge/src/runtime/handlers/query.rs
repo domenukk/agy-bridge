@@ -47,6 +47,7 @@ pub(in crate::runtime) fn handle_get_history(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(agent_id = ?agent_id, "get_history reply receiver dropped (not found)");
@@ -132,6 +133,7 @@ pub(in crate::runtime) fn handle_get_turn_count(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(agent_id = ?agent_id, "get_turn_count reply receiver dropped (not found)");
@@ -203,6 +205,7 @@ fn handle_get_usage_impl(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(agent_id = ?agent_id, label, "usage reply receiver dropped (not found)");
@@ -256,6 +259,7 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(agent_id = ?agent_id, "get_compaction_indices reply receiver dropped (not found)");
@@ -304,6 +308,7 @@ pub(in crate::runtime) fn handle_get_last_response(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(agent_id = ?agent_id, "get_last_response reply receiver dropped (not found)");
@@ -355,6 +360,7 @@ pub(in crate::runtime) fn handle_is_idle(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(agent_id = ?agent_id, "is_idle reply receiver dropped (not found)");

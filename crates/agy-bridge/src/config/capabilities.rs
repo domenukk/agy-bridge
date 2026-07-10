@@ -112,6 +112,24 @@ impl BuiltinTools {
             Self::Finish => "finish",
         }
     }
+
+    /// Human-readable description of this builtin tool.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::ListDir => "List files and subdirectories.",
+            Self::SearchDir => "Regex search within directory contents.",
+            Self::FindFile => "Find files by name pattern.",
+            Self::ViewFile => "Read file contents.",
+            Self::CreateFile => "Create a new file.",
+            Self::EditFile => "Edit an existing file.",
+            Self::RunCommand => "Execute a shell command.",
+            Self::AskQuestion => "Ask the user a question.",
+            Self::StartSubagent => "Spawn a subagent.",
+            Self::GenerateImage => "Generate images from text prompts.",
+            Self::Finish => "Signal task completion.",
+        }
+    }
 }
 
 impl std::fmt::Display for BuiltinTools {

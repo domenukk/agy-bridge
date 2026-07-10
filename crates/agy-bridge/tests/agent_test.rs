@@ -26,13 +26,21 @@ impl MockRuntime {
     }
 }
 
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl agy_bridge::agent::Runtime for MockRuntime {
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn create_agent(
         &self,
         _config: AgentConfig,
-    ) -> Result<agy_bridge::agent::AgentId, Error> {
-        Ok(1)
+    ) -> Result<(agy_bridge::agent::AgentId, Vec<agy_bridge::AvailableTool>), Error> {
+        Ok((
+            1,
+            vec![agy_bridge::AvailableTool {
+                name: "mock_tool".to_owned(),
+                description: "A mock tool for testing.".to_owned(),
+                parameter_schema: serde_json::Value::Null,
+                source: agy_bridge::ToolSource::Custom,
+            }],
+        ))
     }
 
     async fn chat(
@@ -262,5 +270,27 @@ async fn test_conversation_id_state_restoration() {
         agent.conversation_id(),
         Some("existing-session-123".to_owned())
     );
+    agent.shutdown().await.unwrap();
+}
+
+/// Verify that `available_tools()` returns the tool names from the runtime.
+#[tokio::test]
+async fn test_available_tools_from_runtime() {
+    let runtime = Arc::new(MockRuntime::new());
+    let config = AgentConfig::default();
+
+    let agent = agy_bridge::agent::AgentHandle::new(runtime, config, None, None, None)
+        .await
+        .unwrap();
+
+    let tools = agent.available_tools();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "mock_tool");
+    assert_eq!(tools[0].source, agy_bridge::ToolSource::Custom);
+    assert!(!tools[0].description.is_empty());
+
+    let names = agent.available_tool_names();
+    assert_eq!(names, vec!["mock_tool"]);
+
     agent.shutdown().await.unwrap();
 }

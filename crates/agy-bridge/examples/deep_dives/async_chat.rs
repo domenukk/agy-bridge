@@ -129,6 +129,7 @@ impl AsyncChatRoom {
             futures::future::join_all(tasks),
         )
         .await
+        // NOLINT: if-condition checking timeout result — value is not needed, only the timeout status
         .is_err()
         {
             eprintln!("  ⚠ Discussion timed out after {DISCUSSION_TIMEOUT_SECS}s");

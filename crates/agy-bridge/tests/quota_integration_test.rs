@@ -31,6 +31,7 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     buf_reader: &mut BufReader<R>,
 ) -> Option<ParsedHttpRequest> {
     let mut request_line = String::new();
+    // NOLINT: test mock server helper — malformed request means caller error, return None
     buf_reader.read_line(&mut request_line).await.ok()?;
     let request_line = request_line.trim_end().to_string();
     if request_line.is_empty() {
@@ -40,6 +41,7 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
+        // NOLINT: test mock server helper — malformed request means caller error, return None
         buf_reader.read_line(&mut line).await.ok()?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -47,12 +49,14 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
         }
         let lower = trimmed.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
+            // NOLINT: test helper — invalid content-length defaults to zero (no body)
             content_length = val.trim().parse().unwrap_or(0);
         }
     }
 
     if content_length > 0 {
         let mut body_buf = vec![0u8; content_length];
+        // NOLINT: test mock server helper — incomplete body means malformed request, return None
         buf_reader.read_exact(&mut body_buf).await.ok()?;
     }
 
@@ -244,6 +248,7 @@ fn agent_retries_on_quota_errors() {
         eprintln!("Chat result: {result:?}");
 
         assert!(
+            // NOLINT: test assertion \u2014 checking that chat succeeds after quota retry
             result.is_ok(),
             "Expected chat to succeed after retry, got: {result:?}"
         );

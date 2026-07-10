@@ -54,6 +54,7 @@ async fn run_py_async_op<T, F, E>(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(
@@ -103,6 +104,7 @@ async fn run_py_async_op<T, F, E>(
                         duration: dur,
                         operation: format!("{op_label}(agent={agent_id})"),
                     }))
+                    // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
                     .is_err()
                 {
                     tracing::warn!(
@@ -157,7 +159,7 @@ pub(in crate::runtime) async fn handle_cancel(
             let conv = agent.getattr("conversation")?;
             conv.call_method0("cancel")
         },
-        |_| (),
+        |_py_none| (),
     )
     .await;
 }
@@ -177,7 +179,7 @@ pub(in crate::runtime) async fn handle_wait_for_idle(
             let conv = agent.getattr("conversation")?;
             conv.call_method0("wait_for_idle")
         },
-        |_| (),
+        |_py_none| (),
     )
     .await;
 }
@@ -193,6 +195,7 @@ pub(in crate::runtime) fn handle_clear_history(
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
             }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
             .is_err()
         {
             tracing::warn!(
@@ -236,7 +239,7 @@ pub(in crate::runtime) async fn handle_send(
             let decoded = decode_prompt_py(py, &prompt)?;
             conv.call_method1("send", (decoded,))
         },
-        |_| (),
+        |_py_none| (),
     )
     .await;
 }
@@ -256,7 +259,7 @@ pub(in crate::runtime) async fn handle_signal_idle(
             let conv = agent.getattr("conversation")?;
             conv.call_method0("signal_idle")
         },
-        |_| (),
+        |_py_none| (),
     )
     .await;
 }
@@ -310,7 +313,7 @@ pub(in crate::runtime) async fn handle_delete(
             let conv = agent.getattr("conversation")?;
             conv.call_method0("delete")
         },
-        |_| (),
+        |_py_none| (),
     )
     .await;
 }
@@ -331,7 +334,7 @@ pub(in crate::runtime) async fn handle_disconnect(
             let conv = agent.getattr("conversation")?;
             conv.call_method0("disconnect")
         },
-        |_| (),
+        |_py_none| (),
     )
     .await;
 }

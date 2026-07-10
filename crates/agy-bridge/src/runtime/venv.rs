@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
     let sys = py.import("sys")?;
 
+    // NOLINT: `.ok()` — env var not set is expected; falls back to cwd below
     let workspace_root = match std::env::var("CARGO_MANIFEST_DIR").ok() {
         Some(dir) if !dir.is_empty() => discover_venv_root(std::path::Path::new(&dir)),
         _ => {

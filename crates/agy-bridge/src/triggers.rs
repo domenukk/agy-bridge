@@ -584,6 +584,7 @@ mod tests {
         let json = r#"{"Every":{"interval":0.5}}"#;
         let result = serde_json::from_str::<TriggerConfig>(json);
         assert!(
+            // NOLINT: .is_err() in assert — verifying deserialization correctly rejects invalid input
             result.is_err(),
             "Sub-second interval should be rejected during deserialization"
         );

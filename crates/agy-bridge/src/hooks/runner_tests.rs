@@ -167,6 +167,7 @@ fn hook_runner_default_is_empty() {
 
 #[test]
 fn hook_callback_debug_format() {
+    // NOLINT: |_| closure arg intentionally unused — mock callback for Debug format test
     let cb = HookCallback::PreTurn(Box::new(|_| {}));
     let dbg = format!("{cb:?}");
     assert_eq!(dbg, "HookCallback::pre_turn");
@@ -593,6 +594,7 @@ fn transform_tool_input_panic_recovery() {
 
 #[test]
 fn transform_callback_debug_format() {
+    // NOLINT: |_| closure arg intentionally unused — mock callback for Debug format test
     let cb = HookCallback::TransformToolInput(Box::new(|_| None));
     let dbg = format!("{cb:?}");
     assert_eq!(dbg, "HookCallback::transform_tool_input");

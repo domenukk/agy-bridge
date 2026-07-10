@@ -54,16 +54,46 @@ impl ToolAwareMockRuntime {
     }
 }
 
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl Runtime for ToolAwareMockRuntime {
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
-    async fn create_agent(&self, _config: AgentConfig) -> Result<AgentId, Error> {
+    async fn create_agent(
+        &self,
+        _config: AgentConfig,
+    ) -> Result<(AgentId, Vec<crate::tools::AvailableTool>), Error> {
         if self.fail_create.load(Ordering::SeqCst) {
             return Err(Error::BackendError {
                 message: "invalid config: missing system instructions".to_owned(),
             });
         }
         let id = NEXT_AGENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(id)
+        let tools = vec![
+            crate::tools::AvailableTool {
+                name: "run_command".to_owned(),
+                description: "Execute a shell command.".to_owned(),
+                parameter_schema: serde_json::Value::Null,
+                source: crate::tools::ToolSource::Builtin,
+            },
+            crate::tools::AvailableTool {
+                name: "view_file".to_owned(),
+                description: "Read file contents.".to_owned(),
+                parameter_schema: serde_json::Value::Null,
+                source: crate::tools::ToolSource::Builtin,
+            },
+            crate::tools::AvailableTool {
+                name: "add_numbers".to_owned(),
+                description: "Adds two numbers together.".to_owned(),
+                parameter_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"}
+                    },
+                    "required": ["x", "y"]
+                }),
+                source: crate::tools::ToolSource::Custom,
+            },
+        ];
+        Ok((id, tools))
     }
 
     /// # Panics
@@ -316,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ffi_session_start_updates_conversation_id() {
+    async fn ffi_session_start_does_not_inject_session_id_as_conversation_id() {
         let rt = Arc::new(ToolAwareMockRuntime::new());
         let agent = AgentHandle::new(rt, test_config(), None, None, None)
             .await
@@ -324,7 +354,11 @@ mod tests {
 
         assert!(agent.conversation_id().is_none());
 
-        // Simulate the dispatch_rust_hook callback for on_session_start
+        // Simulate the dispatch_rust_hook callback for on_session_start.
+        // Previously this would inject session_id as conversation_id, but
+        // session_id is the save-directory basename (e.g. "fixed_run_3"),
+        // NOT a real conversation handle.  The fix ensures conversation_id
+        // stays None unless explicitly set via set_conversation_id().
         let ctx = crate::hooks::OnSessionStartContext {
             session: crate::hooks::SessionContext {
                 session_id: "dynamically-generated-session-123".to_owned(),
@@ -349,9 +383,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            agent.conversation_id().as_deref(),
-            Some("dynamically-generated-session-123")
+        // conversation_id must remain None — session_id is NOT a conversation handle
+        assert!(
+            agent.conversation_id().is_none(),
+            "on_session_start must NOT inject session_id as conversation_id"
         );
 
         agent.shutdown().await.expect("shutdown should succeed");
@@ -513,6 +548,7 @@ mod tests {
             type Params = Params;
             const NAME: &'static str = "test_tool";
             const DESCRIPTION: &'static str = "A test tool";
+            // NOLINT: forward-compat with future clippy lint
             #[allow(unknown_lints, clippy::unused_async_trait_impl)]
             async fn call(
                 &self,
@@ -980,5 +1016,94 @@ mod tests {
 
         b.shutdown().await.expect("shutdown b");
         c.shutdown().await.expect("shutdown c");
+    }
+
+    // ── available_tools() tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn available_tools_populated_at_creation() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(rt, test_config(), None, None, None)
+            .await
+            .expect("create agent");
+
+        let tools = agent.available_tools();
+        assert!(!tools.is_empty(), "available_tools should not be empty");
+
+        let names = agent.available_tool_names();
+        assert!(
+            names.contains(&"add_numbers"),
+            "should contain mock tool 'add_numbers', got: {names:?}"
+        );
+        assert!(
+            names.contains(&"run_command"),
+            "should contain mock tool 'run_command', got: {names:?}"
+        );
+        assert!(
+            names.contains(&"view_file"),
+            "should contain mock tool 'view_file', got: {names:?}"
+        );
+
+        // Verify source tagging.
+        let custom = tools
+            .iter()
+            .find(|t| t.name == "add_numbers")
+            .expect("add_numbers tool");
+        assert_eq!(custom.source, crate::tools::ToolSource::Custom);
+        assert!(
+            !custom.description.is_empty(),
+            "custom tool should have description"
+        );
+
+        let builtin = tools
+            .iter()
+            .find(|t| t.name == "run_command")
+            .expect("run_command tool");
+        assert_eq!(builtin.source, crate::tools::ToolSource::Builtin);
+        assert!(
+            !builtin.description.is_empty(),
+            "builtin tool should have description"
+        );
+
+        agent.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn available_tools_survives_chat() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("create agent");
+
+        let _response = agent.chat("Hello").await.expect("chat");
+
+        // available_tools must still be accessible after chat
+        let tools = agent.available_tools();
+        assert!(
+            !tools.is_empty(),
+            "available_tools should persist after chat"
+        );
+
+        agent.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn subagent_has_own_available_tools() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let parent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("create parent");
+
+        let child = parent
+            .spawn_subagent(test_config(), None)
+            .await
+            .expect("spawn subagent");
+
+        // Both parent and child should have available tools
+        assert!(!parent.available_tools().is_empty());
+        assert!(!child.available_tools().is_empty());
+
+        child.shutdown().await.expect("shutdown child");
+        parent.shutdown().await.expect("shutdown parent");
     }
 }

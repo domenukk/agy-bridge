@@ -16,7 +16,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.5"
+agy-bridge = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -63,8 +63,6 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
-    // bridge.agent() returns an AgentBuilder — chain .tools() / .hooks()
-    // before .await, or .await directly for a bare agent.
     let agent = bridge
         .agent(
             AgentConfig::builder()
@@ -188,6 +186,29 @@ let registry = ToolRegistry::new().with_tool(SearchTool);
 assert_eq!(registry.definitions().len(), 1);
 ```
 
+#### Tool Discovery
+
+After agent creation, inspect all available tools — custom Rust tools,
+MCP server tools, and SDK builtins — with source, description, and schema:
+
+```rust
+use agy_bridge::{AgyBridge, ToolSource};
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+    let agent = bridge.default_agent().await?;
+
+    for tool in agent.available_tools() {
+        println!("  [{}] {} — {}", tool.source, tool.name, tool.description);
+    }
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
 ### MCP Integration
 
 Connect external [MCP](https://modelcontextprotocol.io/) servers:
@@ -207,9 +228,9 @@ let config = AgentConfig::builder().mcp_servers([server]).build();
 assert_eq!(config.mcp_servers.len(), 1);
 ```
 
-### Hooks and Policies
+### Hooks
 
-Control agent behavior with hooks and a declarative policy system:
+Register lifecycle callbacks for logging, safety gates, and middleware:
 
 ```rust
 use agy_bridge::{
@@ -223,7 +244,6 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
-    // 1. Register lifecycle hooks
     let mut hooks = Hooks::new();
 
     hooks.on_pre_turn("turn_logger", |ctx| {
@@ -238,12 +258,8 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
         }
     });
 
-    // 2. Create the agent configuration
-    let config = AgentConfig::builder().build();
-
-    // 3. Pass hooks to the agent builder
     let agent = bridge
-        .agent(config)
+        .agent(AgentConfig::builder().build())
         .hooks(hooks)
         .await?;
 
@@ -255,17 +271,22 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 }
 ```
 
+### Policies
+
+Declarative tool access control — first matching rule wins:
+
 ```rust
 use agy_bridge::policies::{PolicyRule, PolicySet};
 
-let mut policies = PolicySet::new();
-policies.push(PolicyRule::allow("view_file")).unwrap();
-policies.push(PolicyRule::deny("run_command")).unwrap();
-policies.push(PolicyRule::DenyAll).unwrap();
+let policies = PolicySet::new()
+    .with_rule(PolicyRule::allow("view_file"))?
+    .with_rule(PolicyRule::deny("run_command"))?
+    .with_rule(PolicyRule::deny_all())?;
 
 assert!(policies.evaluate("view_file").is_allowed());
 assert!(policies.evaluate("run_command").is_denied());
 assert!(policies.evaluate("unknown_tool").is_denied());
+# Ok::<(), agy_bridge::Error>(())
 ```
 
 ### Triggers
@@ -297,7 +318,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     );
 
     let config = AgentConfig::builder()
-        .triggers(vec![periodic, file_watch])
+        .triggers([periodic, file_watch])
         .build();
 
     let agent = bridge.agent(config).await?;

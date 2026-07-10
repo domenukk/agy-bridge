@@ -33,13 +33,18 @@ pub type AgentId = u64;
 ///
 /// This allows unit tests to inject a mock runtime without requiring a live
 /// Python interpreter. The real implementation will call through to `PyO3`.
+// NOLINT: async_fn_in_trait is intentional — Runtime is not object-safe by design
 #[expect(
     async_fn_in_trait,
     reason = "Runtime is not object-safe by design; callers always know the concrete type"
 )]
 pub trait Runtime: Send + Sync {
-    /// Create an agent from the given config, returning its ID.
-    async fn create_agent(&self, config: AgentConfig) -> Result<AgentId, Error>;
+    /// Create an agent from the given config, returning its ID and the list
+    /// of all available tools (custom, MCP, and builtin) with metadata.
+    async fn create_agent(
+        &self,
+        config: AgentConfig,
+    ) -> Result<(AgentId, Vec<crate::tools::AvailableTool>), Error>;
 
     /// Send a chat message to the agent, returning a streaming response handle.
     ///
@@ -175,6 +180,9 @@ pub struct AgentHandle<R: Runtime + 'static> {
     conversation_id: Arc<Mutex<Option<String>>>,
     is_started: AtomicBool,
     is_shutdown: AtomicBool,
+    /// All tools available to this agent — custom Rust tools, MCP tools, and
+    /// SDK builtins — with metadata about source, description, and schema.
+    available_tools: Vec<crate::tools::AvailableTool>,
     /// Shared state from the last completed chat response, used to surface
     /// `get_last_structured_output()` without round-tripping to Python.
     ///
@@ -200,21 +208,9 @@ impl<R: Runtime> AgentHandle<R> {
         hook_runner: Option<Arc<crate::hooks::Hooks>>,
         policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Self, Error> {
+        // NOLINT: empty string default is intentional — agents without an API key share one quota bucket
         let quota_key = config.effective_api_key().unwrap_or_default();
         let quota_state = runtime.quota_registry().state_for_key(&quota_key);
-
-        let mut config = config;
-        let has_session_start = config
-            .hooks
-            .iter()
-            .any(|h| h.point == crate::hooks::HookPoint::OnSessionStart);
-        if !has_session_start {
-            config.hooks.push(crate::hooks::HookEntry {
-                name: "builtin_session_sync".to_string(),
-                point: crate::hooks::HookPoint::OnSessionStart,
-                callback_id: "builtin_session_sync".to_string(),
-            });
-        }
 
         let _guard = crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await;
 
@@ -234,12 +230,12 @@ impl<R: Runtime> AgentHandle<R> {
             }
         }
 
-        let id = runtime.create_agent(config.clone()).await?;
-        tracing::info!(agent_id = id, "Agent created successfully");
+        let (agent_id, available_tools) = runtime.create_agent(config.clone()).await?;
+        tracing::info!(agent_id, "Agent created successfully");
 
         let conversation_id = match Self::setup_bridge_state(
             &runtime,
-            id,
+            agent_id,
             &config,
             registry.as_ref(),
             effective_hook_runner,
@@ -257,7 +253,7 @@ impl<R: Runtime> AgentHandle<R> {
             }
             Err(e) => {
                 tracing::error!(
-                    agent_id = id,
+                    agent_id,
                     error = %e,
                     "INITIALIZING_HOOK_RUNNER mutex poisoned during cleanup — \
                      stale hook runner may persist"
@@ -266,7 +262,7 @@ impl<R: Runtime> AgentHandle<R> {
         }
 
         Ok(Self {
-            id,
+            id: agent_id,
             runtime,
             config,
             quota_state,
@@ -275,6 +271,7 @@ impl<R: Runtime> AgentHandle<R> {
             conversation_id,
             is_started: AtomicBool::new(true),
             is_shutdown: AtomicBool::new(false),
+            available_tools,
             last_shared_state: Mutex::new(None),
         })
     }
@@ -288,21 +285,13 @@ impl<R: Runtime> AgentHandle<R> {
         policy_handler: Option<&Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Arc<Mutex<Option<String>>>, Error> {
         let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
-        let mut initial_conv_id = config.conversation_id.clone();
-        if initial_conv_id.is_none()
-            && let Ok(mut guard) = crate::runtime::PENDING_CONVERSATION_IDS.lock()
-            && let Some(pending_id) = guard.remove(&id)
-        {
-            initial_conv_id = Some(pending_id);
-        }
-        let conversation_id = Arc::new(Mutex::new(initial_conv_id));
+        let conversation_id = Arc::new(Mutex::new(config.conversation_id.clone()));
         let bridge_entry = crate::runtime::AgentBridgeState {
             registry: registry.map(Arc::clone),
             hook_runner: Some(effective_hook_runner),
             policies: policies_set,
             policy_handler: policy_handler.map(Arc::clone),
             tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            conversation_id: Arc::clone(&conversation_id),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
             Ok(mut map) => {
@@ -351,6 +340,7 @@ impl<R: Runtime> AgentHandle<R> {
         }
 
         let content = content.into();
+        // NOLINT: zero retries is the correct default — no automatic retry unless explicitly configured
         let max_retries = self.config.max_quota_retries.unwrap_or(0);
 
         let handle = 'retry: {
@@ -427,6 +417,7 @@ impl<R: Runtime> AgentHandle<R> {
                     "conversation_id mutex poisoned"
                 );
             })
+            // NOLINT: error already logged via inspect_err above; .ok() converts to Option for the return type
             .ok()
             .and_then(|guard| guard.clone())
     }
@@ -466,6 +457,30 @@ impl<R: Runtime> AgentHandle<R> {
     #[must_use]
     pub const fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Return all tools available to this agent, with metadata.
+    ///
+    /// Each [`AvailableTool`](crate::tools::AvailableTool) includes the tool's
+    /// name, description, JSON parameter schema, and source tag
+    /// ([`Builtin`](crate::tools::ToolSource::Builtin),
+    /// [`Custom`](crate::tools::ToolSource::Custom), or
+    /// [`Mcp`](crate::tools::ToolSource::Mcp)).
+    ///
+    /// The list is assembled at agent creation time and is immutable for
+    /// the agent's lifetime.
+    #[must_use]
+    pub fn available_tools(&self) -> &[crate::tools::AvailableTool] {
+        &self.available_tools
+    }
+
+    /// Convenience accessor: returns just the tool names.
+    #[must_use]
+    pub fn available_tool_names(&self) -> Vec<&str> {
+        self.available_tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect()
     }
 
     /// Interrupt the active chat prompt execution.
@@ -603,6 +618,7 @@ impl<R: Runtime> AgentHandle<R> {
                     "last_shared_state mutex poisoned in get_last_structured_output"
                 );
             })
+            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
             .ok()?;
         let state = guard
             .as_ref()?
@@ -614,6 +630,7 @@ impl<R: Runtime> AgentHandle<R> {
                     "ChatResponseSharedState mutex poisoned in get_last_structured_output"
                 );
             })
+            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
             .ok()?;
         state.structured_output.clone()
     }
@@ -642,6 +659,7 @@ impl<R: Runtime> AgentHandle<R> {
                     "last_shared_state mutex poisoned in get_last_usage"
                 );
             })
+            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
             .ok()?;
         let state = guard
             .as_ref()?
@@ -653,6 +671,7 @@ impl<R: Runtime> AgentHandle<R> {
                     "ChatResponseSharedState mutex poisoned in get_last_usage"
                 );
             })
+            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
             .ok()?;
         state.usage.clone()
     }
@@ -672,6 +691,7 @@ impl<R: Runtime> AgentHandle<R> {
 
         let content = content.into();
 
+        // NOLINT: zero retries is the correct default — no automatic retry unless explicitly configured
         let max_retries = self.config.max_quota_retries.unwrap_or(0);
 
         for attempt in 0..=max_retries {
@@ -841,14 +861,18 @@ impl<R: Runtime> Drop for AgentHandle<R> {
         } else {
             // Agent was never started (e.g. creation failed). Clean up
             // any partial bridge state that might have been registered.
-            if let Ok(mut map) = crate::runtime::bridge_state().write() {
-                map.remove(&self.id);
-            } else {
-                tracing::error!(
-                    agent_id = self.id,
-                    "BRIDGE_STATE RwLock poisoned during Drop — \
-                     bridge state entry for this agent may leak"
-                );
+            match crate::runtime::bridge_state().write() {
+                Ok(mut map) => {
+                    map.remove(&self.id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = self.id,
+                        error = %e,
+                        "BRIDGE_STATE RwLock poisoned during Drop — \
+                         bridge state entry for this agent may leak"
+                    );
+                }
             }
         }
     }

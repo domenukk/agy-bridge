@@ -23,6 +23,7 @@ fn live_agent_invalid_config_returns_error() {
                 Ok(agent) => {
                     let result = agent.chat("PING").await;
                     assert!(
+                        // NOLINT: test assertion — checking that invalid config produces an error
                         result.is_err(),
                         "Expected an error due to invalid config, got success"
                     );
@@ -64,6 +65,7 @@ fn live_agent_timeout_triggers() {
                 Ok(agent) => {
                     let result = agent.chat("Write a very long poem about the sea.").await;
                     assert!(
+                        // NOLINT: test assertion — checking that timeout produces an error
                         result.is_err(),
                         "Expected an error due to timeout, got success"
                     );
@@ -99,9 +101,11 @@ fn live_error_recovery_force_python_error() {
                 .build();
 
             let result = bridge.agent(config).await;
+            // NOLINT: test intentionally handles both Ok/Err paths to validate error recovery
             if let Ok(agent) = result {
                 let chat_result = agent.chat("hi").await;
                 assert!(
+                    // NOLINT: test assertion — checking that forced error produces an error
                     chat_result.is_err(),
                     "Expected chat to fail with python error"
                 );

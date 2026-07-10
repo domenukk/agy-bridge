@@ -48,9 +48,12 @@ pub use hooks::{HookCallback, HookEntry, HookPoint, HookResult, HookSet, Hooks};
 /// their dependency list.
 pub use llm_tool_macros::llm_tool;
 pub use policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet};
-pub use runtime::RuntimeConfig;
+pub use runtime::{BackendLogLevel, RuntimeConfig};
 pub use streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk};
-pub use tools::{RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
+pub use tools::{
+    AvailableTool, RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry,
+    ToolSource,
+};
 pub use triggers::{TriggerConfig, TriggerEntry};
 pub use types::{ConversationMessage, MessageRole, Step, UsageMetadata};
 
@@ -75,8 +78,12 @@ pub mod prelude {
         error::Error,
         hooks::{HookPoint, HookResult, Hooks},
         policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet},
+        runtime::BackendLogLevel,
         streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk},
-        tools::{RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry},
+        tools::{
+            AvailableTool, RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput,
+            ToolRegistry, ToolSource,
+        },
         triggers::{TriggerConfig, TriggerEntry},
         types::{ConversationMessage, MessageRole, Step, UsageMetadata},
     };
@@ -111,6 +118,7 @@ use std::sync::Arc;
 /// ```
 /// let new_vars = agy_bridge::load_dotenv();
 /// // OnceLock-cached: safe to call multiple times, only loads .env once.
+/// // NOLINT: example code in documentation — `let _ =` demonstrates the return value exists
 /// let _ = new_vars.len();
 /// ```
 pub fn load_dotenv() -> &'static std::collections::HashMap<String, String> {
@@ -296,6 +304,16 @@ impl AgyBridgeBuilder {
     #[must_use]
     pub fn inter_agent_delay(mut self, delay: std::time::Duration) -> Self {
         self.config.inter_agent_delay = delay;
+        self
+    }
+
+    /// Set the backend runtime log verbosity.
+    ///
+    /// Defaults to [`BackendLogLevel::Warn`]. Set to [`BackendLogLevel::Info`]
+    /// or [`BackendLogLevel::Debug`] for verbose protocol-level diagnostics.
+    #[must_use]
+    pub fn backend_log_level(mut self, level: runtime::BackendLogLevel) -> Self {
+        self.config.backend_log_level = level;
         self
     }
 

@@ -21,6 +21,7 @@ impl RustTool for SafeTool {
     const NAME: &'static str = "safe_tool";
     const DESCRIPTION: &'static str = "A safe no-op tool that returns a confirmation.";
 
+    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
     #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,

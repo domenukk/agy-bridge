@@ -61,6 +61,45 @@ impl PolicyRule {
         Self::Deny(tool.into())
     }
 
+    /// Create an [`AllowAll`](Self::AllowAll) rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use agy_bridge::policies::PolicyRule;
+    /// let rule = PolicyRule::allow_all();
+    /// ```
+    #[must_use]
+    pub const fn allow_all() -> Self {
+        Self::AllowAll
+    }
+
+    /// Create a [`DenyAll`](Self::DenyAll) rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use agy_bridge::policies::PolicyRule;
+    /// let rule = PolicyRule::deny_all();
+    /// ```
+    #[must_use]
+    pub const fn deny_all() -> Self {
+        Self::DenyAll
+    }
+
+    /// Create a [`WorkspaceOnly`](Self::WorkspaceOnly) rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use agy_bridge::policies::PolicyRule;
+    /// let rule = PolicyRule::workspace_only(["/my/project"]);
+    /// ```
+    #[must_use]
+    pub fn workspace_only(paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        Self::WorkspaceOnly(paths.into_iter().map(Into::into).collect())
+    }
+
     /// Human-readable description used for logging and diagnostics.
     #[must_use]
     pub fn description(&self) -> String {
@@ -675,6 +714,71 @@ mod tests {
         ]);
         assert!(set.evaluate("view_file").is_allowed());
         assert!(set.evaluate("run_command").is_denied());
+    }
+
+    #[test]
+    fn evaluate_ask_user_returns_needs_confirmation() {
+        let set = PolicySet::from(vec![
+            super::ask_user("run_command", "confirm_run_command"),
+            PolicyRule::allow_all(),
+        ]);
+        let decision = set.evaluate("run_command");
+        assert!(decision.needs_confirmation());
+        assert!(!decision.is_allowed());
+        assert!(!decision.is_denied());
+        // Other tools fall through to AllowAll.
+        assert!(set.evaluate("view_file").is_allowed());
+    }
+
+    #[test]
+    fn evaluate_ask_user_handler_id_preserved() {
+        let set = PolicySet::from(vec![super::ask_user("rm", "my_handler")]);
+        match set.evaluate("rm") {
+            PolicyDecision::NeedsConfirmation { handler_id } => {
+                assert_eq!(handler_id, "my_handler");
+            }
+            other => panic!("expected NeedsConfirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_run_command_helper() {
+        let rule = super::confirm_run_command();
+        assert_eq!(
+            rule,
+            PolicyRule::AskUser {
+                tool: "run_command".to_owned(),
+                handler_id: "confirm_run_command".to_owned(),
+            }
+        );
+    }
+
+    // ── Builder method tests ──────────────────────────────────────
+
+    #[test]
+    fn builder_allow_all() {
+        assert_eq!(PolicyRule::allow_all(), PolicyRule::AllowAll);
+    }
+
+    #[test]
+    fn builder_deny_all() {
+        assert_eq!(PolicyRule::deny_all(), PolicyRule::DenyAll);
+    }
+
+    #[test]
+    fn builder_workspace_only() {
+        let rule = PolicyRule::workspace_only(["/ws/a", "/ws/b"]);
+        assert_eq!(
+            rule,
+            PolicyRule::WorkspaceOnly(vec![PathBuf::from("/ws/a"), PathBuf::from("/ws/b"),])
+        );
+    }
+
+    #[test]
+    fn builder_allow_deny_accept_str() {
+        // Verify impl Into<String> works with &str.
+        let _ = PolicyRule::allow("view_file");
+        let _ = PolicyRule::deny("run_command");
     }
 
     #[test]

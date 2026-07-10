@@ -256,6 +256,7 @@ impl AgentConfig {
             .and_then(|g| g.models.default.api_key.clone())
             .or_else(|| self.gemini.as_ref().and_then(|g| g.api_key.clone()))
             .or_else(|| self.api_key.clone())
+            // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
     }
 
@@ -840,6 +841,7 @@ mod tests {
         // If GEMINI_API_KEY happens to be set, we verify it's returned.
         let config = AgentConfig::builder().build();
         let result = config.effective_api_key();
+        // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
         match std::env::var("GEMINI_API_KEY").ok() {
             Some(env_key) => assert_eq!(result.as_deref(), Some(env_key.as_str())),
             None => assert!(result.is_none()),

@@ -48,8 +48,11 @@ async fn forward_step_to_writer(
     let usage_summary = step.usage_metadata.as_ref().map(|u| {
         format!(
             "{}p/{}o/{}t",
+            // NOLINT: zero is the correct default for missing token counts
             u.prompt_token_count.unwrap_or(0),
+            // NOLINT: zero is the correct default for missing token counts
             u.candidates_token_count.unwrap_or(0),
+            // NOLINT: zero is the correct default for missing token counts
             u.thoughts_token_count.unwrap_or(0),
         )
     });

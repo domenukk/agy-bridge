@@ -105,6 +105,7 @@ fn test_policy_set_validated_from_rejects_invalid() {
         PolicyRule::DenyAll,
     ]);
     assert!(
+        // NOLINT: test assertion \u2014 checking that validation rejects empty tool name
         result.is_err(),
         "Expected validation error for empty tool name"
     );

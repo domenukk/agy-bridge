@@ -187,6 +187,7 @@ pub(crate) fn classify_py_error(py: Python<'_>, err: &PyErr) -> Error {
 fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     match py.import("google.antigravity.types") {
         Ok(types_mod) => {
+            // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
             if let Ok(conn_err_cls) = types_mod.getattr("AntigravityConnectionError")
                 && err.is_instance(py, &conn_err_cls)
             {
@@ -194,6 +195,7 @@ fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
                     message: err.to_string(),
                 });
             }
+            // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
             if let Ok(val_err_cls) = types_mod.getattr("AntigravityValidationError")
                 && err.is_instance(py, &val_err_cls)
             {
@@ -215,6 +217,7 @@ fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
 fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     match py.import("pydantic") {
         Ok(pydantic) => {
+            // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
             if let Ok(validation_err_cls) = pydantic.getattr("ValidationError")
                 && err.is_instance(py, &validation_err_cls)
             {
@@ -234,7 +237,9 @@ fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
 }
 
 fn check_builtin_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
+    // NOLINT: intentional fallthrough — if import fails, we skip the builtins check (logged in else)
     if let Ok(builtins) = py.import("builtins") {
+        // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
         if let Ok(import_err_cls) = builtins.getattr("ImportError")
             && err.is_instance(py, &import_err_cls)
         {

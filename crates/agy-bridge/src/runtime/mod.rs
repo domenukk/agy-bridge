@@ -54,8 +54,8 @@ pub(crate) mod venv;
 // Re-export items used by sibling modules and external crate consumers.
 pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state};
 pub(crate) use ffi_dispatch::{
-    CREATE_AGENT_HOOK_GUARD, INITIALIZING_HOOK_RUNNER, PENDING_CONVERSATION_IDS,
-    dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool,
+    CREATE_AGENT_HOOK_GUARD, INITIALIZING_HOOK_RUNNER, dispatch_rust_hook,
+    dispatch_rust_policy_confirm, dispatch_rust_tool,
 };
 
 /// Safety-net timeout for a single `send_command` round-trip.
@@ -107,9 +107,12 @@ pub fn default_chat_timeout() -> Duration {
 /// dispatched in `command_loop::run_async_command_loop`.
 pub(crate) enum PyCommand {
     /// Create a new agent with the given configuration dict as JSON.
+    ///
+    /// The reply carries both the agent ID and tool definitions discovered
+    /// by the Python SDK (Rust tools + MCP tools — builtins are added later).
     CreateAgent {
         config_json: String,
-        reply: oneshot::Sender<Result<AgentId, Error>>,
+        reply: oneshot::Sender<Result<(AgentId, Vec<handlers::agent::RawToolInfo>), Error>>,
     },
     /// Send a chat message to an agent.
     Chat {
@@ -210,6 +213,44 @@ pub(crate) enum PyCommand {
     },
 }
 
+/// Log verbosity for the agent backend runtime.
+///
+/// Controls the logging level of the underlying agent runtime. This is
+/// intentionally backend-agnostic — consumers should not need to know
+/// the implementation details of the runtime layer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendLogLevel {
+    /// Errors only.
+    Error,
+    /// Warnings and errors (default — matches upstream SDK behavior).
+    #[default]
+    Warn,
+    /// Informational messages (verbose — includes raw protocol traffic).
+    Info,
+    /// Full debug output.
+    Debug,
+}
+
+impl BackendLogLevel {
+    /// Return the lowercase string representation used by the Python side.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendLogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Configuration for the bridge runtime.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -226,6 +267,11 @@ pub struct RuntimeConfig {
     pub chat_timeout: Duration,
     /// Delay injected between successive chat commands to prevent burst requests.
     pub inter_agent_delay: Duration,
+    /// Backend runtime log verbosity.
+    ///
+    /// Defaults to `Warn`, matching the upstream SDK's default behavior.
+    /// Set to `Info` or `Debug` for verbose protocol-level diagnostics.
+    pub backend_log_level: BackendLogLevel,
 }
 
 impl Default for RuntimeConfig {
@@ -237,6 +283,7 @@ impl Default for RuntimeConfig {
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             chat_timeout,
             inter_agent_delay: DEFAULT_INTER_AGENT_DELAY,
+            backend_log_level: BackendLogLevel::default(),
         }
     }
 }
@@ -552,49 +599,115 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
     })
 }
 
+/// Compute which SDK builtin tools are active based on the agent's
+/// [`CapabilitiesConfig`].
+///
+/// - `enabled_tools: Some(list)` → only those tools are active.
+/// - `disabled_tools: Some(list)` → all tools minus the disabled ones.
+/// - Neither set → all builtin tools are active.
+fn compute_active_builtins(
+    config: &crate::config::AgentConfig,
+) -> Vec<crate::config::BuiltinTools> {
+    match config.capabilities.as_ref() {
+        Some(caps) if caps.enabled_tools.as_ref().is_some_and(|v| !v.is_empty()) => {
+            caps.enabled_tools.clone().unwrap_or_default()
+        }
+        Some(caps) if caps.enabled_tools.as_ref().is_some_and(Vec::is_empty) => {
+            // Explicitly empty = no builtins
+            Vec::new()
+        }
+        Some(caps) if caps.disabled_tools.is_some() => {
+            let disabled = caps.disabled_tools.as_ref().unwrap();
+            crate::config::BuiltinTools::all_tools()
+                .iter()
+                .filter(|t| !disabled.contains(t))
+                .cloned()
+                .collect()
+        }
+        _ => crate::config::BuiltinTools::all_tools().to_vec(),
+    }
+}
+
 impl crate::agent::Runtime for PythonRuntime {
     async fn create_agent(
         &self,
         config: crate::config::AgentConfig,
-    ) -> Result<crate::agent::AgentId, Error> {
-        // Report all available tools as requested by the user.
-        let mut all_tools = config.custom_tool_names();
-        if let Some(ref caps) = config.capabilities {
-            if let Some(ref builtins) = caps.enabled_tools {
-                all_tools.extend(builtins.iter().map(|b| b.as_sdk_name().to_string()));
-            } else if caps.disabled_tools.is_none() {
-                // Default is all tools
-                all_tools.extend(
-                    crate::config::capabilities::BuiltinTools::all_tools()
-                        .iter()
-                        .map(|b| b.as_sdk_name().to_string()),
+    ) -> Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error> {
+        // Serialize the AgentConfig and inject the runtime's backend log
+        // level so the Python init script can configure logging without
+        // needing a separate FFI parameter.
+        let config_json = {
+            let mut val = serde_json::to_value(&config).map_err(|e| Error::BackendError {
+                message: format!("Failed to serialize AgentConfig: {e}"),
+            })?;
+            if let serde_json::Value::Object(ref mut map) = val {
+                map.insert(
+                    "_backend_log_level".to_owned(),
+                    serde_json::Value::String(self.config.backend_log_level.as_str().to_owned()),
                 );
             }
-        } else {
-            all_tools.extend(
-                crate::config::capabilities::BuiltinTools::all_tools()
-                    .iter()
-                    .map(|b| b.as_sdk_name().to_string()),
-            );
-        }
-        tracing::info!(
-            "Agent starting with {} available tools: {:?}",
-            all_tools.len(),
-            all_tools
-        );
+            serde_json::to_string(&val).map_err(|e| Error::BackendError {
+                message: format!("Failed to re-serialize config JSON: {e}"),
+            })?
+        };
 
-        let config_json = serde_json::to_string(&config).map_err(|e| Error::BackendError {
-            message: format!("Failed to serialize AgentConfig: {e}"),
-        })?;
+        // Collect the names of custom Rust tools so we can tag them correctly.
+        let custom_tool_names: std::collections::HashSet<String> =
+            config.tools.iter().map(|t| t.name.clone()).collect();
 
-        let raw_id = self
+        let (raw_id, raw_tools) = self
             .send_command("create_agent", false, |reply| PyCommand::CreateAgent {
                 config_json,
                 reply,
             })
             .await?;
 
-        Ok(raw_id.0)
+        // Compute which builtins are active so we can tag and deduplicate them.
+        let active_builtins = compute_active_builtins(&config);
+        let builtin_names: std::collections::HashSet<&str> = active_builtins
+            .iter()
+            .map(crate::config::BuiltinTools::as_sdk_name)
+            .collect();
+
+        // Convert RawToolInfo → AvailableTool with source tags.
+        // Python's ToolRunner includes builtins in its `tools` dict, so we
+        // skip them here and add them back below with the Builtin tag.
+        let mut available_tools: Vec<crate::tools::AvailableTool> = raw_tools
+            .into_iter()
+            .filter(|raw| !builtin_names.contains(raw.name.as_str()))
+            .map(|raw| {
+                let source = if custom_tool_names.contains(&raw.name) {
+                    crate::tools::ToolSource::Custom
+                } else {
+                    crate::tools::ToolSource::Mcp
+                };
+                crate::tools::AvailableTool {
+                    name: raw.name,
+                    description: raw.description,
+                    parameter_schema: raw.parameter_schema,
+                    source,
+                }
+            })
+            .collect();
+
+        // Add builtin tools with their known descriptions.
+        for builtin in active_builtins {
+            available_tools.push(crate::tools::AvailableTool {
+                name: builtin.as_sdk_name().to_owned(),
+                description: builtin.description().to_owned(),
+                parameter_schema: serde_json::Value::Null,
+                source: crate::tools::ToolSource::Builtin,
+            });
+        }
+
+        tracing::info!(
+            agent_id = raw_id.0,
+            tool_count = available_tools.len(),
+            tools = ?available_tools.iter().map(|t| format!("{t}")).collect::<Vec<_>>(),
+            "Agent created with available tools"
+        );
+
+        Ok((raw_id.0, available_tools))
     }
 
     async fn chat(
@@ -815,6 +928,7 @@ mod tests {
             shutdown_timeout: Duration::from_secs(5),
             chat_timeout: Duration::from_mins(1),
             inter_agent_delay: Duration::from_millis(100),
+            backend_log_level: BackendLogLevel::default(),
         }
     }
 
@@ -838,6 +952,54 @@ mod tests {
         assert_eq!(parsed.shutdown_timeout, Duration::from_secs(5));
         assert_eq!(parsed.chat_timeout, Duration::from_mins(1));
         assert_eq!(parsed.inter_agent_delay, Duration::from_millis(100));
+        assert_eq!(parsed.backend_log_level, BackendLogLevel::Warn);
+    }
+
+    #[test]
+    fn backend_log_level_default_is_warn() {
+        assert_eq!(BackendLogLevel::default(), BackendLogLevel::Warn);
+    }
+
+    #[test]
+    fn backend_log_level_serde_roundtrip_all_variants() {
+        for (variant, expected_str) in [
+            (BackendLogLevel::Error, "\"error\""),
+            (BackendLogLevel::Warn, "\"warn\""),
+            (BackendLogLevel::Info, "\"info\""),
+            (BackendLogLevel::Debug, "\"debug\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let parsed: BackendLogLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant, "roundtrip {variant:?}");
+        }
+    }
+
+    #[test]
+    fn backend_log_level_as_str() {
+        assert_eq!(BackendLogLevel::Error.as_str(), "error");
+        assert_eq!(BackendLogLevel::Warn.as_str(), "warn");
+        assert_eq!(BackendLogLevel::Info.as_str(), "info");
+        assert_eq!(BackendLogLevel::Debug.as_str(), "debug");
+    }
+
+    #[test]
+    fn backend_log_level_display() {
+        assert_eq!(format!("{}", BackendLogLevel::Error), "error");
+        assert_eq!(format!("{}", BackendLogLevel::Warn), "warn");
+        assert_eq!(format!("{}", BackendLogLevel::Info), "info");
+        assert_eq!(format!("{}", BackendLogLevel::Debug), "debug");
+    }
+
+    #[test]
+    fn runtime_config_with_custom_backend_log_level() {
+        let config = RuntimeConfig {
+            backend_log_level: BackendLogLevel::Debug,
+            ..test_config()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: RuntimeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.backend_log_level, BackendLogLevel::Debug);
     }
 
     #[test]
@@ -955,7 +1117,6 @@ err = MaxTokensException(\"dummy\")
                     Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>
                 ),
                 tool_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
-                conversation_id: Arc::new(std::sync::Mutex::new(None)),
             },
         );
 
@@ -983,5 +1144,102 @@ err = MaxTokensException(\"dummy\")
 
         // Clean up
         bridge_state().write().unwrap().remove(&agent_id);
+    }
+
+    // ── compute_active_builtins tests ─────────────────────────────────
+
+    #[test]
+    fn builtins_default_config_returns_all() {
+        let config = crate::config::AgentConfig::default();
+        let builtins = super::compute_active_builtins(&config);
+        assert_eq!(
+            builtins.len(),
+            crate::config::BuiltinTools::all_tools().len(),
+            "default config should produce all builtins"
+        );
+    }
+
+    #[test]
+    fn builtins_no_capabilities_returns_all() {
+        let config = crate::config::AgentConfig {
+            capabilities: None,
+            ..crate::config::AgentConfig::default()
+        };
+        let builtins = super::compute_active_builtins(&config);
+        assert_eq!(
+            builtins.len(),
+            crate::config::BuiltinTools::all_tools().len(),
+        );
+    }
+
+    #[test]
+    fn builtins_enabled_tools_filters() {
+        let config = crate::config::AgentConfig {
+            capabilities: Some(crate::config::CapabilitiesConfig {
+                enabled_tools: Some(vec![
+                    crate::config::BuiltinTools::ViewFile,
+                    crate::config::BuiltinTools::ListDir,
+                ]),
+                ..crate::config::CapabilitiesConfig::default()
+            }),
+            ..crate::config::AgentConfig::default()
+        };
+        let builtins = super::compute_active_builtins(&config);
+        assert_eq!(builtins.len(), 2);
+        assert!(builtins.contains(&crate::config::BuiltinTools::ViewFile));
+        assert!(builtins.contains(&crate::config::BuiltinTools::ListDir));
+    }
+
+    #[test]
+    fn builtins_disabled_tools_excludes() {
+        let config = crate::config::AgentConfig {
+            capabilities: Some(crate::config::CapabilitiesConfig {
+                disabled_tools: Some(vec![crate::config::BuiltinTools::RunCommand]),
+                ..crate::config::CapabilitiesConfig::default()
+            }),
+            ..crate::config::AgentConfig::default()
+        };
+        let builtins = super::compute_active_builtins(&config);
+        assert!(
+            !builtins.contains(&crate::config::BuiltinTools::RunCommand),
+            "RunCommand should be excluded"
+        );
+        assert!(
+            builtins.len() == crate::config::BuiltinTools::all_tools().len() - 1,
+            "should have all builtins minus the disabled one"
+        );
+    }
+
+    #[test]
+    fn builtins_custom_tools_only_returns_empty() {
+        let config = crate::config::AgentConfig {
+            capabilities: Some(crate::config::CapabilitiesConfig::custom_tools_only()),
+            ..crate::config::AgentConfig::default()
+        };
+        let builtins = super::compute_active_builtins(&config);
+        assert!(
+            builtins.is_empty(),
+            "custom_tools_only should produce 0 builtins"
+        );
+    }
+
+    #[test]
+    fn builtins_all_descriptions_non_empty() {
+        for tool in crate::config::BuiltinTools::all_tools() {
+            assert!(
+                !tool.description().is_empty(),
+                "builtin {tool:?} has empty description",
+            );
+        }
+    }
+
+    #[test]
+    fn builtins_all_sdk_names_non_empty() {
+        for tool in crate::config::BuiltinTools::all_tools() {
+            assert!(
+                !tool.as_sdk_name().is_empty(),
+                "builtin {tool:?} has empty SDK name",
+            );
+        }
     }
 }
