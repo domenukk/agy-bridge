@@ -6,29 +6,39 @@ use super::DEFAULT_IMAGE_GENERATION_MODEL;
 
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum BuiltinTools {
     /// List files and subdirectories.
+    #[serde(rename = "list_directory")]
     ListDir,
     /// Regex search within directory contents.
+    #[serde(rename = "search_directory")]
     SearchDir,
     /// Find files by name pattern.
+    #[serde(rename = "find_file")]
     FindFile,
     /// Read file contents.
+    #[serde(rename = "view_file")]
     ViewFile,
     /// Create a new file.
+    #[serde(rename = "create_file")]
     CreateFile,
     /// Edit an existing file.
+    #[serde(rename = "edit_file")]
     EditFile,
     /// Execute a shell command.
+    #[serde(rename = "run_command")]
     RunCommand,
     /// Ask the user a question.
+    #[serde(rename = "ask_question")]
     AskQuestion,
     /// Spawn a subagent.
+    #[serde(rename = "start_subagent")]
     StartSubagent,
     /// Generate images from text prompts.
+    #[serde(rename = "generate_image")]
     GenerateImage,
     /// Signal task completion.
+    #[serde(rename = "finish")]
     Finish,
 }
 
