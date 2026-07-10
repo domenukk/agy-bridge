@@ -102,6 +102,18 @@ pub trait Runtime: Send + Sync {
     /// Clear the conversation history and reset state.
     async fn clear_history(&self, agent_id: AgentId) -> Result<(), Error>;
 
+    /// Remove the last user+model turn pair from conversation history.
+    ///
+    /// Used for safety recovery: when a model refuses due to safety filters,
+    /// removing the refusal from history and retrying gives it a fresh chance.
+    /// Removes the last 2 entries from the internal history list (user message
+    /// + model response).
+    ///
+    /// Default implementation is a no-op that returns `Ok(())`.
+    async fn remove_last_turn(&self, _agent_id: AgentId) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Return the text of the last model response, if any.
     ///
     /// Default implementation returns `Ok(None)`.
@@ -391,15 +403,68 @@ impl<R: Runtime> AgentHandle<R> {
     /// with the agent at creation time, the Python runtime handles tool
     /// execution automatically.
     ///
+    /// Unlike [`chat`](Self::chat), this method includes a full retry loop
+    /// because quota/429 errors from the SDK often surface during streaming
+    /// (after `chat()` already returned `Ok(handle)`), making `chat()`'s own
+    /// retry loop ineffective.
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] if the chat turn fails or stream errors occur.
     pub async fn chat_text(&self, message: impl Into<Content>) -> Result<String, Error> {
-        let response = self.chat(message.into()).await?;
-        let text = response.text().await.map_err(|e| Error::BackendError {
-            message: format!("Failed to read response text: {}", Error::from(e)),
-        })?;
-        Ok(text.into_string())
+        let content = message.into();
+        // NOLINT: zero retries is the correct default — no automatic retry unless explicitly configured
+        let max_retries = self.config.max_quota_retries.unwrap_or(0);
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                self.quota_state.wait_for_quota().await;
+            }
+
+            let response = match self.chat(content.clone()).await {
+                Ok(h) => h,
+                Err(Error::QuotaExceeded { retry_after }) => {
+                    self.handle_quota_error("chat_text", attempt, max_retries, retry_after)?;
+                    continue;
+                }
+                Err(ref e) if e.is_quota_error() => {
+                    self.handle_quota_error(
+                        "chat_text",
+                        attempt,
+                        max_retries,
+                        DEFAULT_QUOTA_BACKOFF,
+                    )?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            match response.text().await {
+                Ok(text) => return Ok(text.into_string()),
+                Err(stream_err) => {
+                    let err = Error::BackendError {
+                        message: format!(
+                            "Failed to read response text: stream error: {}",
+                            stream_err.message
+                        ),
+                    };
+                    if err.is_quota_error() {
+                        self.handle_quota_error(
+                            "chat_text",
+                            attempt,
+                            max_retries,
+                            DEFAULT_QUOTA_BACKOFF,
+                        )?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(Error::QuotaExceeded {
+            retry_after: QUOTA_EXHAUSTED_RETRY_AFTER,
+        })
     }
 
     /// Return the current conversation ID, if one has been set.
@@ -544,6 +609,18 @@ impl<R: Runtime> AgentHandle<R> {
     /// Returns [`Error`] if the operation fails.
     pub async fn clear_history(&self) -> Result<(), Error> {
         self.runtime.clear_history(self.id).await
+    }
+
+    /// Remove the last user+model turn pair from conversation history.
+    ///
+    /// Used for safety recovery: when a model refuses due to safety filters,
+    /// removing the refusal from history and retrying gives it a fresh chance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the operation fails.
+    pub async fn remove_last_turn(&self) -> Result<(), Error> {
+        self.runtime.remove_last_turn(self.id).await
     }
 
     /// Return the text of the last model response, if any.

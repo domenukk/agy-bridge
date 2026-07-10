@@ -47,7 +47,7 @@ fn live_agent_with_builtin_tools() {
                 temp_path.display()
             );
             let text = agent.chat_text(&*prompt).await?;
-            drop(agent);
+            agent.shutdown().await?;
 
             eprintln!("Agent response: {text}");
             assert!(

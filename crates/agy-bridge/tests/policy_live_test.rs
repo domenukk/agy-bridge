@@ -56,7 +56,7 @@ fn live_agent_policy_allows_safe_tool() {
             let agent = bridge.agent(config).tools(registry).await?;
 
             let text = agent.chat_text("Call the safe_tool please.").await?;
-            drop(agent);
+            agent.shutdown().await?;
 
             eprintln!("Agent response: {text}");
             assert!(

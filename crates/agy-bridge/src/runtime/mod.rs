@@ -179,6 +179,14 @@ pub(crate) enum PyCommand {
         agent_id: AgentId,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    /// Remove the last user+model turn pair from conversation history.
+    ///
+    /// Used for safety recovery: when a model safety-filters trip, removing
+    /// the refusal from history gives the model a fresh chance on retry.
+    RemoveLastTurn {
+        agent_id: AgentId,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     /// Return step indices where compaction occurred.
     GetCompactionIndices {
         agent_id: AgentId,
@@ -865,6 +873,16 @@ impl crate::agent::Runtime for PythonRuntime {
         self.send_command("clear_history", false, |reply| PyCommand::ClearHistory {
             agent_id: AgentId(agent_id),
             reply,
+        })
+        .await
+    }
+
+    async fn remove_last_turn(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        self.send_command("remove_last_turn", false, |reply| {
+            PyCommand::RemoveLastTurn {
+                agent_id: AgentId(agent_id),
+                reply,
+            }
         })
         .await
     }

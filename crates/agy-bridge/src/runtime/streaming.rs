@@ -39,7 +39,12 @@ async fn forward_step_to_writer(
 
     if has_error_status || has_error_field {
         route_error_step(writer, &mut step, agent_id).await;
-        return Ok(());
+        // Return Err to break the streaming loop — continuing after an error
+        // step would call __anext__ on a dead/terminated Python iterator,
+        // risking a blocking call or spin. The error is already routed to
+        // error_tx by route_error_step above, so send_stream_error in the
+        // caller will see "channel full" and log a debug message (first error wins).
+        return Err("error step received — stopping stream".to_string());
     }
 
     // ── Extract summary info before forwarding consumes the data ────────
@@ -94,6 +99,14 @@ async fn forward_step_to_writer(
 
 /// Route a step with an error status/field to the error channel, then
 /// forward the raw step for timeline consumers.
+///
+/// This sends to BOTH:
+/// - `step_tx`: so timeline consumers (e.g. `receive_steps()`) see the error step
+/// - `error_tx`: so `handle.text()` returns `Err(StreamError)` instead of `Ok("")`
+///
+/// Without the `error_tx` send, backend failures (e.g. "Agent execution
+/// terminated" from exhausted 503 retries) silently return empty text,
+/// which downstream consumers misclassify as safety filter trips.
 async fn route_error_step(
     writer: &crate::streaming::ChatResponseWriter,
     step: &mut crate::types::Step,
@@ -117,6 +130,14 @@ async fn route_error_step(
         error = %error_msg,
         "Step has error status/field"
     );
+    // Send to error channel so handle.text() returns Err().
+    // Use try_send (capacity=1, first error wins) to avoid blocking.
+    if let Err(e) = writer
+        .error_tx
+        .try_send(crate::streaming::StreamError { message: error_msg })
+    {
+        tracing::debug!("Error channel full or closed (first error wins): {e}");
+    }
     if let Err(e) = writer.send_step(std::mem::take(step)).await {
         tracing::debug!("Failed to send error step: {e}");
     }
@@ -397,5 +418,21 @@ mod tests {
         let has_error_status = step.status == StepStatus::Error;
         let has_error_field = !step.error.is_empty();
         assert!(has_error_status && has_error_field);
+    }
+
+    #[test]
+    fn normal_step_not_treated_as_error() {
+        let step = step_with(StepStatus::Done, "", "normal content");
+        let has_error_status = step.status == StepStatus::Error;
+        let has_error_field = !step.error.is_empty();
+        assert!(!has_error_status && !has_error_field);
+    }
+
+    #[test]
+    fn empty_content_with_done_status_is_not_error() {
+        let step = step_with(StepStatus::Done, "", "");
+        let has_error_status = step.status == StepStatus::Error;
+        let has_error_field = !step.error.is_empty();
+        assert!(!has_error_status && !has_error_field);
     }
 }

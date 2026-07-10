@@ -186,7 +186,7 @@ fn live_agent_with_custom_rust_tool() {
             let text = agent
                 .chat_text("What is the serial number for the Pixel 9?")
                 .await?;
-            drop(agent);
+            agent.shutdown().await?;
 
             eprintln!("Agent response: {text}");
             assert!(
@@ -265,13 +265,13 @@ fn live_rust_tool_called_by_agent() {
             let agent = bridge.agent(config).tools(registry).await?;
 
             let text = agent.chat_text("What's the status of build-42?").await?;
-            drop(agent);
 
             eprintln!("Agent response: {text}");
             assert!(
                 text.to_lowercase().contains("success"),
                 "Expected 'success' in response, got: {text}"
             );
+            agent.shutdown().await?;
             Ok(())
         })
     });
@@ -306,7 +306,7 @@ fn live_agentic_loop() {
             let text = agent
                 .chat_text("Call the add_numbers tool with x=10 and y=32, then report the result.")
                 .await?;
-            drop(agent);
+            agent.shutdown().await?;
 
             eprintln!("Agent response: {text}");
             assert!(text.contains("42"), "Expected 42, got: {text}");

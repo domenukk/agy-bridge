@@ -654,4 +654,209 @@ mod tests {
         let s: String = result.into();
         assert!(s.is_empty());
     }
+
+    // ── Error routing tests (bug: error steps not routed to error_tx) ──────
+
+    #[tokio::test]
+    async fn error_step_routed_to_error_channel() {
+        // Simulate what route_error_step does: send to both error_tx and step_tx.
+        // handle.text() must return Err, not Ok("").
+        let (writer, handle) = channel();
+
+        // Destructure the writer so we can drop text_tx explicitly to unblock
+        // handle.text()'s drain loop, then send to error_tx and step_tx.
+        let ChatResponseWriter {
+            text_tx,
+            error_tx,
+            step_tx,
+            ..
+        } = writer;
+
+        let producer = async move {
+            // Simulate a backend 503 error step — this is what the SDK sends
+            // when GenerateContent fails after exhausting retries.
+            error_tx
+                .try_send(StreamError {
+                    message: "Agent execution terminated due to error. (request failed (code 503): APP_ERROR(2))".to_owned(),
+                })
+                .expect("error_tx should accept");
+            step_tx
+                .send(crate::types::Step {
+                    status: crate::types::StepStatus::Error,
+                    error: "Agent execution terminated due to error.".to_owned(),
+                    ..crate::types::Step::default()
+                })
+                .await
+                .expect("step_tx should accept");
+            // Close the text channel so handle.text() can finish draining.
+            drop(text_tx);
+        };
+
+        let consumer = handle.text();
+
+        let ((), result) = tokio::join!(producer, consumer);
+        assert!(
+            result.is_err(),
+            "handle.text() must return Err when error step is sent"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("503") || err.message.contains("Agent execution terminated"),
+            "Error message should contain the backend error: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn error_step_without_error_channel_returns_empty_ok() {
+        // Verify the OLD behavior (before fix): if only step_tx gets the error
+        // but error_tx does NOT, handle.text() returns Ok("").
+        // This documents the bug and ensures the fix is needed.
+        let (writer, handle) = channel();
+
+        let ChatResponseWriter {
+            text_tx, step_tx, ..
+        } = writer;
+
+        let producer = async move {
+            // Only send to step_tx (NOT error_tx) — the old broken behavior.
+            step_tx
+                .send(crate::types::Step {
+                    status: crate::types::StepStatus::Error,
+                    error: "Agent execution terminated".to_owned(),
+                    ..crate::types::Step::default()
+                })
+                .await
+                .expect("step_tx should accept");
+            // Close text channel so handle.text() can finish draining.
+            drop(text_tx);
+        };
+
+        let consumer = handle.text();
+
+        // Without the error_tx send, text() returns Ok("") — the bug!
+        let ((), result) = tokio::join!(producer, consumer);
+        assert!(
+            result.is_ok(),
+            "Without error_tx, text() should return Ok (demonstrating the old bug)"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "Without error_tx, text should be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_tx_capacity_one_first_error_wins() {
+        // error_tx has capacity 1. Multiple sends should not block.
+        let (writer, handle) = channel();
+
+        let ChatResponseWriter {
+            text_tx, error_tx, ..
+        } = writer;
+
+        let producer = async move {
+            // First error — should succeed
+            error_tx
+                .try_send(StreamError {
+                    message: "first error".to_owned(),
+                })
+                .expect("first try_send should succeed");
+            // Second error — should fail (channel full), not block
+            let second = error_tx.try_send(StreamError {
+                message: "second error".to_owned(),
+            });
+            assert!(
+                second.is_err(),
+                "Second try_send should fail (channel full)"
+            );
+            // Close text channel so handle.text() can finish draining.
+            drop(text_tx);
+        };
+
+        let consumer = handle.text();
+
+        let ((), result) = tokio::join!(producer, consumer);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().message,
+            "first error",
+            "First error should win"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_step_with_partial_text_still_returns_error() {
+        // Even if some text was streamed before the error, the error wins.
+        let (writer, handle) = channel();
+
+        let ChatResponseWriter {
+            text_tx, error_tx, ..
+        } = writer;
+
+        let producer = async move {
+            // Some text tokens arrive first
+            text_tx
+                .send("partial response...".to_owned())
+                .await
+                .expect("text send");
+            // Then backend error
+            error_tx
+                .try_send(StreamError {
+                    message: "connection reset during streaming".to_owned(),
+                })
+                .expect("error send");
+            // text_tx is dropped here, closing the text channel.
+        };
+
+        let consumer = handle.text();
+
+        let ((), result) = tokio::join!(producer, consumer);
+        assert!(
+            result.is_err(),
+            "Error should take priority over partial text"
+        );
+        assert!(
+            result.unwrap_err().message.contains("connection reset"),
+            "Should contain the error message"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_stream_receives_error_steps() {
+        // Even with the fix, step consumers should still see error steps.
+        use tokio_stream::StreamExt;
+
+        let (writer, mut handle) = channel();
+
+        let error_step = crate::types::Step {
+            id: "err-step".to_owned(),
+            step_index: 0,
+            status: crate::types::StepStatus::Error,
+            error: "model 503".to_owned(),
+            ..crate::types::Step::default()
+        };
+
+        let ChatResponseWriter {
+            error_tx, step_tx, ..
+        } = writer;
+
+        let producer = async move {
+            error_tx
+                .try_send(StreamError {
+                    message: "model 503".to_owned(),
+                })
+                .expect("error send");
+            step_tx.send(error_step).await.expect("step send");
+        };
+
+        let consumer = async {
+            let mut stream = handle.receive_steps().expect("should get stream");
+            let step = stream.next().await.expect("should get error step");
+            assert_eq!(step.status, crate::types::StepStatus::Error);
+            assert_eq!(step.error, "model 503");
+        };
+
+        tokio::join!(producer, consumer);
+    }
 }

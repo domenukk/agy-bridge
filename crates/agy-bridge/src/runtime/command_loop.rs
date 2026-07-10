@@ -343,7 +343,7 @@ fn dispatch_lifecycle_command(
 }
 
 /// Dispatch async agent operations: cancel, idle, send, signal, wakeup,
-/// clear history, delete, disconnect.
+/// clear history, remove last turn, delete, disconnect.
 ///
 /// Returns `Ok(())` if handled, `Err(cmd)` if not an agent operation.
 fn dispatch_agent_operation(
@@ -366,6 +366,9 @@ fn dispatch_agent_operation(
         }
         PyCommand::ClearHistory { agent_id, reply } => {
             async_ops::handle_clear_history(registry, agent_id, reply);
+        }
+        PyCommand::RemoveLastTurn { agent_id, reply } => {
+            async_ops::handle_remove_last_turn(registry, agent_id, reply);
         }
         PyCommand::Send {
             agent_id,

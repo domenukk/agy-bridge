@@ -233,6 +233,18 @@ pub struct AgentConfig {
     #[serde(default)]
     #[builder(setter(into, strip_option))]
     pub max_quota_retries: Option<u32>,
+    /// Optional initial conversation history to inject after agent creation.
+    ///
+    /// When set, these messages are inserted into the SDK's internal
+    /// `_history` list before the first chat turn, enabling warm-start
+    /// scenarios such as safety recovery (re-creating an agent with
+    /// curated prior context).
+    ///
+    /// Serialized as `"initial_history"` and consumed by the Python init
+    /// script. Skipped from serialization when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<crate::types::ConversationMessage>>| v.into_iter().map(Into::into).collect()))]
+    pub initial_history: Vec<crate::types::ConversationMessage>,
 }
 
 impl Default for AgentConfig {
@@ -846,5 +858,48 @@ mod tests {
             Some(env_key) => assert_eq!(result.as_deref(), Some(env_key.as_str())),
             None => assert!(result.is_none()),
         }
+    }
+
+    #[test]
+    fn initial_history_empty_by_default() {
+        let config = AgentConfig::default();
+        assert!(config.initial_history.is_empty());
+
+        // Empty initial_history should be skipped in serialization.
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("initial_history"),
+            "empty initial_history should be skipped in JSON"
+        );
+    }
+
+    #[test]
+    fn initial_history_roundtrip() {
+        use crate::types::{ConversationMessage, MessageRole};
+
+        let config = AgentConfig::builder()
+            .initial_history(vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    content: "Hello".to_string(),
+                },
+                ConversationMessage {
+                    role: MessageRole::Model,
+                    content: "Hi there!".to_string(),
+                },
+            ])
+            .build();
+
+        assert_eq!(config.initial_history.len(), 2);
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("initial_history"));
+
+        let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.initial_history.len(), 2);
+        assert_eq!(parsed.initial_history[0].role, MessageRole::User);
+        assert_eq!(parsed.initial_history[0].content, "Hello");
+        assert_eq!(parsed.initial_history[1].role, MessageRole::Model);
+        assert_eq!(parsed.initial_history[1].content, "Hi there!");
     }
 }

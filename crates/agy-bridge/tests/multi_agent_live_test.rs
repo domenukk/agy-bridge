@@ -146,7 +146,7 @@ for line in sys.stdin:
 
             // Verify that the agent constructs and successfully connects to the MCP server.
             let agent = bridge.agent(config).await?;
-            drop(agent);
+            agent.shutdown().await?;
             Ok(())
         })
     });

@@ -232,6 +232,13 @@ impl Runtime for ToolAwareMockRuntime {
         Ok(())
     }
 
+    async fn remove_last_turn(&self, agent_id: AgentId) -> Result<(), Error> {
+        let mut counts = self.chat_count.lock().unwrap();
+        let entry = counts.entry(agent_id).or_insert(0);
+        *entry = entry.saturating_sub(1);
+        Ok(())
+    }
+
     async fn last_response(&self, _agent_id: AgentId) -> Result<Option<String>, Error> {
         Ok(Some("Hi there!".to_string()))
     }
@@ -646,6 +653,41 @@ mod tests {
         assert_eq!(agent.turn_count().await.unwrap(), 1);
 
         agent.clear_history().await.expect("clear_history");
+        assert_eq!(agent.turn_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn remove_last_turn_decrements_turn_count() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("create agent");
+
+        let _r1 = agent.chat("Turn 1").await.expect("chat 1");
+        let _r2 = agent.chat("Turn 2").await.expect("chat 2");
+        assert_eq!(agent.turn_count().await.unwrap(), 2);
+
+        agent
+            .remove_last_turn()
+            .await
+            .expect("remove_last_turn should succeed");
+        assert_eq!(agent.turn_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_last_turn_saturates_at_zero() {
+        let rt = Arc::new(ToolAwareMockRuntime::new());
+        let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
+            .await
+            .expect("create agent");
+
+        assert_eq!(agent.turn_count().await.unwrap(), 0);
+
+        // Should not panic or underflow when no turns exist.
+        agent
+            .remove_last_turn()
+            .await
+            .expect("remove_last_turn on empty history should succeed");
         assert_eq!(agent.turn_count().await.unwrap(), 0);
     }
 

@@ -370,7 +370,7 @@ fn base_url_routes_requests_to_custom_endpoint() {
             recorded.iter().map(|r| &r.body).collect::<Vec<_>>()
         );
 
-        drop(agent);
+        agent.shutdown().await.expect("shutdown");
     });
 }
 
@@ -449,7 +449,7 @@ fn multiple_agents_use_independent_base_urls() {
         assert!(a_has_a, "Server A should contain 'Hello from A'");
         assert!(b_has_b, "Server B should contain 'Hello from B'");
 
-        drop(agent_a);
-        drop(agent_b);
+        agent_a.shutdown().await.expect("shutdown agent_a");
+        agent_b.shutdown().await.expect("shutdown agent_b");
     });
 }

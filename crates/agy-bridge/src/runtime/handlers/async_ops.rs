@@ -222,6 +222,81 @@ pub(in crate::runtime) fn handle_clear_history(
     }
 }
 
+/// Remove the last user+model turn pair from conversation history.
+///
+/// Accesses `conversation._history` (the SDK's internal mutable list)
+/// and removes the last 2 entries. This is a synchronous operation because
+/// it only mutates an in-memory Python list.
+///
+/// Used for safety recovery: when a model refuses due to safety filters,
+/// removing the refusal from history and retrying gives it a fresh chance.
+pub(in crate::runtime) fn handle_remove_last_turn(
+    registry: &AgentRegistry,
+    agent_id: AgentId,
+    reply: oneshot::Sender<Result<(), Error>>,
+) {
+    let Some((_ctx, agent_instance)) = clone_agent_refs(registry, agent_id) else {
+        if reply
+            .send(Err(Error::BackendError {
+                message: format!("Agent ID {agent_id} not found in registry"),
+            }))
+            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
+            .is_err()
+        {
+            tracing::warn!(
+                agent_id = ?agent_id,
+                "remove_last_turn reply receiver dropped (agent not found)",
+            );
+        }
+        return;
+    };
+
+    let result = Python::attach(|py| -> Result<(), Error> {
+        let agent_bound = agent_instance.bind(py);
+        if !agent_bound.hasattr("conversation")? {
+            return Ok(());
+        }
+        let conv = agent_bound.getattr("conversation")?;
+        if conv.is_none() {
+            return Ok(());
+        }
+
+        // The SDK stores the mutable history in `_history` (a Python list).
+        // We remove the last 2 entries (user message + model response).
+        if conv.hasattr("_history")? {
+            let history = conv.getattr("_history")?;
+            let len: usize = history.len()?;
+            if len >= 2 {
+                // Remove from the end: index len-1 first, then len-2.
+                history.call_method1("pop", (len - 1,))?;
+                history.call_method1("pop", (len - 2,))?;
+                tracing::debug!(
+                    agent_id = ?agent_id,
+                    removed = 2,
+                    remaining = len - 2,
+                    "Removed last turn pair from conversation history",
+                );
+            } else {
+                tracing::warn!(
+                    agent_id = ?agent_id,
+                    history_len = len,
+                    "Cannot remove last turn: history has fewer than 2 entries",
+                );
+            }
+        } else {
+            tracing::warn!(
+                agent_id = ?agent_id,
+                "Conversation object does not have _history attribute",
+            );
+        }
+        Ok(())
+    });
+
+    if reply.send(result).is_err() {
+        tracing::warn!(agent_id = ?agent_id, "remove_last_turn reply receiver dropped");
+    }
+}
+
 pub(in crate::runtime) async fn handle_send(
     registry: AgentRegistry,
     agent_id: AgentId,

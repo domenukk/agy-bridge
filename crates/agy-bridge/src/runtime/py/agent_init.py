@@ -803,6 +803,11 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     if "gemini_config" in local_config and local_config.get("gemini_config"):
         local_config.pop("model", None)
 
+    # Extract initial_history before passing config to the SDK.
+    # The SDK does not know about this field — we inject it into the
+    # conversation's internal _history list after agent creation.
+    initial_history = local_config.pop("initial_history", [])
+
     from google.antigravity.connections.local.local_connection_config import (
         LocalAgentConfig,
     )
@@ -845,6 +850,39 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                     agent.conversation, "connection"
                 ):
                     agent.conversation.connection._agent_id = agent_id_u64
+
+                # Inject initial_history into the conversation's internal
+                # _history list, enabling warm-start with prior context.
+                if (
+                    initial_history
+                    and hasattr(agent, "conversation")
+                    and agent.conversation is not None
+                ):
+                    conv = agent.conversation
+                    if hasattr(conv, "_history"):
+                        from google.genai import types as genai_types
+
+                        history_logger = logging.getLogger("agy_bridge.initial_history")
+                        for msg in initial_history:
+                            role = msg.get("role", "user")
+                            content_text = msg.get("content", "")
+                            try:
+                                entry = genai_types.Content(
+                                    role=role,
+                                    parts=[genai_types.Part(text=content_text)],
+                                )
+                                conv._history.append(entry)
+                            except Exception as e:
+                                history_logger.error(
+                                    "Failed to inject initial_history entry (role=%s): %s",
+                                    role,
+                                    e,
+                                )
+                        history_logger.info(
+                            "Injected %d initial_history entries into conversation",
+                            len(initial_history),
+                        )
+
                 result_holder["instance"] = agent
                 enter_event.set()
                 await exit_event.wait()

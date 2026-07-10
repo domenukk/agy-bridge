@@ -133,12 +133,16 @@ fn test_on_tool_error_hook_live() {
         const DESCRIPTION: &'static str =
             "A tool that always returns an error. Call it with no arguments.";
 
-        async fn call(
+        fn call(
             &self,
             _params: Self::Params,
             _ctx: &agy_bridge::tools::ToolContext,
-        ) -> Result<agy_bridge::tools::ToolOutput, agy_bridge::tools::ToolError> {
-            Err(agy_bridge::tools::ToolError::new("intentional test error"))
+        ) -> impl std::future::Future<
+            Output = Result<agy_bridge::tools::ToolOutput, agy_bridge::tools::ToolError>,
+        > {
+            std::future::ready(Err(agy_bridge::tools::ToolError::new(
+                "intentional test error",
+            )))
         }
     }
 
