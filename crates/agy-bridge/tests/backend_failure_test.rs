@@ -27,7 +27,6 @@ use tokio::{
 static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
     agy_bridge::AgyBridge::builder()
         .inter_agent_delay(std::time::Duration::ZERO)
-        .chat_timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("shared AgyBridge")
 });
@@ -38,7 +37,10 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     buf_reader: &mut BufReader<R>,
 ) -> Option<(String, String)> {
     let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await.ok()?;
+    if let Err(e) = buf_reader.read_line(&mut request_line).await {
+        eprintln!("mock server: failed to read request line: {e}");
+        return None;
+    }
     let request_line = request_line.trim_end().to_string();
     if request_line.is_empty() {
         return None;
@@ -47,21 +49,32 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        buf_reader.read_line(&mut line).await.ok()?;
+        if let Err(e) = buf_reader.read_line(&mut line).await {
+            eprintln!("mock server: failed to read header line: {e}");
+            return None;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         let lower = trimmed.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
-            // NOLINT: test helper — invalid content-length defaults to zero
-            content_length = val.trim().parse().unwrap_or(0);
+            content_length = match val.trim().parse() {
+                Ok(len) => len,
+                Err(e) => {
+                    eprintln!("mock server: invalid Content-Length header: {e}");
+                    return None;
+                }
+            };
         }
     }
 
     if content_length > 0 {
         let mut body_buf = vec![0u8; content_length];
-        buf_reader.read_exact(&mut body_buf).await.ok()?;
+        if let Err(e) = buf_reader.read_exact(&mut body_buf).await {
+            eprintln!("mock server: failed to read body: {e}");
+            return None;
+        }
     }
 
     Some((request_line, String::new()))
@@ -220,12 +233,16 @@ impl MockFailureServer {
                     if is_get {
                         // Always serve model list (agent creation needs it).
                         let response = json_response(200, &model_list_json());
-                        let _ = writer.write_all(response.as_bytes()).await;
-                        let _ = writer.flush().await;
+                        if let Err(e) = writer.write_all(response.as_bytes()).await {
+                            eprintln!("mock server: write failed: {e}");
+                        }
+                        if let Err(e) = writer.flush().await {
+                            eprintln!("mock server: flush failed: {e}");
+                        }
                         return;
                     }
 
-                    let _ = count.fetch_add(1, Ordering::SeqCst);
+                    count.fetch_add(1, Ordering::SeqCst);
 
                     let response = match behaviour {
                         MockBehaviour::Healthy => sse_response(&generate_content_json()),
@@ -240,8 +257,12 @@ impl MockFailureServer {
                         }
                     };
 
-                    let _ = writer.write_all(response.as_bytes()).await;
-                    let _ = writer.flush().await;
+                    if let Err(e) = writer.write_all(response.as_bytes()).await {
+                        eprintln!("mock server: write failed: {e}");
+                    }
+                    if let Err(e) = writer.flush().await {
+                        eprintln!("mock server: flush failed: {e}");
+                    }
                 });
             }
         });
@@ -302,15 +323,11 @@ fn error_503_returns_err_not_empty_ok() {
         let result = agent.chat_text("Hello").await;
         eprintln!("503 result: {result:?}");
 
-        assert!(
-            result.is_err(),
-            "Backend 503 MUST return Err, got Ok({:?}). \
-             This is the bug that killed the ARTIST swarm — \
-             agy-bridge returned Ok(\"\") for 503 errors.",
-            result.unwrap_or_default()
-        );
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result
+            .expect_err(
+                "Backend 503 MUST return Err (bug: agy-bridge returned Ok(\"\") for 503 errors)",
+            )
+            .to_string();
         eprintln!("503 error message: {err_msg}");
 
         // The error message should contain useful context about the failure.
@@ -354,11 +371,7 @@ fn error_500_returns_err() {
         let result = agent.chat_text("Hello").await;
         eprintln!("500 result: {result:?}");
 
-        assert!(
-            result.is_err(),
-            "Backend 500 MUST return Err, got Ok({:?})",
-            result.unwrap_or_default()
-        );
+        result.expect_err("Backend 500 MUST return Err");
 
         agent.shutdown().await.expect("shutdown");
     });
@@ -399,22 +412,14 @@ fn concurrent_agents_mixed_healthy_and_503() {
         eprintln!("Broken result: {broken_result:?}");
 
         // Healthy agent MUST succeed.
-        assert!(
-            healthy_result.is_ok(),
-            "Healthy agent should succeed, got: {healthy_result:?}"
-        );
+        let healthy_text = healthy_result.expect("Healthy agent should succeed");
         assert_eq!(
-            healthy_result.unwrap(),
-            "Healthy mock response",
+            healthy_text, "Healthy mock response",
             "Healthy agent should return the mock response"
         );
 
         // Broken agent MUST fail.
-        assert!(
-            broken_result.is_err(),
-            "Broken agent should fail with 503, got Ok({:?})",
-            broken_result.unwrap_or_default()
-        );
+        broken_result.expect_err("Broken agent should fail with 503");
 
         healthy_agent.shutdown().await.expect("shutdown healthy");
         broken_agent.shutdown().await.expect("shutdown broken");
@@ -458,21 +463,9 @@ fn concurrent_agents_all_different_errors() {
         eprintln!("500: {r500:?}");
         eprintln!("429: {r429:?}");
 
-        assert!(
-            r503.is_err(),
-            "503 agent must fail, got Ok({:?})",
-            r503.unwrap_or_default()
-        );
-        assert!(
-            r500.is_err(),
-            "500 agent must fail, got Ok({:?})",
-            r500.unwrap_or_default()
-        );
-        assert!(
-            r429.is_err(),
-            "429 agent must fail, got Ok({:?})",
-            r429.unwrap_or_default()
-        );
+        r503.expect_err("503 agent must fail");
+        r500.expect_err("500 agent must fail");
+        r429.expect_err("429 agent must fail");
 
         agent_503.shutdown().await.expect("shutdown 503");
         agent_500.shutdown().await.expect("shutdown 500");
@@ -547,18 +540,21 @@ fn timeout_fires_when_backend_hangs() {
     rt.block_on(async {
         let server = MockFailureServer::start(MockBehaviour::Hang).await;
 
-        // Use a short timeout to not slow down tests.
+        // The bridge no longer imposes a chat timeout — stall detection is a
+        // consumer-layer concern. A tokio timeout around chat() must be able to
+        // fire even while Python is busy; this is the ARTIST GIL-starvation
+        // regression guard.
         let bridge = agy_bridge::AgyBridge::builder()
             .inter_agent_delay(std::time::Duration::ZERO)
-            .chat_timeout(std::time::Duration::from_secs(3))
             .build()
-            .expect("short-timeout bridge");
+            .expect("bridge");
 
         let config = agent_config_for(&server.base_url(), "Timeout agent");
         let agent = bridge.agent(config).await.expect("create agent");
 
         let start = std::time::Instant::now();
-        let result = agent.chat_text("Hello").await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), agent.chat_text("Hello")).await;
         let elapsed = start.elapsed();
 
         eprintln!(
@@ -566,11 +562,7 @@ fn timeout_fires_when_backend_hangs() {
             elapsed.as_secs_f64()
         );
 
-        assert!(
-            result.is_err(),
-            "Hanging backend MUST return Err (timeout), got Ok({:?})",
-            result.unwrap_or_default()
-        );
+        result.expect_err("Hanging backend MUST cause the consumer tokio timeout to fire");
 
         // Should have timed out within a reasonable margin of the 3s timeout.
         assert!(
@@ -579,7 +571,10 @@ fn timeout_fires_when_backend_hangs() {
             elapsed.as_secs()
         );
 
-        agent.shutdown().await.expect("shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown())
+            .await
+            .expect("shutdown must not stall")
+            .expect("shutdown");
     });
 }
 
@@ -598,9 +593,8 @@ fn healthy_agent_survives_sibling_timeout() {
 
         let bridge = agy_bridge::AgyBridge::builder()
             .inter_agent_delay(std::time::Duration::ZERO)
-            .chat_timeout(std::time::Duration::from_secs(3))
             .build()
-            .expect("short-timeout bridge");
+            .expect("bridge");
 
         let healthy_config = agent_config_for(&healthy_server.base_url(), "Healthy");
         let hanging_config = agent_config_for(&hanging_server.base_url(), "Hanging");
@@ -608,28 +602,32 @@ fn healthy_agent_survives_sibling_timeout() {
         let healthy_agent = bridge.agent(healthy_config).await.expect("healthy agent");
         let hanging_agent = bridge.agent(hanging_config).await.expect("hanging agent");
 
-        // Run both concurrently.
+        // Run both concurrently. Stall detection for the hanging agent is a
+        // consumer-layer tokio timeout.
         let (healthy_res, hanging_res) = tokio::join!(
             healthy_agent.chat_text("Ping"),
-            hanging_agent.chat_text("Ping"),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                hanging_agent.chat_text("Ping"),
+            ),
         );
 
         // Healthy must succeed.
-        assert!(
-            healthy_res.is_ok(),
-            "Healthy agent must work even when sibling is timing out, got: {healthy_res:?}"
-        );
-        assert_eq!(healthy_res.unwrap(), "Healthy mock response");
+        let healthy_text =
+            healthy_res.expect("Healthy agent must work even when sibling is timing out");
+        assert_eq!(healthy_text, "Healthy mock response");
 
-        // Hanging must timeout.
-        assert!(
-            hanging_res.is_err(),
-            "Hanging agent must timeout, got Ok({:?})",
-            hanging_res.unwrap_or_default()
-        );
+        // Hanging must time out at the consumer layer.
+        hanging_res.expect_err("Hanging agent must time out");
 
-        healthy_agent.shutdown().await.expect("shutdown healthy");
-        hanging_agent.shutdown().await.expect("shutdown hanging");
+        tokio::time::timeout(std::time::Duration::from_secs(10), healthy_agent.shutdown())
+            .await
+            .expect("shutdown healthy must not stall")
+            .expect("shutdown healthy");
+        tokio::time::timeout(std::time::Duration::from_secs(10), hanging_agent.shutdown())
+            .await
+            .expect("shutdown hanging must not stall")
+            .expect("shutdown hanging");
     });
 }
 
@@ -655,14 +653,8 @@ fn agent_shutdown_after_error_does_not_hang() {
         let shutdown_result =
             tokio::time::timeout(std::time::Duration::from_secs(5), agent.shutdown()).await;
 
-        assert!(
-            shutdown_result.is_ok(),
-            "Agent shutdown should not hang after error"
-        );
-        assert!(
-            shutdown_result.unwrap().is_ok(),
-            "Agent shutdown should succeed after error"
-        );
+        let shutdown_inner = shutdown_result.expect("Agent shutdown should not hang after error");
+        shutdown_inner.expect("Agent shutdown should succeed after error");
     });
 }
 
@@ -681,15 +673,24 @@ fn repeated_errors_each_return_err() {
         let agent = BRIDGE.agent(config).await.expect("create agent");
 
         for i in 0..3 {
-            let result = agent.chat_text(format!("Attempt {i}")).await;
+            // Bound each attempt: the bridge imposes no timeout, so a backend
+            // that the SDK keeps retrying is bounded at the consumer layer. A
+            // timeout or an SDK error both prove the 503 backend never yields Ok.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                agent.chat_text(format!("Attempt {i}")),
+            )
+            .await;
             assert!(
-                result.is_err(),
-                "Attempt {i}: 503 backend must return Err, got Ok({:?})",
-                result.unwrap_or_default()
+                result.as_ref().map_or(true, std::result::Result::is_err),
+                "Attempt {i}: 503 backend must not return Ok, got {result:?}"
             );
         }
 
-        agent.shutdown().await.expect("shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown())
+            .await
+            .expect("shutdown must not stall")
+            .expect("shutdown");
     });
 }
 
@@ -707,23 +708,35 @@ fn streaming_handle_text_returns_err_on_503() {
         let config = agent_config_for(&server.base_url(), "Streaming handle");
         let agent = BRIDGE.agent(config).await.expect("create agent");
 
-        let chat_result = agent.chat("Hello").await;
+        let chat_result =
+            tokio::time::timeout(std::time::Duration::from_secs(30), agent.chat("Hello")).await;
         match chat_result {
-            Ok(handle) => {
-                let text_result = handle.text().await;
+            Ok(Ok(handle)) => {
+                let text_result =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), handle.text()).await;
                 eprintln!("Streaming handle .text() result: {text_result:?}");
                 assert!(
-                    text_result.is_err(),
-                    "handle.text() must return Err for 503, got Ok(\"...\")"
+                    text_result
+                        .as_ref()
+                        .map_or(true, std::result::Result::is_err),
+                    "handle.text() must not return Ok for 503, got {text_result:?}"
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Also acceptable — some error paths surface at chat() time.
                 eprintln!("Error at chat() level (also acceptable): {e}");
             }
+            Err(_elapsed) => {
+                // A stalled retry loop bounded at the consumer layer is also a
+                // valid non-Ok outcome for a persistent 503 backend.
+                eprintln!("chat() bounded by consumer timeout (acceptable for 503)");
+            }
         }
 
-        agent.shutdown().await.expect("shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown())
+            .await
+            .expect("shutdown must not stall")
+            .expect("shutdown");
     });
 }
 
@@ -783,21 +796,9 @@ fn five_agents_mixed_backends_full_isolation() {
         assert_eq!(rh2.unwrap(), "Healthy mock response");
 
         // Broken agents must fail.
-        assert!(
-            r503.is_err(),
-            "broken-503 must fail, got Ok({:?})",
-            r503.unwrap_or_default()
-        );
-        assert!(
-            r500.is_err(),
-            "broken-500 must fail, got Ok({:?})",
-            r500.unwrap_or_default()
-        );
-        assert!(
-            r429.is_err(),
-            "broken-429 must fail, got Ok({:?})",
-            r429.unwrap_or_default()
-        );
+        r503.expect_err("broken-503 must fail");
+        r500.expect_err("broken-500 must fail");
+        r429.expect_err("broken-429 must fail");
 
         a_h1.shutdown().await.expect("shutdown");
         a_h2.shutdown().await.expect("shutdown");

@@ -57,9 +57,16 @@ lint-hygiene:
 
 # ── Test ──────────────────────────────────────────────────────────────
 
-# Run tests
-test:
+# Run all tests (Rust + Python)
+test: test-rust test-python
+
+# Run Rust tests (lib + doctests)
+test-rust:
     cargo test
+
+# Run Python tests for the embedded agent_init helpers
+test-python:
+    python3 -m pytest crates/agy-bridge/tests/python -q
 
 # ── Other ─────────────────────────────────────────────────────────────
 

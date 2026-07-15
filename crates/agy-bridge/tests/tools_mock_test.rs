@@ -47,7 +47,6 @@ use tokio::{
 static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
     agy_bridge::AgyBridge::builder()
         .inter_agent_delay(std::time::Duration::ZERO)
-        .chat_timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("shared AgyBridge")
 });
@@ -70,8 +69,6 @@ impl RustTool for AddNumbers {
     const NAME: &'static str = "add_numbers";
     const DESCRIPTION: &'static str = "Adds two numbers together.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
@@ -96,8 +93,6 @@ impl RustTool for LookupTool {
     const NAME: &'static str = "lookup";
     const DESCRIPTION: &'static str = "Looks up a value by key.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
@@ -126,8 +121,6 @@ impl RustTool for AlwaysFailTool {
     const NAME: &'static str = "always_fail";
     const DESCRIPTION: &'static str = "Always fails with the given reason.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
@@ -192,8 +185,12 @@ impl ToolMockServer {
 
                     if request_line.starts_with("GET ") {
                         let resp = json_response(200, &model_list_json());
-                        let _ = writer.write_all(resp.as_bytes()).await;
-                        let _ = writer.flush().await;
+                        if let Err(e) = writer.write_all(resp.as_bytes()).await {
+                            eprintln!("mock server: write failed: {e}");
+                        }
+                        if let Err(e) = writer.flush().await {
+                            eprintln!("mock server: flush failed: {e}");
+                        }
                         return;
                     }
 
@@ -208,8 +205,12 @@ impl ToolMockServer {
                         sse_response(&text_response_json(&final_text))
                     };
 
-                    let _ = writer.write_all(response.as_bytes()).await;
-                    let _ = writer.flush().await;
+                    if let Err(e) = writer.write_all(response.as_bytes()).await {
+                        eprintln!("mock server: write failed: {e}");
+                    }
+                    if let Err(e) = writer.flush().await {
+                        eprintln!("mock server: flush failed: {e}");
+                    }
                 });
             }
         });
@@ -266,8 +267,12 @@ impl ToolMockServer {
 
                     if request_line.starts_with("GET ") {
                         let resp = json_response(200, &model_list_json());
-                        let _ = writer.write_all(resp.as_bytes()).await;
-                        let _ = writer.flush().await;
+                        if let Err(e) = writer.write_all(resp.as_bytes()).await {
+                            eprintln!("mock server: write failed: {e}");
+                        }
+                        if let Err(e) = writer.flush().await {
+                            eprintln!("mock server: flush failed: {e}");
+                        }
                         return;
                     }
 
@@ -280,8 +285,12 @@ impl ToolMockServer {
                         _ => sse_response(&text_response_json(&ftext)),
                     };
 
-                    let _ = writer.write_all(response.as_bytes()).await;
-                    let _ = writer.flush().await;
+                    if let Err(e) = writer.write_all(response.as_bytes()).await {
+                        eprintln!("mock server: write failed: {e}");
+                    }
+                    if let Err(e) = writer.flush().await {
+                        eprintln!("mock server: flush failed: {e}");
+                    }
                 });
             }
         });
@@ -319,7 +328,10 @@ async fn parse_http_request_with_body<R: tokio::io::AsyncRead + Unpin>(
     buf_reader: &mut BufReader<R>,
 ) -> Option<(String, String)> {
     let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await.ok()?;
+    if let Err(e) = buf_reader.read_line(&mut request_line).await {
+        eprintln!("mock server: failed to read request line: {e}");
+        return None;
+    }
     let request_line = request_line.trim_end().to_string();
     if request_line.is_empty() {
         return None;
@@ -328,21 +340,32 @@ async fn parse_http_request_with_body<R: tokio::io::AsyncRead + Unpin>(
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        buf_reader.read_line(&mut line).await.ok()?;
+        if let Err(e) = buf_reader.read_line(&mut line).await {
+            eprintln!("mock server: failed to read header line: {e}");
+            return None;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         let lower = trimmed.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
-            // NOLINT: test helper — invalid content-length defaults to zero
-            content_length = val.trim().parse().unwrap_or(0);
+            content_length = match val.trim().parse() {
+                Ok(len) => len,
+                Err(e) => {
+                    eprintln!("mock server: invalid Content-Length header: {e}");
+                    return None;
+                }
+            };
         }
     }
 
     let body = if content_length > 0 {
         let mut buf = vec![0u8; content_length];
-        buf_reader.read_exact(&mut buf).await.ok()?;
+        if let Err(e) = buf_reader.read_exact(&mut buf).await {
+            eprintln!("mock server: failed to read body: {e}");
+            return None;
+        }
         String::from_utf8_lossy(&buf).to_string()
     } else {
         String::new()

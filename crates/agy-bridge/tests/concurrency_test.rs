@@ -29,7 +29,6 @@ use tokio::{
 static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
     agy_bridge::AgyBridge::builder()
         .inter_agent_delay(std::time::Duration::ZERO)
-        .chat_timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("shared AgyBridge")
 });
@@ -40,7 +39,10 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     buf_reader: &mut BufReader<R>,
 ) -> Option<String> {
     let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await.ok()?;
+    if let Err(e) = buf_reader.read_line(&mut request_line).await {
+        eprintln!("mock server: failed to read request line: {e}");
+        return None;
+    }
     let request_line = request_line.trim_end().to_string();
     if request_line.is_empty() {
         return None;
@@ -49,21 +51,32 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        buf_reader.read_line(&mut line).await.ok()?;
+        if let Err(e) = buf_reader.read_line(&mut line).await {
+            eprintln!("mock server: failed to read header line: {e}");
+            return None;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         let lower = trimmed.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
-            // NOLINT: test helper — invalid content-length defaults to zero
-            content_length = val.trim().parse().unwrap_or(0);
+            content_length = match val.trim().parse() {
+                Ok(len) => len,
+                Err(e) => {
+                    eprintln!("mock server: invalid Content-Length header: {e}");
+                    return None;
+                }
+            };
         }
     }
 
     if content_length > 0 {
         let mut body_buf = vec![0u8; content_length];
-        buf_reader.read_exact(&mut body_buf).await.ok()?;
+        if let Err(e) = buf_reader.read_exact(&mut body_buf).await {
+            eprintln!("mock server: failed to read body: {e}");
+            return None;
+        }
     }
 
     Some(request_line)
@@ -144,58 +157,62 @@ struct MockServer {
     handle: tokio::task::JoinHandle<()>,
 }
 
-impl MockServer {
-    /// Start a mock Gemini API server that responds with a tag in each response.
-    async fn start(tag: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock server");
-        let addr = listener.local_addr().expect("local addr");
+/// Serve HTTP/1.1 requests on a single connection until the client closes it
+/// (keep-alive). `GET` returns the model list; `POST` returns an SSE completion
+/// tagged with `tag` (after an optional `delay`) and increments `count`.
+///
+/// Serving multiple requests per connection avoids the connection churn and
+/// ephemeral-port pressure that otherwise makes highly concurrent test runs
+/// flaky.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    tag: String,
+    count: Arc<AtomicUsize>,
+    delay: Option<std::time::Duration>,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut buf_reader = BufReader::new(reader);
 
-        let post_count = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&post_count);
-        let tag = tag.to_string();
+    loop {
+        // `None` means the client closed the connection (or sent a malformed
+        // request) — nothing more to serve.
+        let Some(request_line) = parse_http_request(&mut buf_reader).await else {
+            break;
+        };
 
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let count = Arc::clone(&count);
-                let tag = tag.clone();
-                tokio::spawn(async move {
-                    let (reader, mut writer) = tokio::io::split(stream);
-                    let mut buf_reader = BufReader::new(reader);
-
-                    let Some(request_line) = parse_http_request(&mut buf_reader).await else {
-                        return;
-                    };
-
-                    let is_get = request_line.starts_with("GET ");
-                    let response = if is_get {
-                        json_response(200, &model_list_json())
-                    } else {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        sse_response(&generate_content_json(&tag))
-                    };
-
-                    if let Err(e) = writer.write_all(response.as_bytes()).await {
-                        eprintln!("[MOCK {tag}] write error: {e}");
-                    }
-                    let _ = writer.flush().await;
-                });
+        let response = if request_line.starts_with("GET ") {
+            json_response(200, &model_list_json())
+        } else {
+            count.fetch_add(1, Ordering::SeqCst);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
-        });
+            sse_response(&generate_content_json(&tag))
+        };
 
-        Self {
-            addr,
-            post_count,
-            handle,
+        if let Err(e) = writer.write_all(response.as_bytes()).await {
+            eprintln!("[MOCK {tag}] write error: {e}");
+            break;
+        }
+        if let Err(e) = writer.flush().await {
+            eprintln!("[MOCK {tag}] flush error: {e}");
+            break;
         }
     }
+}
 
-    /// Start a mock server with an intentional delay on POST responses.
+impl MockServer {
+    /// Start a mock Gemini API server that tags each response with `tag`.
+    async fn start(tag: &str) -> Self {
+        Self::start_with_delay(tag, None).await
+    }
+
+    /// Start a mock server that delays each POST response by `delay`.
     async fn start_slow(tag: &str, delay: std::time::Duration) -> Self {
+        Self::start_with_delay(tag, Some(delay)).await
+    }
+
+    async fn start_with_delay(tag: &str, delay: Option<std::time::Duration>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock server");
@@ -210,30 +227,12 @@ impl MockServer {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                let count = Arc::clone(&count);
-                let tag = tag.clone();
-                tokio::spawn(async move {
-                    let (reader, mut writer) = tokio::io::split(stream);
-                    let mut buf_reader = BufReader::new(reader);
-
-                    let Some(request_line) = parse_http_request(&mut buf_reader).await else {
-                        return;
-                    };
-
-                    let is_get = request_line.starts_with("GET ");
-                    let response = if is_get {
-                        json_response(200, &model_list_json())
-                    } else {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(delay).await;
-                        sse_response(&generate_content_json(&tag))
-                    };
-
-                    if let Err(e) = writer.write_all(response.as_bytes()).await {
-                        eprintln!("[MOCK {tag}] write error: {e}");
-                    }
-                    let _ = writer.flush().await;
-                });
+                tokio::spawn(serve_connection(
+                    stream,
+                    tag.clone(),
+                    Arc::clone(&count),
+                    delay,
+                ));
             }
         });
 
@@ -279,6 +278,27 @@ fn multi_thread_rt() -> tokio::runtime::Runtime {
         .expect("multi-thread tokio runtime")
 }
 
+/// Poll `bridge.active_agent_count()` until it reaches zero or the timeout
+/// elapses. Returns `true` if the registry drained to zero.
+///
+/// Used to deterministically verify that dropping a handle (which fires a
+/// best-effort *asynchronous* shutdown) cleans up — without resorting to a
+/// fixed-duration sleep.
+async fn wait_for_zero_agents(bridge: &agy_bridge::AgyBridge) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match bridge.active_agent_count().await {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e) => panic!("active_agent_count query failed: {e}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 // =============================================================================
@@ -298,14 +318,20 @@ fn concurrent_agent_startup_no_gil_lockup() {
 
         let start = std::time::Instant::now();
 
-        // Create 5 agents concurrently.
-        let (a1, a2, a3, a4, a5) = tokio::join!(
-            BRIDGE.agent(agent_config(&url, "Agent 1")),
-            BRIDGE.agent(agent_config(&url, "Agent 2")),
-            BRIDGE.agent(agent_config(&url, "Agent 3")),
-            BRIDGE.agent(agent_config(&url, "Agent 4")),
-            BRIDGE.agent(agent_config(&url, "Agent 5")),
-        );
+        // Create 5 agents concurrently, guarded by a consumer-level timeout so a
+        // true GIL deadlock fails the test instead of hanging forever.
+        let (a1, a2, a3, a4, a5) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(
+                    BRIDGE.agent(agent_config(&url, "Agent 1")),
+                    BRIDGE.agent(agent_config(&url, "Agent 2")),
+                    BRIDGE.agent(agent_config(&url, "Agent 3")),
+                    BRIDGE.agent(agent_config(&url, "Agent 4")),
+                    BRIDGE.agent(agent_config(&url, "Agent 5")),
+                )
+            })
+            .await
+            .expect("concurrent agent creation stalled — possible GIL deadlock");
 
         let elapsed = start.elapsed();
         eprintln!("5 concurrent agent creations took {elapsed:.1?}");
@@ -318,8 +344,7 @@ fn concurrent_agent_startup_no_gil_lockup() {
         let a5 = a5.expect("agent 5");
 
         // GIL lockup detection: 5 concurrent creates should not take
-        // 5 × sequential time. With a 15s timeout on the bridge, even
-        // one GIL-blocked create would time out, failing the test.
+        // 5 × sequential time. A GIL-blocked create would serialize startup.
         assert!(
             elapsed.as_secs() < 14,
             "5 concurrent creates took {elapsed:.1?} — possible GIL deadlock"
@@ -494,17 +519,40 @@ fn no_python_object_leaks_rapid_cycles() {
 
     rt.block_on(async {
         const CYCLES: usize = 10;
+
+        // A dedicated bridge so the live-agent count is isolated from any
+        // other test that shares `BRIDGE` and may run in parallel.
+        let bridge = agy_bridge::AgyBridge::builder()
+            .inter_agent_delay(std::time::Duration::ZERO)
+            .build()
+            .expect("dedicated leak-test bridge");
+
         let server = MockServer::start("leak-test").await;
         let url = server.base_url();
 
-        let mut durations = Vec::with_capacity(CYCLES);
+        assert_eq!(
+            bridge
+                .active_agent_count()
+                .await
+                .expect("count on fresh bridge"),
+            0,
+            "a fresh bridge must have no live agents"
+        );
 
         for i in 0..CYCLES {
-            let start = std::time::Instant::now();
-            let agent = BRIDGE
+            let agent = bridge
                 .agent(agent_config(&url, &format!("cycle-{i}")))
                 .await
                 .unwrap_or_else(|e| panic!("agent creation failed at cycle {i}: {e}"));
+
+            assert_eq!(
+                bridge
+                    .active_agent_count()
+                    .await
+                    .expect("count with live agent"),
+                1,
+                "exactly one agent should be live during cycle {i}"
+            );
 
             let text = agent
                 .chat_text(format!("cycle {i}"))
@@ -517,37 +565,46 @@ fn no_python_object_leaks_rapid_cycles() {
                 .await
                 .unwrap_or_else(|e| panic!("shutdown failed at cycle {i}: {e}"));
 
-            let elapsed = start.elapsed();
-            eprintln!("Cycle {i}: {elapsed:.1?}");
-            durations.push(elapsed);
+            // Deterministic leak check: `shutdown()` removes the agent from the
+            // registry *before* it returns, so the count must be exactly zero.
+            // A leak would leave the entry behind and the count would grow.
+            let live = bridge
+                .active_agent_count()
+                .await
+                .expect("count after shutdown");
+            assert_eq!(
+                live, 0,
+                "agent leak after cycle {i}: {live} agent(s) still registered"
+            );
         }
 
-        // Leak detection: compare steady-state windows.
-        //
-        // Cycles 0–2 include cold-start overhead (Python import, SDK init),
-        // so comparing against them is meaningless. Instead compare the
-        // *middle* warm window (cycles 4–6) against the *last* window (7–9).
-        // If Python objects leak, each cycle accumulates GC pressure / event
-        // loop overhead, so the last window would be measurably slower.
-        let mid_avg: std::time::Duration =
-            durations[4..7].iter().sum::<std::time::Duration>() / 3;
-        let last_avg: std::time::Duration =
-            durations[CYCLES - 3..].iter().sum::<std::time::Duration>() / 3;
-
-        eprintln!("Mid window (4–6) avg: {mid_avg:.1?}");
-        eprintln!("Last window (7–9) avg: {last_avg:.1?}");
-
-        // Both windows are warm — allow 2× for GC jitter / system load.
+        // Dropping a handle *without* an explicit shutdown must also clean up
+        // (best-effort async shutdown fired from `Drop`). The registry must
+        // drain back to zero.
+        {
+            let agent = bridge
+                .agent(agent_config(&url, "drop-cycle"))
+                .await
+                .expect("drop-cycle agent");
+            assert_eq!(
+                bridge
+                    .active_agent_count()
+                    .await
+                    .expect("count before drop"),
+                1,
+                "one live agent before drop"
+            );
+            drop(agent);
+        }
         assert!(
-            last_avg < mid_avg * 2,
-            "Possible Python object leak: last 3 cycles avg {last_avg:.1?} vs mid 3 avg {mid_avg:.1?} \
-             (>2× slowdown in steady state)"
+            wait_for_zero_agents(&bridge).await,
+            "agent dropped without shutdown() was not cleaned up — leak"
         );
 
         assert_eq!(
             server.post_count(),
             CYCLES,
-            "Expected exactly {CYCLES} POST requests"
+            "expected exactly {CYCLES} POST requests"
         );
     });
 }
@@ -612,12 +669,10 @@ fn two_bridges_concurrent_agents_isolation() {
 
         let bridge_1 = agy_bridge::AgyBridge::builder()
             .inter_agent_delay(std::time::Duration::ZERO)
-            .chat_timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("bridge 1");
         let bridge_2 = agy_bridge::AgyBridge::builder()
             .inter_agent_delay(std::time::Duration::ZERO)
-            .chat_timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("bridge 2");
 
@@ -646,12 +701,136 @@ fn two_bridges_concurrent_agents_isolation() {
         // Shut down bridge 1's agent, bridge 2's agent must still work.
         a1.shutdown().await.expect("b1 shutdown");
         let r2_after = a2.chat_text("after b1 shutdown").await;
-        assert!(
-            r2_after.is_ok(),
-            "Bridge 2 agent should survive bridge 1 teardown: {r2_after:?}"
-        );
+        r2_after.expect("Bridge 2 agent should survive bridge 1 teardown");
 
         a2.shutdown().await.expect("b2 shutdown");
+    });
+}
+
+/// Concurrent agent creation across two *separate* bridges must not serialize,
+/// block, or interfere. Even though agent IDs and the per-agent state registry
+/// are process-global, each bridge's live-agent count reflects only its own
+/// agents, and fully tearing down one bridge leaves the other untouched.
+///
+/// This is the deterministic regression guard for the lock-free, per-agent
+/// keyed creation path (no process-global create mutex).
+#[test]
+fn concurrent_creation_across_bridges_no_interference() {
+    let rt = multi_thread_rt();
+
+    rt.block_on(async {
+        const PER_BRIDGE: usize = 4;
+
+        let server = MockServer::start("multi-bridge").await;
+        let url = server.base_url();
+
+        let bridge_1 = agy_bridge::AgyBridge::builder()
+            .inter_agent_delay(std::time::Duration::ZERO)
+            .build()
+            .expect("bridge 1");
+        let bridge_2 = agy_bridge::AgyBridge::builder()
+            .inter_agent_delay(std::time::Duration::ZERO)
+            .build()
+            .expect("bridge 2");
+
+        // Create all agents on BOTH bridges fully concurrently. A process-wide
+        // create lock (the bug this guards against) would serialize these.
+        let (b1, b2) = (&bridge_1, &bridge_2);
+        let (created_1, created_2) = tokio::join!(
+            futures::future::join_all((0..PER_BRIDGE).map(|i| {
+                let url = url.clone();
+                async move { b1.agent(agent_config(&url, &format!("b1-{i}"))).await }
+            })),
+            futures::future::join_all((0..PER_BRIDGE).map(|i| {
+                let url = url.clone();
+                async move { b2.agent(agent_config(&url, &format!("b2-{i}"))).await }
+            })),
+        );
+
+        let agents_1: Vec<_> = created_1
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| r.unwrap_or_else(|e| panic!("bridge 1 agent {i} creation: {e}")))
+            .collect();
+        let agents_2: Vec<_> = created_2
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| r.unwrap_or_else(|e| panic!("bridge 2 agent {i} creation: {e}")))
+            .collect();
+
+        // Deterministic isolation: each bridge counts only its own agents.
+        assert_eq!(
+            bridge_1.active_agent_count().await.expect("b1 count"),
+            PER_BRIDGE,
+            "bridge 1 must see exactly its own agents"
+        );
+        assert_eq!(
+            bridge_2.active_agent_count().await.expect("b2 count"),
+            PER_BRIDGE,
+            "bridge 2 must see exactly its own agents"
+        );
+
+        // Agent IDs are process-globally unique — no collisions across bridges.
+        let ids: Vec<u64> = agents_1
+            .iter()
+            .chain(agents_2.iter())
+            .map(agy_bridge::agent::AgentHandle::id)
+            .collect();
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "agent IDs must be globally unique across bridges: {ids:?}"
+        );
+
+        // Tear down ALL of bridge 1's agents — bridge 2 must be untouched.
+        futures::future::join_all(
+            agents_1
+                .into_iter()
+                .map(|a| async move { a.shutdown().await }),
+        )
+        .await
+        .into_iter()
+        .enumerate()
+        .for_each(|(i, r)| r.unwrap_or_else(|e| panic!("bridge 1 shutdown {i}: {e}")));
+
+        assert_eq!(
+            bridge_1.active_agent_count().await.expect("b1 count after"),
+            0,
+            "bridge 1 must be drained after shutting down all its agents"
+        );
+        assert_eq!(
+            bridge_2.active_agent_count().await.expect("b2 count after"),
+            PER_BRIDGE,
+            "bridge 2 agents must survive bridge 1's full teardown"
+        );
+
+        // Bridge 2 agents remain fully functional after bridge 1 is drained.
+        for (i, a) in agents_2.iter().enumerate() {
+            let text = a
+                .chat_text(format!("b2 still alive {i}"))
+                .await
+                .unwrap_or_else(|e| panic!("bridge 2 chat {i} after bridge 1 teardown: {e}"));
+            assert!(
+                text.contains("mock:multi-bridge"),
+                "bridge 2 agent {i}: {text}"
+            );
+        }
+
+        futures::future::join_all(
+            agents_2
+                .into_iter()
+                .map(|a| async move { a.shutdown().await }),
+        )
+        .await
+        .into_iter()
+        .enumerate()
+        .for_each(|(i, r)| r.unwrap_or_else(|e| panic!("bridge 2 shutdown {i}: {e}")));
+
+        assert!(
+            wait_for_zero_agents(&bridge_2).await,
+            "bridge 2 must drain to zero agents after teardown"
+        );
     });
 }
 
@@ -681,8 +860,8 @@ fn sequential_agent_startup_timing() {
             let elapsed = start.elapsed();
             eprintln!("Agent {i} creation: {elapsed:.1?}");
 
-            // Each agent creation should complete well within the chat_timeout.
-            // If the GIL is locked by a prior agent's init, this will time out.
+            // Each agent creation should complete quickly. If the GIL is locked
+            // by a prior agent's init, this will stall.
             assert!(
                 elapsed.as_secs() < 14,
                 "Agent {i} creation took {elapsed:.1?} — possible GIL contention"
@@ -846,10 +1025,68 @@ fn chat_after_shutdown_returns_error() {
 
         // Chat after shutdown must fail.
         let result = agent.chat_text("after shutdown").await;
-        assert!(
-            result.is_err(),
-            "Chat after shutdown MUST return Err, got Ok({:?})",
-            result.unwrap_or_default()
+        result.expect_err("Chat after shutdown MUST return Err");
+    });
+}
+
+// =============================================================================
+// 13. Concurrent create + simultaneous shutdown storm — no stall
+// =============================================================================
+
+/// Create many agents concurrently, chat with all of them concurrently, then
+/// shut them **all** down at the same time. The entire lifecycle is guarded by
+/// a consumer-level timeout: if the GIL or the runtime thread stalls at any
+/// point, the timeout fires and the test fails instead of hanging forever.
+#[test]
+fn concurrent_create_and_shutdown_storm_no_stall() {
+    let rt = multi_thread_rt();
+
+    rt.block_on(async {
+        const N: usize = 8;
+        let server = MockServer::start("storm").await;
+        let url = server.base_url();
+
+        let lifecycle = async {
+            // Create all agents concurrently.
+            let agents = futures::future::join_all((0..N).map(|i| {
+                let url = url.clone();
+                let name = format!("storm-{i}");
+                async move { BRIDGE.agent(agent_config(&url, &name)).await }
+            }))
+            .await
+            .into_iter()
+            .enumerate()
+            .map(|(i, res)| res.unwrap_or_else(|e| panic!("storm agent {i} creation: {e}")))
+            .collect::<Vec<_>>();
+
+            // Chat with all of them concurrently.
+            let chats =
+                futures::future::join_all(agents.iter().map(|a| a.chat_text("storm ping"))).await;
+            for (i, res) in chats.into_iter().enumerate() {
+                let text = res.unwrap_or_else(|e| panic!("storm agent {i} chat: {e}"));
+                assert!(text.contains("mock:storm"), "storm agent {i} got: {text}");
+            }
+
+            // Shut every agent down simultaneously.
+            let shutdowns = futures::future::join_all(
+                agents
+                    .into_iter()
+                    .map(|a| async move { a.shutdown().await }),
+            )
+            .await;
+            for (i, res) in shutdowns.into_iter().enumerate() {
+                res.unwrap_or_else(|e| panic!("storm agent {i} shutdown: {e}"));
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_mins(1), lifecycle)
+            .await
+            .expect("concurrent create/chat/shutdown storm stalled — possible GIL deadlock");
+
+        assert_eq!(
+            server.post_count(),
+            N,
+            "Expected exactly {N} POST requests from storm test"
         );
     });
 }

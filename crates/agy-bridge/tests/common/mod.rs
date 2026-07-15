@@ -195,7 +195,8 @@ where
 
     // Stagger: sleep a small random duration to spread API bursts across
     // concurrent tests, reducing the chance of hitting TPM limits.
-    let max_stagger = usize::try_from(STAGGER_MAX_MS).unwrap_or(usize::MAX);
+    let max_stagger =
+        usize::try_from(STAGGER_MAX_MS).expect("STAGGER_MAX_MS constant fits in usize");
     let stagger =
         std::time::Duration::from_millis(fast_rands::StdRand::new().between(0, max_stagger) as u64);
     eprintln!(

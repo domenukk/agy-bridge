@@ -15,10 +15,7 @@
 //! suits their use-case (e.g. a CLI only needs `text_tx`, while a UI might
 //! consume the full `event_tx` timeline).
 
-use std::time::Duration;
-
 use pyo3::prelude::*;
-use tokio::time::timeout;
 
 use super::AgentId;
 
@@ -288,9 +285,7 @@ fn classify_py_step_error(err: &pyo3::PyErr, agent_id: AgentId) -> StepIteration
 
 async fn process_next_step_iteration(
     aiter_py: &Py<PyAny>,
-    chat_timeout: Duration,
     agent_id: AgentId,
-    step_count: u64,
 ) -> StepIterationResult {
     let next_fut = Python::attach(|py| -> PyResult<_> {
         let aiter_bound = aiter_py.bind(py);
@@ -303,17 +298,7 @@ async fn process_next_step_iteration(
         Err(e) => return classify_py_step_error(&e, agent_id),
     };
 
-    let step_result = match timeout(chat_timeout, next_fut).await {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            return StepIterationResult::Error(format!(
-                "Step streaming timed out after {}s for agent {agent_id} (step #{step_count})",
-                chat_timeout.as_secs()
-            ));
-        }
-    };
-
-    let step_py = match step_result {
+    let step_py = match next_fut.await {
         Ok(obj) => obj,
         Err(e) => return classify_py_step_error(&e, agent_id),
     };
@@ -338,16 +323,13 @@ async fn process_next_step_iteration(
 
 pub async fn stream_steps_to_writer(
     writer: &crate::streaming::ChatResponseWriter,
-    chat_timeout: Duration,
     agent_id: AgentId,
     aiter_py: &Py<PyAny>,
 ) {
     tracing::debug!(agent_id = ?agent_id, "Starting step streaming");
-    let mut step_count: u64 = 0;
     loop {
-        match process_next_step_iteration(aiter_py, chat_timeout, agent_id, step_count).await {
+        match process_next_step_iteration(aiter_py, agent_id).await {
             StepIterationResult::Step(step) => {
-                step_count += 1;
                 if let Err(send_err) = forward_step_to_writer(writer, *step, agent_id).await {
                     tracing::error!("{send_err}");
                     return;

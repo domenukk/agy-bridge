@@ -1,21 +1,228 @@
-def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
-    import logging, sys, json
+# DRY helpers shared across hook context serialization.
+#
+# These module-level helpers are pure and importable without the live
+# antigravity SDK (all SDK imports happen lazily inside the section-wiring
+# functions and inside `init_agent`), so they can be unit-tested with plain
+# pytest.
 
-    # Extract and consume the backend log level injected by Rust.
-    # Default ("warn") matches upstream SDK behavior — only warnings and above.
-    _pre_parsed = json.loads(config_json)
-    _backend_log_level = _pre_parsed.pop("_backend_log_level", "warn")
-    config_json = json.dumps(_pre_parsed)
+# Hook points whose callbacks must return a `HookResult` (allow/deny gate).
+RESULT_HOOK_POINTS = ("pre_turn", "pre_tool_call_decide", "on_interaction")
 
-    _LEVEL_MAP = {
-        "error": logging.ERROR,
-        "warn": logging.WARNING,
-        "info": logging.INFO,
-        "debug": logging.DEBUG,
+
+def _to_dict(obj):
+    """Best-effort conversion of a pydantic-like object to a plain dict.
+
+    Falls back to returning the object unchanged when it exposes neither
+    `model_dump` (pydantic v2) nor `dict` (pydantic v1).
+    """
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    elif hasattr(obj, "dict"):
+        return obj.dict()
+    return obj
+
+
+def _normalize_tool_name(name):
+    """Normalize a tool name to a plain string.
+
+    Handles enum-like values (`.value`) and non-string names (`str()`).
+    """
+    if hasattr(name, "value"):
+        return name.value
+    elif not isinstance(name, str):
+        return str(name)
+    return name
+
+
+def _serialize_post_tool_call_ctx(ctx, current_tool_call):
+    """Serialize a `post_tool_call` hook context to a JSON string."""
+    import json
+
+    tool_args = getattr(current_tool_call, "args", {}) if current_tool_call else {}
+    tool_args = _to_dict(tool_args)
+
+    result_val = getattr(ctx, "result", None)
+    result_str = ""
+    metadata = {}
+    if result_val is None:
+        result_str = ""
+    elif isinstance(result_val, str):
+        result_str = result_val
+    elif isinstance(result_val, dict) and "content" in result_val:
+        result_str = result_val["content"]
+        metadata = result_val.get("metadata", {})
+    else:
+        tool_output = getattr(result_val, "result", None)
+        if isinstance(tool_output, dict) and "content" in tool_output:
+            result_str = tool_output["content"]
+            metadata = tool_output.get("metadata", {})
+        else:
+            try:
+                if hasattr(result_val, "model_dump_json"):
+                    result_str = result_val.model_dump_json()
+                elif hasattr(result_val, "model_dump"):
+                    result_str = json.dumps(result_val.model_dump())
+                else:
+                    result_str = json.dumps(result_val)
+            except Exception:
+                import logging
+
+                logging.getLogger("agy_bridge.tool_dispatch").warning(
+                    "Failed to JSON-serialize tool result, falling back to str()",
+                    exc_info=True,
+                )
+                result_str = str(result_val)
+
+    tool_name = getattr(ctx, "name", "")
+    tool_name = _normalize_tool_name(tool_name)
+
+    payload = {
+        "name": tool_name,
+        "args": tool_args,
+        "result": result_str,
+        "metadata": metadata,
     }
-    py_level = _LEVEL_MAP.get(_backend_log_level, logging.WARNING)
-    logging.basicConfig(level=py_level, stream=sys.stderr)
-    logger = logging.getLogger("agy_bridge.init")
+    return json.dumps(payload)
+
+
+def _serialize_on_tool_error_ctx(ctx, current_tool_call, hook_logger):
+    """Serialize an `on_tool_error` hook context to a JSON string."""
+    import json
+
+    tool_name = getattr(current_tool_call, "name", "") if current_tool_call else ""
+    tool_args = getattr(current_tool_call, "args", {}) if current_tool_call else {}
+    tool_args = _to_dict(tool_args)
+
+    tool_name = _normalize_tool_name(tool_name)
+
+    payload = {
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "error": str(ctx),
+    }
+    # Best-effort: surface structured metadata
+    # attached to the error context so errors
+    # raised on the Python side still deliver
+    # metadata to on_tool_error. Rust-side
+    # ToolError metadata is merged
+    # authoritatively in `handle_on_tool_error`;
+    # this only helps errors that never reach
+    # the Rust dispatch path.
+    try:
+        err_metadata = getattr(ctx, "metadata", None)
+        if err_metadata is not None:
+            err_metadata = _to_dict(err_metadata)
+            payload["metadata"] = err_metadata
+    except Exception:
+        hook_logger.warning(
+            "Failed to extract metadata from " "on_tool_error context",
+            exc_info=True,
+        )
+    return json.dumps(payload)
+
+
+def _serialize_session_ctx(local_config, agent_id):
+    """Serialize an on_session_start/on_session_end payload to a JSON string.
+
+    Falls back to a workspace-derived or `default_session` conversation id when
+    the config does not carry one.
+    """
+    import json
+
+    conversation_id = local_config.get("conversation_id")
+    if not conversation_id:
+        workspaces = local_config.get("workspaces")
+        if (
+            workspaces
+            and isinstance(workspaces, list)
+            and len(workspaces) > 0
+            and workspaces[0]
+        ):
+            import os
+
+            conversation_id = os.path.basename(str(workspaces[0]).rstrip("/"))
+    if not conversation_id:
+        conversation_id = "default_session"
+    payload = {
+        "session": {
+            "session_id": str(conversation_id),
+            "agent_id": int(agent_id),
+        }
+    }
+    return json.dumps(payload)
+
+
+def _serialize_post_turn_ctx(ctx):
+    """Serialize a `post_turn` hook context to a JSON string."""
+    import json
+
+    text_val = getattr(ctx, "text", str(ctx))
+    return json.dumps(
+        {
+            "response_text": text_val,
+            "turn_number": getattr(ctx, "turn_number", 0),
+        }
+    )
+
+
+def _serialize_pre_turn_ctx(ctx):
+    """Serialize a `pre_turn` hook context to a JSON string."""
+    import json
+
+    text_val = ctx if isinstance(ctx, str) else str(ctx)
+    return json.dumps(
+        {
+            "prompt": text_val,
+            "turn_number": getattr(ctx, "turn_number", 0),
+        }
+    )
+
+
+def _serialize_generic_ctx(ctx):
+    """Serialize an arbitrary hook context to a JSON string.
+
+    Handles plain strings, pydantic models (`model_dump_json`), dicts, and an
+    opaque `str()` fallback.
+    """
+    import json
+
+    if isinstance(ctx, str):
+        return json.dumps({"value": ctx})
+    elif hasattr(ctx, "model_dump_json"):
+        return ctx.model_dump_json()
+    elif isinstance(ctx, dict):
+        return json.dumps(ctx)
+    else:
+        return json.dumps(str(ctx))
+
+
+def _munge_config_model(local_config):
+    """Drop the redundant top-level `model` shorthand when gemini_config is set.
+
+    The Rust AgentConfig always serializes a `model` field (it's a required
+    String, not Option).  The SDK's LocalAgentConfig validator rejects configs
+    that set *both* the top-level `model` shorthand and
+    `gemini_config.models.default`.  When gemini_config carries the model via
+    `models.default`, drop the redundant top-level key.
+    """
+    if "gemini_config" in local_config and local_config.get("gemini_config"):
+        local_config.pop("model", None)
+
+
+def _extract_initial_history(local_config):
+    """Pop and return `initial_history` from the config.
+
+    Extract initial_history before passing config to the SDK.
+    The SDK does not know about this field — we inject it into the
+    conversation's internal _history list after agent creation.
+    """
+    return local_config.pop("initial_history", [])
+
+
+def _apply_sdk_monkeypatches(logger):
+    """Apply the LocalConnection monkeypatches (turn-context/idle-event race,
+    dynamic cascade_id sync, tool-result normalization)."""
+    import sys
 
     try:
         from google.antigravity.connections.local.local_connection import (
@@ -147,13 +354,10 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     except Exception as e:
         logger.warning("Failed to apply LocalConnection monkeypatch: %s", e)
 
-    if "_agy_bridge_globals" not in sys.modules:
-        import types
 
-        sys.modules["_agy_bridge_globals"] = types.ModuleType("_agy_bridge_globals")
-
+def _wire_tool_proxies(local_config, agent_id_u64):
+    """Replace tool/capability dict specs with AsyncRustProxy instances."""
     from google.antigravity.tools import tool_runner
-    import json
 
     class AsyncRustProxy(tool_runner.ToolWithSchema):
         def __init__(self, agent_id, name, description, schema_dict):
@@ -196,8 +400,6 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     def create_proxy(agent_id, name, desc, schema):
         return AsyncRustProxy(agent_id, name, desc, schema)
 
-    local_config = json.loads(config_json)
-
     if "tools" in local_config:
         proxies = []
         for t in local_config["tools"]:
@@ -236,6 +438,11 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
     if "capabilities" in local_config and local_config["capabilities"] is None:
         del local_config["capabilities"]
+
+
+def _wire_policies(local_config, agent_id_u64):
+    """Translate serialized policy specs into SDK policy objects."""
+    import logging
 
     from google.antigravity.hooks import policy
 
@@ -292,6 +499,12 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                 policy_logger.warning("Unknown policy type %r, skipping", p)
         local_config["policies"] = parsed_policies
 
+
+def _wire_hooks(local_config, agent_id_u64):
+    """Register Rust-backed hook callbacks with the SDK."""
+    import logging
+    import sys
+
     # --- Wire hooks ---
     hooks_entries = local_config.pop("hooks", [])
 
@@ -325,7 +538,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                         """Factory to capture name/point_label per hook."""
 
                         async def _hook_callback(ctx=None):
-                            import json, inspect
+                            import sys, json, inspect
 
                             globals_mod = sys.modules.get("_agy_bridge_globals")
                             if not globals_mod or not hasattr(
@@ -335,11 +548,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                                     "dispatch_rust_hook not found in _agy_bridge_globals, skipping hook %r",
                                     name,
                                 )
-                                if point_label in (
-                                    "pre_turn",
-                                    "pre_tool_call_decide",
-                                    "on_interaction",
-                                ):
+                                if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False,
                                         message="dispatch_rust_hook not found in _agy_bridge_globals",
@@ -363,75 +572,9 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                                         and hasattr(globals_mod, "CURRENT_TOOL_CALLS")
                                         else None
                                     )
-                                    tool_args = (
-                                        getattr(current_tool_call, "args", {})
-                                        if current_tool_call
-                                        else {}
+                                    ctx_json = _serialize_post_tool_call_ctx(
+                                        ctx, current_tool_call
                                     )
-                                    if hasattr(tool_args, "model_dump"):
-                                        tool_args = tool_args.model_dump()
-                                    elif hasattr(tool_args, "dict"):
-                                        tool_args = tool_args.dict()
-
-                                    result_val = getattr(ctx, "result", None)
-                                    result_str = ""
-                                    metadata = {}
-                                    if result_val is None:
-                                        result_str = ""
-                                    elif isinstance(result_val, str):
-                                        result_str = result_val
-                                    elif (
-                                        isinstance(result_val, dict)
-                                        and "content" in result_val
-                                    ):
-                                        result_str = result_val["content"]
-                                        metadata = result_val.get("metadata", {})
-                                    else:
-                                        tool_output = getattr(
-                                            result_val, "result", None
-                                        )
-                                        if (
-                                            isinstance(tool_output, dict)
-                                            and "content" in tool_output
-                                        ):
-                                            result_str = tool_output["content"]
-                                            metadata = tool_output.get("metadata", {})
-                                        else:
-                                            try:
-                                                if hasattr(
-                                                    result_val, "model_dump_json"
-                                                ):
-                                                    result_str = (
-                                                        result_val.model_dump_json()
-                                                    )
-                                                elif hasattr(result_val, "model_dump"):
-                                                    result_str = json.dumps(
-                                                        result_val.model_dump()
-                                                    )
-                                                else:
-                                                    result_str = json.dumps(result_val)
-                                            except Exception:
-                                                logging.getLogger(
-                                                    "agy_bridge.tool_dispatch"
-                                                ).warning(
-                                                    "Failed to JSON-serialize tool result, falling back to str()",
-                                                    exc_info=True,
-                                                )
-                                                result_str = str(result_val)
-
-                                    tool_name = getattr(ctx, "name", "")
-                                    if hasattr(tool_name, "value"):
-                                        tool_name = tool_name.value
-                                    elif not isinstance(tool_name, str):
-                                        tool_name = str(tool_name)
-
-                                    payload = {
-                                        "name": tool_name,
-                                        "args": tool_args,
-                                        "result": result_str,
-                                        "metadata": metadata,
-                                    }
-                                    ctx_json = json.dumps(payload)
                                 elif point_label == "on_tool_error":
                                     current_tool_call = (
                                         globals_mod.CURRENT_TOOL_CALLS.get(agent_id_u64)
@@ -439,103 +582,32 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                                         and hasattr(globals_mod, "CURRENT_TOOL_CALLS")
                                         else None
                                     )
-                                    tool_name = (
-                                        getattr(current_tool_call, "name", "")
-                                        if current_tool_call
-                                        else ""
+                                    ctx_json = _serialize_on_tool_error_ctx(
+                                        ctx, current_tool_call, hook_logger
                                     )
-                                    tool_args = (
-                                        getattr(current_tool_call, "args", {})
-                                        if current_tool_call
-                                        else {}
-                                    )
-                                    if hasattr(tool_args, "model_dump"):
-                                        tool_args = tool_args.model_dump()
-                                    elif hasattr(tool_args, "dict"):
-                                        tool_args = tool_args.dict()
-
-                                    if hasattr(tool_name, "value"):
-                                        tool_name = tool_name.value
-                                    elif not isinstance(tool_name, str):
-                                        tool_name = str(tool_name)
-
-                                    payload = {
-                                        "tool_name": tool_name,
-                                        "tool_args": tool_args,
-                                        "error": str(ctx),
-                                    }
-                                    ctx_json = json.dumps(payload)
                                 elif ctx is None:
                                     if point_label in (
                                         "on_session_start",
                                         "on_session_end",
                                     ):
-                                        conversation_id = local_config.get(
-                                            "conversation_id"
+                                        ctx_json = _serialize_session_ctx(
+                                            local_config, agent_id_u64
                                         )
-                                        if not conversation_id:
-                                            workspaces = local_config.get("workspaces")
-                                            if (
-                                                workspaces
-                                                and isinstance(workspaces, list)
-                                                and len(workspaces) > 0
-                                                and workspaces[0]
-                                            ):
-                                                import os
-
-                                                conversation_id = os.path.basename(
-                                                    str(workspaces[0]).rstrip("/")
-                                                )
-                                        if not conversation_id:
-                                            conversation_id = "default_session"
-                                        payload = {
-                                            "session": {
-                                                "session_id": str(conversation_id),
-                                                "agent_id": int(agent_id_u64),
-                                            }
-                                        }
-                                        ctx_json = json.dumps(payload)
                                     else:
                                         ctx_json = "{}"
                                 elif point_label == "post_turn":
-                                    text_val = getattr(ctx, "text", str(ctx))
-                                    ctx_json = json.dumps(
-                                        {
-                                            "response_text": text_val,
-                                            "turn_number": getattr(
-                                                ctx, "turn_number", 0
-                                            ),
-                                        }
-                                    )
+                                    ctx_json = _serialize_post_turn_ctx(ctx)
                                 elif point_label == "pre_turn":
-                                    text_val = ctx if isinstance(ctx, str) else str(ctx)
-                                    ctx_json = json.dumps(
-                                        {
-                                            "prompt": text_val,
-                                            "turn_number": getattr(
-                                                ctx, "turn_number", 0
-                                            ),
-                                        }
-                                    )
-                                elif isinstance(ctx, str):
-                                    ctx_json = json.dumps({"value": ctx})
-                                elif hasattr(ctx, "model_dump_json"):
-                                    ctx_json = ctx.model_dump_json()
-                                elif isinstance(ctx, dict):
-                                    ctx_json = json.dumps(ctx)
+                                    ctx_json = _serialize_pre_turn_ctx(ctx)
                                 else:
-                                    ctx_json = json.dumps(str(ctx))
+                                    ctx_json = _serialize_generic_ctx(ctx)
                             except Exception as e:
                                 hook_logger.error(
                                     "Failed to serialize hook context for %r: %s",
                                     name,
                                     e,
                                 )
-                                if point_label in (
-                                    "pre_turn",
-                                    "pre_tool_call_decide",
-                                    "on_interaction",
-                                ):
+                                if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False,
                                         message=f"Failed to serialize hook context: {e}",
@@ -554,11 +626,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                                 hook_logger.error(
                                     "dispatch_rust_hook failed for %r: %s", name, e
                                 )
-                                if point_label in (
-                                    "pre_turn",
-                                    "pre_tool_call_decide",
-                                    "on_interaction",
-                                ):
+                                if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False, message=str(e)
                                     )
@@ -578,21 +646,13 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
                                         result_json,
                                         e,
                                     )
-                                    if point_label in (
-                                        "pre_turn",
-                                        "pre_tool_call_decide",
-                                        "on_interaction",
-                                    ):
+                                    if point_label in RESULT_HOOK_POINTS:
                                         return hooks_module.HookResult(
                                             allow=False,
                                             message=f"Invalid hook result JSON: {e}",
                                         )
 
-                            if point_label in (
-                                "pre_turn",
-                                "pre_tool_call_decide",
-                                "on_interaction",
-                            ):
+                            if point_label in RESULT_HOOK_POINTS:
                                 return hooks_module.HookResult(allow=True, message="")
 
                         return _hook_callback
@@ -630,6 +690,11 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
             hook_logger.warning(
                 "google.antigravity.hooks.hooks module not available, skipping hook registration"
             )
+
+
+def _wire_triggers(local_config):
+    """Register SDK triggers from serialized trigger specs; returns the list."""
+    import logging
 
     # --- Wire triggers using SDK primitives ---
     trigger_entries = local_config.pop("triggers", [])
@@ -695,6 +760,12 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
         except ImportError:
             trigger_logger = logging.getLogger("agy_bridge.triggers")
             trigger_logger.error("Failed to import trigger modules: %s", exc)
+    return sdk_triggers
+
+
+def _wire_mcp_servers(local_config):
+    """Convert serialized MCP server dicts into SDK pydantic types."""
+    import logging
 
     # --- Wire MCP Servers ---
     # Rust serializes MCP servers as JSON dicts with a "type" discriminator.
@@ -724,11 +795,16 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     else:
         local_config.pop("mcp_servers", None)
 
-    # Rust serializes `skills` as `"skills_paths"` and `gemini` as
-    # `"gemini_config"` via serde(rename), so no Python-side renaming needed.
-    # Strip null gemini_config so the SDK uses its defaults.
-    if "gemini_config" in local_config and local_config["gemini_config"] is None:
-        local_config.pop("gemini_config")
+
+def _setup_base_url_routing(local_config):
+    """Wire per-instance base_url routing into LocalConnectionStrategy.
+
+    Returns the custom base_url (or None) so the caller can bind it onto the
+    agent lifecycle at the right time.
+    """
+    import logging
+
+    logger = logging.getLogger("agy_bridge.init")
 
     # --- Handle custom base_url routing ---
     # When a custom base_url is set (e.g., local proxy, alternative gateway),
@@ -754,16 +830,25 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
             LocalConnectionStrategy,
         )
 
-        # Per-instance registry: maps strategy id() → base_url.
-        # The class-level patch is installed once and dispatches
-        # per-instance using this registry.
-        if not hasattr(LocalConnectionStrategy, "_base_url_registry"):
-            LocalConnectionStrategy._base_url_registry = {}
+        import contextvars
+
+        # Route the base_url to the connection strategy WITHOUT any global
+        # handoff slot. A `contextvars.ContextVar` is isolated per asyncio task
+        # and per thread, so concurrent agent creations — on the same event
+        # loop or across separate bridges — never clobber each other's
+        # base_url. The URL is copied onto the strategy instance in `__init__`
+        # (which runs inside the creating agent's task during `__aenter__`) and
+        # consumed in `_build_harness_config`. Because it lives on the instance,
+        # it is freed with the strategy — there is no ever-growing registry.
+        if not hasattr(LocalConnectionStrategy, "_agy_base_url_var"):
+            LocalConnectionStrategy._agy_base_url_var = contextvars.ContextVar(
+                "agy_base_url", default=None
+            )
             _original_build = LocalConnectionStrategy._build_harness_config
 
             def _patched_build(self):
                 config = _original_build(self)
-                url = LocalConnectionStrategy._base_url_registry.get(id(self))
+                url = getattr(self, "_agy_base_url", None)
                 if url:
                     config.gemini_config.base_url = url
                     if config.gemini_config.api_key == "LOAS":
@@ -781,39 +866,28 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
             LocalConnectionStrategy._build_harness_config = _patched_build
 
-            # Also patch __init__ to register from the pending queue
+            # Patch __init__ to bind the base_url from the current task/thread
+            # context onto the new strategy instance.
             _original_strategy_init = LocalConnectionStrategy.__init__
 
             def _patched_strategy_init(self, *args, **kwargs):
                 _original_strategy_init(self, *args, **kwargs)
-                # Consume the pending base_url (set by _agent_lifecycle just
-                # before __aenter__) and associate it with this instance.
-                pending = getattr(LocalConnectionStrategy, "_pending_base_url", None)
-                if pending is not None:
-                    LocalConnectionStrategy._base_url_registry[id(self)] = pending
-                    LocalConnectionStrategy._pending_base_url = None
+                # ContextVar reads are task- and thread-local, so this is
+                # race-free across concurrent agent creations.
+                self._agy_base_url = LocalConnectionStrategy._agy_base_url_var.get()
 
             LocalConnectionStrategy.__init__ = _patched_strategy_init
 
-    # The Rust AgentConfig always serializes a `model` field (it's a required
-    # String, not Option).  The SDK's LocalAgentConfig validator rejects configs
-    # that set *both* the top-level `model` shorthand and
-    # `gemini_config.models.default`.  When gemini_config carries the model via
-    # `models.default`, drop the redundant top-level key.
-    if "gemini_config" in local_config and local_config.get("gemini_config"):
-        local_config.pop("model", None)
+    return custom_base_url
 
-    # Extract initial_history before passing config to the SDK.
-    # The SDK does not know about this field — we inject it into the
-    # conversation's internal _history list after agent creation.
-    initial_history = local_config.pop("initial_history", [])
 
-    from google.antigravity.connections.local.local_connection_config import (
-        LocalAgentConfig,
-    )
-
-    config = LocalAgentConfig(triggers=sdk_triggers, **local_config)
-    agent = agent_cls(config)
+def _build_agent_lifecycle(
+    agent, agent_id_u64, initial_history, custom_base_url, passed_event_loop
+):
+    """Schedule the agent's async lifecycle and return `(controller, awaitable)`."""
+    import asyncio
+    import logging
+    import sys
 
     # Store the base_url on the agent object so _agent_lifecycle can
     # set _pending_base_url at the right time (on the event loop thread,
@@ -821,28 +895,25 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     if custom_base_url:
         agent._agy_pending_base_url = custom_base_url
 
-    import asyncio
-
     enter_event = asyncio.Event()
     exit_event = asyncio.Event()
     result_holder = {}
 
     async def _agent_lifecycle():
         try:
-            # Set _pending_base_url HERE, on the event loop thread, right
-            # before __aenter__. This avoids the race where another
-            # init_agent() call on the Python thread could overwrite it.
-            #
-            # The asyncio event loop is single-threaded and cooperative:
-            # no other coroutine can interleave between setting the pending
-            # URL and the strategy's __init__ consuming it during __aenter__.
+            # Bind this agent's base_url into the current task's context, on the
+            # event loop thread, right before __aenter__. `_agent_lifecycle`
+            # runs as its own asyncio task (scheduled via
+            # run_coroutine_threadsafe), so the ContextVar value is isolated
+            # from every other concurrent agent creation — there is no shared
+            # slot that another init could overwrite, on this loop or any other.
             pending_url = getattr(agent, "_agy_pending_base_url", None)
             if pending_url is not None:
                 from google.antigravity.connections.local.local_connection import (
                     LocalConnectionStrategy,
                 )
 
-                LocalConnectionStrategy._pending_base_url = pending_url
+                LocalConnectionStrategy._agy_base_url_var.set(pending_url)
                 delattr(agent, "_agy_pending_base_url")
 
             async with agent:
@@ -929,3 +1000,61 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
     controller = AgentLifecycleController(future, exit_event)
     return (controller, _wait_for_enter())
+
+
+def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
+    import logging, sys, json
+
+    # Extract and consume the backend log level injected by Rust.
+    # Default ("warn") matches upstream SDK behavior — only warnings and above.
+    _pre_parsed = json.loads(config_json)
+    _backend_log_level = _pre_parsed.pop("_backend_log_level", "warn")
+    config_json = json.dumps(_pre_parsed)
+
+    _LEVEL_MAP = {
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+    }
+    py_level = _LEVEL_MAP.get(_backend_log_level, logging.WARNING)
+    logging.basicConfig(level=py_level, stream=sys.stderr)
+    logger = logging.getLogger("agy_bridge.init")
+
+    _apply_sdk_monkeypatches(logger)
+
+    if "_agy_bridge_globals" not in sys.modules:
+        import types
+
+        sys.modules["_agy_bridge_globals"] = types.ModuleType("_agy_bridge_globals")
+
+    local_config = json.loads(config_json)
+
+    _wire_tool_proxies(local_config, agent_id_u64)
+    _wire_policies(local_config, agent_id_u64)
+    _wire_hooks(local_config, agent_id_u64)
+    sdk_triggers = _wire_triggers(local_config)
+    _wire_mcp_servers(local_config)
+
+    # Rust serializes `skills` as `"skills_paths"` and `gemini` as
+    # `"gemini_config"` via serde(rename), so no Python-side renaming needed.
+    # Strip null gemini_config so the SDK uses its defaults.
+    if "gemini_config" in local_config and local_config["gemini_config"] is None:
+        local_config.pop("gemini_config")
+
+    custom_base_url = _setup_base_url_routing(local_config)
+
+    _munge_config_model(local_config)
+
+    initial_history = _extract_initial_history(local_config)
+
+    from google.antigravity.connections.local.local_connection_config import (
+        LocalAgentConfig,
+    )
+
+    config = LocalAgentConfig(triggers=sdk_triggers, **local_config)
+    agent = agent_cls(config)
+
+    return _build_agent_lifecycle(
+        agent, agent_id_u64, initial_history, custom_base_url, passed_event_loop
+    )

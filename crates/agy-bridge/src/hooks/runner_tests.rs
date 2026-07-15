@@ -145,6 +145,7 @@ fn hook_runner_on_tool_error_fires_with_context() {
         tool_name: "write_file".into(),
         tool_args: serde_json::json!({}),
         error: "permission denied".into(),
+        metadata: serde_json::Value::Null,
     });
 
     assert_eq!(*captured_error.lock().unwrap(), "permission denied");
@@ -423,6 +424,7 @@ fn convenience_on_tool_error() {
         tool_name: "t".into(),
         tool_args: serde_json::Value::Null,
         error: "boom".into(),
+        metadata: serde_json::Value::Null,
     });
     assert_eq!(*captured.lock().unwrap(), "boom");
 }

@@ -200,6 +200,11 @@ impl QuotaState {
     ///
     /// If the internal mutex is poisoned, logs an error and falls through
     /// immediately (operations proceed without backoff rather than panicking).
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the compile-time jitter constants cannot be represented
+    /// as `usize` — impossible on any supported platform.
     pub async fn wait_for_quota(&self) {
         let (deadline, count) = {
             let inner = match self.inner.lock() {
@@ -220,8 +225,10 @@ impl QuotaState {
                 let wait = until - now;
                 // Per-call jitter so agents sharing the same deadline don't
                 // wake simultaneously (thundering-herd mitigation).
-                let min_val = usize::try_from(MIN_PER_AGENT_JITTER_MS).unwrap_or(usize::MAX);
-                let max_val = usize::try_from(MAX_PER_AGENT_JITTER_MS).unwrap_or(usize::MAX);
+                let min_val = usize::try_from(MIN_PER_AGENT_JITTER_MS)
+                    .expect("MIN_PER_AGENT_JITTER_MS constant fits in usize");
+                let max_val = usize::try_from(MAX_PER_AGENT_JITTER_MS)
+                    .expect("MAX_PER_AGENT_JITTER_MS constant fits in usize");
                 let per_agent_jitter = Duration::from_millis(
                     fast_rands::StdRand::new().between(min_val, max_val) as u64,
                 );
@@ -309,7 +316,7 @@ const MAX_JITTER_MS: u64 = 5000;
 /// Uses `fastrand` for non-deterministic jitter, preventing thundering-herd
 /// effects when multiple clients back off from the same attempt count.
 fn jitter_ms() -> u64 {
-    let max_val = usize::try_from(MAX_JITTER_MS - 1).unwrap_or(usize::MAX);
+    let max_val = usize::try_from(MAX_JITTER_MS - 1).expect("MAX_JITTER_MS constant fits in usize");
     fast_rands::StdRand::new().between(0, max_val) as u64
 }
 
@@ -621,5 +628,71 @@ mod tests {
         state_a.record_quota_hit(Duration::from_secs(10));
         assert!(state_a.consecutive_429_count() > 0);
         assert_eq!(state_b.consecutive_429_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn aggregate_status_reports_max_429s_and_throttled() {
+        tokio::time::pause();
+        let registry = QuotaRegistry::new();
+
+        // Empty registry: no 429s, not throttled.
+        let (max_429s, throttled) = registry.aggregate_status();
+        assert_eq!(max_429s, 0);
+        assert!(!throttled);
+
+        // Hit quota on key A.
+        let a = registry.state_for_key("agg-key-a");
+        a.record_quota_hit(Duration::from_secs(10));
+
+        let (max_429s, throttled) = registry.aggregate_status();
+        assert_eq!(max_429s, 1);
+        assert!(throttled);
+
+        // Hit quota on key B three times.
+        let b = registry.state_for_key("agg-key-b");
+        for _ in 0..3 {
+            b.record_quota_hit(Duration::from_secs(10));
+        }
+
+        let (max_429s, throttled) = registry.aggregate_status();
+        assert_eq!(max_429s, 3, "should report the max across all keys");
+        assert!(throttled);
+
+        // Advance time past all backoffs.
+        tokio::time::advance(Duration::from_secs(200)).await;
+
+        let (max_429s, throttled) = registry.aggregate_status();
+        assert_eq!(max_429s, 3, "counter stays until success reset");
+        assert!(
+            !throttled,
+            "should no longer be throttled after backoff expires"
+        );
+    }
+
+    #[test]
+    fn quota_registry_prunes_idle_entries_at_capacity() {
+        let registry = QuotaRegistry::new();
+
+        // Fill the registry to capacity with idle entries.
+        for i in 0..MAX_QUOTA_ENTRIES {
+            let state = registry.state_for_key(&format!("pruning-idle-key-{i}"));
+            assert_eq!(state.consecutive_429_count(), 0);
+        }
+
+        // All entries are idle (0 consecutive 429s).
+        let initial_count = registry.inner.read().unwrap().len();
+        assert_eq!(initial_count, MAX_QUOTA_ENTRIES);
+
+        // Mark one key as active (non-idle).
+        let active = registry.state_for_key("pruning-idle-key-0");
+        active.record_quota_hit(Duration::from_secs(1));
+
+        // Insert one more key — this should trigger pruning of idle entries.
+        let new_state = registry.state_for_key("pruning-new-key");
+        assert_eq!(new_state.consecutive_429_count(), 0);
+
+        let final_count = registry.inner.read().unwrap().len();
+        // Only the active key and the new key should remain.
+        assert_eq!(final_count, 2, "idle entries should have been pruned");
     }
 }

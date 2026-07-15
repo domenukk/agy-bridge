@@ -3,15 +3,12 @@ use std::time::Duration;
 
 use futures::stream::StreamExt;
 use pyo3::prelude::*;
-use tokio::{sync::mpsc, time::timeout};
+use tokio::sync::mpsc;
 
 use super::{
     AgentId, PyCommand,
     handlers::{agent, async_ops, chat, query},
 };
-
-/// Timeout applied to `handle_send`, `handle_signal_idle`, and `handle_wait_for_wakeup`.
-pub(super) const HANDLER_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Python module name used for Rust ↔ Python global state.
 pub(crate) const AGY_BRIDGE_GLOBALS_MODULE: &str = "_agy_bridge_globals";
@@ -56,13 +53,8 @@ pub(super) fn lookup_agent_instance(
 pub(crate) async fn run_async_command_loop(
     event_loop: Py<PyAny>,
     mut cmd_rx: mpsc::Receiver<PyCommand>,
-    chat_timeout: Duration,
     inter_agent_delay: Duration,
 ) -> PyResult<()> {
-    tracing::info!(
-        timeout_secs = chat_timeout.as_secs(),
-        "Chat round-trip timeout configured"
-    );
     let registry: AgentRegistry = std::sync::Arc::new(std::sync::Mutex::new(RegistryInner::new()));
     let mut active_tasks =
         futures::stream::FuturesUnordered::<futures::future::BoxFuture<'static, ()>>::new();
@@ -78,7 +70,6 @@ pub(crate) async fn run_async_command_loop(
                     cmd,
                     &registry,
                     &event_loop,
-                    chat_timeout,
                     inter_agent_delay,
                     &mut active_tasks,
                 ).await {
@@ -141,27 +132,18 @@ async fn cleanup_single_agent(agent_id: AgentId, ctx_py: Py<PyAny>) {
                 pyo3_async_runtimes::tokio::into_future(coro)
             });
             match aexit_fut {
-                Ok(fut) => {
-                    // Use a short timeout — we're shutting down.
-                    match timeout(Duration::from_secs(10), fut).await {
-                        Ok(Ok(_)) => {
-                            tracing::debug!(agent_id = ?agent_id, "Agent __aexit__ completed");
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                agent_id = ?agent_id,
-                                error = %e,
-                                "Agent __aexit__ returned error during cleanup"
-                            );
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(
-                                agent_id = ?agent_id,
-                                "Agent __aexit__ timed out during cleanup (10s)"
-                            );
-                        }
+                Ok(fut) => match fut.await {
+                    Ok(_) => {
+                        tracing::debug!(agent_id = ?agent_id, "Agent __aexit__ completed");
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = ?agent_id,
+                            error = %e,
+                            "Agent __aexit__ returned error during cleanup"
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         agent_id = ?agent_id,
@@ -228,6 +210,9 @@ fn dispatch_query_command(cmd: PyCommand, registry: &AgentRegistry) -> Result<()
         PyCommand::IsIdle { agent_id, reply } => {
             query::handle_is_idle(registry, agent_id, reply);
         }
+        PyCommand::GetActiveAgentCount { reply } => {
+            query::handle_get_active_agent_count(registry, reply);
+        }
         other => return Err(other),
     }
     Ok(())
@@ -239,7 +224,6 @@ async fn dispatch_async_command(
     cmd: PyCommand,
     registry: &AgentRegistry,
     event_loop: &Py<PyAny>,
-    chat_timeout: Duration,
     inter_agent_delay: Duration,
     active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
 ) -> DispatchResult {
@@ -250,11 +234,10 @@ async fn dispatch_async_command(
     };
 
     // Phase 2: agent lifecycle commands (create, shutdown).
-    let cmd =
-        match dispatch_lifecycle_command(cmd, registry, event_loop, chat_timeout, active_tasks) {
-            Ok(()) => return DispatchResult::Continue,
-            Err(cmd) => cmd,
-        };
+    let cmd = match dispatch_lifecycle_command(cmd, registry, event_loop, active_tasks) {
+        Ok(()) => return DispatchResult::Continue,
+        Err(cmd) => cmd,
+    };
 
     // Phase 3: chat (has its own async dispatch path).
     let cmd = match cmd {
@@ -268,7 +251,6 @@ async fn dispatch_async_command(
                 agent_id,
                 prompt,
                 reply,
-                chat_timeout,
                 active_tasks,
                 inter_agent_delay,
             )
@@ -319,22 +301,25 @@ fn dispatch_lifecycle_command(
     cmd: PyCommand,
     registry: &AgentRegistry,
     event_loop: &Py<PyAny>,
-    chat_timeout: Duration,
     active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
 ) -> Result<(), PyCommand> {
     match cmd {
-        PyCommand::CreateAgent { config_json, reply } => {
+        PyCommand::CreateAgent {
+            agent_id,
+            config_json,
+            reply,
+        } => {
             let registry = registry.clone();
             let event_loop = Python::attach(|py| event_loop.clone_ref(py));
             spawn_agent_task(active_tasks, async move {
-                agent::handle_create_agent(registry, event_loop, chat_timeout, config_json, reply)
+                agent::handle_create_agent(registry, event_loop, agent_id, config_json, reply)
                     .await;
             });
         }
         PyCommand::ShutdownAgent { agent_id, reply } => {
             let registry = registry.clone();
             spawn_agent_task(active_tasks, async move {
-                agent::handle_shutdown_agent(registry, chat_timeout, agent_id, reply).await;
+                agent::handle_shutdown_agent(registry, agent_id, reply).await;
             });
         }
         other => return Err(other),

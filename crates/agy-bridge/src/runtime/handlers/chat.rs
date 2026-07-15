@@ -2,7 +2,7 @@
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use tokio::{sync::oneshot, time::timeout};
+use tokio::sync::oneshot;
 
 use super::super::{AgentId, command_loop::lookup_agent_instance, py_scripts::decode_prompt_py};
 use crate::{error::Error, types::UsageMetadata};
@@ -13,7 +13,6 @@ pub(in crate::runtime) async fn dispatch_chat_command(
     agent_id: AgentId,
     prompt: String,
     reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
-    chat_timeout: Duration,
     active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
     inter_agent_delay: Duration,
 ) {
@@ -27,7 +26,7 @@ pub(in crate::runtime) async fn dispatch_chat_command(
     };
 
     let agent_instance = Python::attach(|py| agent_instance.clone_ref(py));
-    let chat_fut = handle_chat(agent_instance, chat_timeout, agent_id, prompt, reply);
+    let chat_fut = handle_chat(agent_instance, agent_id, prompt, reply);
     active_tasks.push(Box::pin(chat_fut));
     // Small delay between successive chat commands to avoid burst requests.
     tokio::time::sleep(inter_agent_delay).await;
@@ -160,7 +159,6 @@ fn apply_response_metadata(
 /// [`ChatResponseWriter`] channels for true streaming.
 pub(crate) async fn handle_chat(
     agent_instance: Py<PyAny>,
-    chat_timeout: Duration,
     agent_id: AgentId,
     prompt: String,
     reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
@@ -179,22 +177,12 @@ pub(crate) async fn handle_chat(
         }
     };
 
-    let response_py = match timeout(chat_timeout, start_fut).await {
-        Ok(Ok(obj)) => obj,
-        Ok(Err(e)) => {
+    let response_py = match start_fut.await {
+        Ok(obj) => obj,
+        Err(e) => {
             let err: Error = e.into();
             if let Err(e) = reply.send(Err(err)) {
                 tracing::warn!(error = ?e, "Chat reply receiver dropped (start error)");
-            }
-            return;
-        }
-        Err(_elapsed) => {
-            tracing::error!(agent_id = ?agent_id, timeout_secs = chat_timeout.as_secs(), "chat() timed out");
-            if let Err(e) = reply.send(Err(Error::Timeout {
-                duration: chat_timeout,
-                operation: "start_chat".to_string(),
-            })) {
-                tracing::warn!(error = ?e, "Chat reply receiver dropped (start timeout)");
             }
             return;
         }
@@ -220,8 +208,7 @@ pub(crate) async fn handle_chat(
     }
 
     // Phase 4: Stream steps from the Python async iterator through the writer.
-    super::super::streaming::stream_steps_to_writer(&writer, chat_timeout, agent_id, &aiter_py)
-        .await;
+    super::super::streaming::stream_steps_to_writer(&writer, agent_id, &aiter_py).await;
 
     // Phase 5: Extract final metadata and apply to the writer.
     let (usage, structured) = extract_response_metadata(&response_py, &agent_instance, agent_id);

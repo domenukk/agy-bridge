@@ -1,6 +1,6 @@
 //! Demonstrates `md-tmpl` integration with `#[llm_tool]`.
 //!
-//! - `prompt_file` loads the tool **description** (shown to the LLM) from a
+//! - `description_file` loads the tool **description** (shown to the LLM) from a
 //!   `.tmpl.md` template. Compile-time `params(...)` are baked into the
 //!   description at zero runtime cost.
 //! - `response_file` renders the tool's **return value** through a template
@@ -23,7 +23,7 @@ struct SearchResult {
 }
 
 #[llm_tool(
-    prompt_file = "examples/getting_started/tools/search_files.tmpl.md",
+    description_file = "examples/getting_started/tools/search_files.tmpl.md",
     response_file = "examples/getting_started/tools/search_results.tmpl.md",
     params(pattern = "*", directory = "/project")
 )]

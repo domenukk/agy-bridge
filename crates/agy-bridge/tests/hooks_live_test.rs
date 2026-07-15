@@ -174,9 +174,7 @@ fn test_on_tool_error_hook_live() {
                 .model("gemini-3.5-flash")
                 .build();
 
-            let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(3))
-                .build()?;
+            let bridge = AgyBridge::builder().build()?;
 
             let agent = bridge.agent(config).hooks(hooks).tools(registry).await?;
 
@@ -240,9 +238,7 @@ fn test_transform_tool_input_hook_live() {
                 .capabilities(CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile]))
                 .build();
 
-            let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(3))
-                .build()?;
+            let bridge = AgyBridge::builder().build()?;
 
             let agent = bridge.agent(config).hooks(hooks).await?;
 
@@ -319,9 +315,7 @@ fn test_session_and_interaction_hooks_live() {
                 .model("gemini-3.5-flash")
                 .build();
 
-            let bridge = AgyBridge::builder()
-                .chat_timeout(Duration::from_mins(3))
-                .build()?;
+            let bridge = AgyBridge::builder().build()?;
 
             let agent = bridge.agent(config).hooks(hooks).await?;
 

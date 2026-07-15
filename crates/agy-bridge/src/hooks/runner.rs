@@ -98,9 +98,8 @@ impl Hooks {
         F: FnMut(&str, &HookCallback),
     {
         for (_, name, cb) in self.iter_at(point) {
-            let name_owned = name.clone();
             if let Err(panic) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(&name_owned, cb)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(name, cb)))
             {
                 tracing::error!(
                     hook = %name,

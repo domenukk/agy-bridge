@@ -41,8 +41,13 @@ pub type AgentId = u64;
 pub trait Runtime: Send + Sync {
     /// Create an agent from the given config, returning its ID and the list
     /// of all available tools (custom, MCP, and builtin) with metadata.
+    ///
+    /// `agent_id` is a process-globally-unique identifier allocated by the
+    /// caller *before* creation, so per-agent initialization state can be
+    /// registered under it without any cross-agent locking.
     async fn create_agent(
         &self,
+        agent_id: u64,
         config: AgentConfig,
     ) -> Result<(AgentId, Vec<crate::tools::AvailableTool>), Error>;
 
@@ -203,6 +208,29 @@ pub struct AgentHandle<R: Runtime + 'static> {
     last_shared_state: Mutex<Option<Arc<Mutex<ChatResponseSharedState>>>>,
 }
 
+/// RAII guard that removes an agent's entry from the initializing hook-runner
+/// registry when dropped, guaranteeing no stale entry survives — whether
+/// [`AgentHandle::new`] succeeds, returns early on error, or panics.
+struct InitializingHookGuard(u64);
+
+impl Drop for InitializingHookGuard {
+    fn drop(&mut self) {
+        match crate::runtime::initializing_hook_runners().write() {
+            Ok(mut map) => {
+                map.remove(&self.0);
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = self.0,
+                    error = %e,
+                    "initializing hook runners lock poisoned during cleanup — \
+                     stale hook runner may persist"
+                );
+            }
+        }
+    }
+}
+
 impl<R: Runtime> AgentHandle<R> {
     /// Create a new agent from the given runtime and configuration.
     ///
@@ -224,28 +252,43 @@ impl<R: Runtime> AgentHandle<R> {
         let quota_key = config.effective_api_key().unwrap_or_default();
         let quota_state = runtime.quota_registry().state_for_key(&quota_key);
 
-        let _guard = crate::runtime::CREATE_AGENT_HOOK_GUARD.lock().await;
+        // Allocate the (process-globally-unique) agent ID up front so we can
+        // register per-agent initialization state *before* creation, keyed by
+        // the ID. This avoids any process-wide lock across `create_agent`, so
+        // concurrent creations — on the same or different bridges — never
+        // block one another.
+        let agent_id_u64 = crate::runtime::next_agent_id();
 
         let effective_hook_runner =
             hook_runner.unwrap_or_else(|| Arc::new(crate::hooks::Hooks::new()));
 
-        match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
-            Ok(mut opt) => {
-                *opt = Some(Arc::clone(&effective_hook_runner));
+        // Install the hook runner in the per-agent initializing registry so
+        // hooks that fire during `__aenter__` (before the permanent bridge
+        // state exists) resolve correctly. `InitializingHookGuard` removes the
+        // entry on every exit path, including early errors.
+        match crate::runtime::initializing_hook_runners().write() {
+            Ok(mut map) => {
+                map.insert(agent_id_u64, Arc::clone(&effective_hook_runner));
             }
             Err(e) => {
                 return Err(Error::BackendError {
                     message: format!(
-                        "INITIALIZING_HOOK_RUNNER mutex poisoned — hooks cannot be installed: {e}"
+                        "initializing hook runners lock poisoned — hooks cannot be installed: {e}"
                     ),
                 });
             }
         }
+        let _init_guard = InitializingHookGuard(agent_id_u64);
 
-        let (agent_id, available_tools) = runtime.create_agent(config.clone()).await?;
+        let (agent_id, available_tools) =
+            runtime.create_agent(agent_id_u64, config.clone()).await?;
+        debug_assert_eq!(
+            agent_id, agent_id_u64,
+            "runtime must echo the caller-provided agent ID"
+        );
         tracing::info!(agent_id, "Agent created successfully");
 
-        let conversation_id = match Self::setup_bridge_state(
+        let conversation_id = Self::setup_bridge_state(
             &runtime,
             agent_id,
             &config,
@@ -253,25 +296,7 @@ impl<R: Runtime> AgentHandle<R> {
             effective_hook_runner,
             policy_handler.as_ref(),
         )
-        .await
-        {
-            Ok(conv_id) => conv_id,
-            Err(e) => return Err(e),
-        };
-
-        match crate::runtime::INITIALIZING_HOOK_RUNNER.lock() {
-            Ok(mut opt) => {
-                *opt = None;
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent_id,
-                    error = %e,
-                    "INITIALIZING_HOOK_RUNNER mutex poisoned during cleanup — \
-                     stale hook runner may persist"
-                );
-            }
-        }
+        .await?;
 
         Ok(Self {
             id: agent_id,
@@ -303,7 +328,8 @@ impl<R: Runtime> AgentHandle<R> {
             hook_runner: Some(effective_hook_runner),
             policies: policies_set,
             policy_handler: policy_handler.map(Arc::clone),
-            tool_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            tool_state: llm_tool::SharedState::new(),
+            last_tool_error: std::sync::Mutex::new(None),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
             Ok(mut map) => {

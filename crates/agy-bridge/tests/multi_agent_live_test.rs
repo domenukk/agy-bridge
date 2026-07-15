@@ -220,9 +220,7 @@ fn sequential_bridge_instances_work_after_teardown() {
         rt.block_on(async {
             // ── Phase 1: create bridge, use agent, tear everything down ──
             {
-                let bridge_1 = agy_bridge::AgyBridge::builder()
-                    .chat_timeout(std::time::Duration::from_mins(1))
-                    .build()?;
+                let bridge_1 = agy_bridge::AgyBridge::builder().build()?;
 
                 let config = agy_bridge::config::AgentConfig::builder()
                     .system_instructions("Reply with exactly: BRIDGE_ONE")
@@ -242,9 +240,7 @@ fn sequential_bridge_instances_work_after_teardown() {
 
             // ── Phase 2: create a fresh bridge and verify it works ──
             {
-                let bridge_2 = agy_bridge::AgyBridge::builder()
-                    .chat_timeout(std::time::Duration::from_mins(1))
-                    .build()?;
+                let bridge_2 = agy_bridge::AgyBridge::builder().build()?;
 
                 let config = agy_bridge::config::AgentConfig::builder()
                     .system_instructions("Reply with exactly: BRIDGE_TWO")

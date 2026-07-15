@@ -221,10 +221,8 @@ pub type Agent = agent::AgentHandle<runtime::PythonRuntime>;
 /// // Zero-config:
 /// // let bridge = AgyBridge::builder().build()?;
 ///
-/// // With custom timeouts:
-/// let bridge = AgyBridge::builder()
-///     .chat_timeout(std::time::Duration::from_secs(120))
-///     .build()?;
+/// // With custom settings:
+/// let bridge = AgyBridge::builder().channel_capacity(128).build()?;
 ///
 /// // Create an agent (simple):
 /// // let agent = bridge.agent(AgentConfig::default()).await?;
@@ -261,10 +259,7 @@ pub struct AgyBridge {
 ///
 /// ```
 /// # use agy_bridge::AgyBridge;
-/// let bridge = AgyBridge::builder()
-///     .chat_timeout(std::time::Duration::from_secs(120))
-///     .channel_capacity(128)
-///     .build()?;
+/// let bridge = AgyBridge::builder().channel_capacity(128).build()?;
 /// # Ok::<(), agy_bridge::error::Error>(())
 /// ```
 pub struct AgyBridgeBuilder {
@@ -279,24 +274,10 @@ impl AgyBridgeBuilder {
         self
     }
 
-    /// Set the timeout for individual runtime operations.
-    #[must_use]
-    pub fn operation_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.config.operation_timeout = timeout;
-        self
-    }
-
     /// Set the timeout for joining the Python thread on shutdown.
     #[must_use]
     pub fn shutdown_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.config.shutdown_timeout = timeout;
-        self
-    }
-
-    /// Set the timeout for a single `agent.chat()` round-trip.
-    #[must_use]
-    pub fn chat_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.config.chat_timeout = timeout;
         self
     }
 
@@ -414,6 +395,23 @@ impl AgyBridge {
     #[must_use]
     pub fn default_agent(&self) -> AgentBuilder<'_> {
         self.agent(config::AgentConfig::default())
+    }
+
+    /// Return the number of agents currently live on this bridge.
+    ///
+    /// Counts agents that have been created but not yet shut down or dropped.
+    /// Because a bridge owns a single runtime with a single agent registry,
+    /// this reflects exactly the agents belonging to *this* bridge — it is
+    /// unaffected by agents on other [`AgyBridge`] instances.
+    ///
+    /// Useful for observability and for asserting clean teardown: once every
+    /// agent has been shut down or dropped, the count returns to zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::Error`] if the runtime thread has exited.
+    pub async fn active_agent_count(&self) -> Result<usize, error::Error> {
+        self.runtime.active_agent_count().await
     }
 }
 

@@ -5,26 +5,24 @@ use tokio::sync::oneshot;
 use super::super::{AgentId, command_loop::AgentRegistry};
 use crate::error::Error;
 
-/// A cloned pair of Python references: `(context_manager, agent_instance)`.
-type PyAgentRef = (Py<PyAny>, Py<PyAny>);
-
-/// Lock the agent registry and clone the Python references for the given agent.
+/// Lock the agent registry (recovering from poison) and clone the Python
+/// references for the given agent.
 ///
-/// Returns `Ok(Some((ctx, instance)))` on success, `Ok(None)` if the agent
-/// is not in the registry, or `Err` if the mutex is poisoned.
+/// Returns `Some((ctx, instance))` on success, or `None` if the agent is not
+/// in the registry. Mutex poisoning is recovered via `into_inner()` because
+/// the registry data is never corrupted by a poison — the panic always happens
+/// in user code after the lock is acquired for a read-only clone.
 fn lock_agent_instance(
     registry: &AgentRegistry,
     agent_id: AgentId,
-) -> Result<Option<PyAgentRef>, Error> {
-    let guard = registry.lock().map_err(|e| {
-        tracing::error!(agent_id = ?agent_id, error = %e, "Agent registry mutex poisoned");
-        Error::BackendError {
-            message: "Agent registry mutex poisoned".to_owned(),
-        }
-    })?;
-    Ok(guard
+) -> Option<(Py<PyAny>, Py<PyAny>)> {
+    let guard = registry.lock().unwrap_or_else(|e| {
+        tracing::error!(agent_id = ?agent_id, error = %e, "Agent registry mutex poisoned, recovering");
+        e.into_inner()
+    });
+    guard
         .get(&agent_id)
-        .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py)))))
+        .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py))))
 }
 
 /// Extract conversation history from the agent's conversation object.
@@ -33,16 +31,7 @@ pub(in crate::runtime) fn handle_get_history(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<Vec<crate::types::ConversationMessage>, Error>>,
 ) {
-    let instance_opt = match lock_agent_instance(registry, agent_id) {
-        Ok(opt) => opt,
-        Err(e) => {
-            if reply.send(Err(e)).is_err() {
-                tracing::warn!(agent_id = ?agent_id, "get_history reply receiver dropped (lock error)");
-            }
-            return;
-        }
-    };
-    let Some((_ctx, agent_instance)) = instance_opt else {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
         if reply
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
@@ -119,16 +108,7 @@ pub(in crate::runtime) fn handle_get_turn_count(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<u32, Error>>,
 ) {
-    let instance_opt = match lock_agent_instance(registry, agent_id) {
-        Ok(opt) => opt,
-        Err(e) => {
-            if reply.send(Err(e)).is_err() {
-                tracing::warn!(agent_id = ?agent_id, "get_turn_count reply receiver dropped (lock error)");
-            }
-            return;
-        }
-    };
-    let Some((_ctx, agent_instance)) = instance_opt else {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
         if reply
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
@@ -191,16 +171,7 @@ fn handle_get_usage_impl(
     attribute: &'static str,
     label: &str,
 ) {
-    let instance_opt = match lock_agent_instance(registry, agent_id) {
-        Ok(opt) => opt,
-        Err(e) => {
-            if reply.send(Err(e)).is_err() {
-                tracing::warn!(agent_id = ?agent_id, label, "usage reply receiver dropped (lock error)");
-            }
-            return;
-        }
-    };
-    let Some((_ctx, agent_instance)) = instance_opt else {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
         if reply
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
@@ -245,16 +216,7 @@ pub(in crate::runtime) fn handle_get_compaction_indices(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<Vec<u32>, Error>>,
 ) {
-    let instance_opt = match lock_agent_instance(registry, agent_id) {
-        Ok(opt) => opt,
-        Err(e) => {
-            if reply.send(Err(e)).is_err() {
-                tracing::warn!(agent_id = ?agent_id, "get_compaction_indices reply receiver dropped (lock error)");
-            }
-            return;
-        }
-    };
-    let Some((_ctx, agent_instance)) = instance_opt else {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
         if reply
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
@@ -294,16 +256,7 @@ pub(in crate::runtime) fn handle_get_last_response(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<Option<String>, Error>>,
 ) {
-    let instance_opt = match lock_agent_instance(registry, agent_id) {
-        Ok(opt) => opt,
-        Err(e) => {
-            if reply.send(Err(e)).is_err() {
-                tracing::warn!(agent_id = ?agent_id, "get_last_response reply receiver dropped (lock error)");
-            }
-            return;
-        }
-    };
-    let Some((_ctx, agent_instance)) = instance_opt else {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
         if reply
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
@@ -346,16 +299,7 @@ pub(in crate::runtime) fn handle_is_idle(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<bool, Error>>,
 ) {
-    let instance_opt = match lock_agent_instance(registry, agent_id) {
-        Ok(opt) => opt,
-        Err(e) => {
-            if reply.send(Err(e)).is_err() {
-                tracing::warn!(agent_id = ?agent_id, "is_idle reply receiver dropped (lock error)");
-            }
-            return;
-        }
-    };
-    let Some((_ctx, agent_instance)) = instance_opt else {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
         if reply
             .send(Err(Error::BackendError {
                 message: format!("Agent ID {agent_id} not found in registry"),
@@ -383,5 +327,24 @@ pub(in crate::runtime) fn handle_is_idle(
 
     if reply.send(result).is_err() {
         tracing::warn!(agent_id = ?agent_id, "is_idle reply receiver dropped");
+    }
+}
+
+/// Return the number of agents currently live in this runtime's registry.
+///
+/// This is the authoritative count of agents that have been created but not
+/// yet shut down or dropped. Because each runtime owns its own registry, this
+/// reflects exactly the agents belonging to this runtime. Used for
+/// observability and leak detection.
+pub(in crate::runtime) fn handle_get_active_agent_count(
+    registry: &AgentRegistry,
+    reply: oneshot::Sender<Result<usize, Error>>,
+) {
+    let guard = registry.lock().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "Agent registry mutex poisoned in active_agent_count, recovering");
+        e.into_inner()
+    });
+    if reply.send(Ok(guard.len())).is_err() {
+        tracing::warn!("active_agent_count reply receiver dropped");
     }
 }

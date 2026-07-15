@@ -1,15 +1,9 @@
 /// Async operation handlers: cancel, wait-for-idle, clear-history, send,
 /// signal-idle, and wait-for-wakeup.
-use std::time::Duration;
-
 use pyo3::prelude::*;
-use tokio::{sync::oneshot, time::timeout};
+use tokio::sync::oneshot;
 
-use super::super::{
-    AgentId,
-    command_loop::{AgentRegistry, HANDLER_TIMEOUT},
-    py_scripts::decode_prompt_py,
-};
+use super::super::{AgentId, command_loop::AgentRegistry, py_scripts::decode_prompt_py};
 use crate::error::Error;
 
 /// Lock the agent registry, recovering from mutex poisoning.
@@ -39,7 +33,6 @@ async fn run_py_async_op<T, F, E>(
     registry: AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<T, Error>>,
-    timeout_duration: Option<Duration>,
     op_label: &str,
     build_coro: F,
     extract: E,
@@ -89,36 +82,9 @@ async fn run_py_async_op<T, F, E>(
         }
     };
 
-    // 3. Await with optional timeout.
-    let py_result = if let Some(dur) = timeout_duration {
-        match timeout(dur, fut).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                let err_msg = format!(
-                    "handle_{op_label} timed out after {:.1}s for agent {agent_id}",
-                    dur.as_secs_f64(),
-                );
-                tracing::error!(agent_id = ?agent_id, "{err_msg}");
-                if reply
-                    .send(Err(Error::Timeout {
-                        duration: dur,
-                        operation: format!("{op_label}(agent={agent_id})"),
-                    }))
-                    // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
-                    .is_err()
-                {
-                    tracing::warn!(
-                        agent_id = ?agent_id,
-                        "{} reply receiver dropped (timeout)",
-                        op_label,
-                    );
-                }
-                return;
-            }
-        }
-    } else {
-        fut.await
-    };
+    // 3. Await the Python coroutine directly. A hang here is an SDK issue,
+    //    not something the bridge masks with an artificial timeout.
+    let py_result = fut.await;
 
     // 4. Map the Python result and send the reply.
     match py_result {
@@ -153,7 +119,6 @@ pub(in crate::runtime) async fn handle_cancel(
         registry,
         agent_id,
         reply,
-        Some(HANDLER_TIMEOUT),
         "cancel",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -173,7 +138,6 @@ pub(in crate::runtime) async fn handle_wait_for_idle(
         registry,
         agent_id,
         reply,
-        Some(HANDLER_TIMEOUT),
         "wait_for_idle",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -307,7 +271,6 @@ pub(in crate::runtime) async fn handle_send(
         registry,
         agent_id,
         reply,
-        Some(HANDLER_TIMEOUT),
         "send",
         |py, agent| {
             let conv = agent.getattr("conversation")?;
@@ -328,7 +291,6 @@ pub(in crate::runtime) async fn handle_signal_idle(
         registry,
         agent_id,
         reply,
-        Some(HANDLER_TIMEOUT),
         "signal_idle",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -345,13 +307,10 @@ pub(in crate::runtime) async fn handle_wait_for_wakeup(
     timeout_secs: f64,
     reply: oneshot::Sender<Result<bool, Error>>,
 ) {
-    // Use Python's own timeout plus 5s headroom so the Rust side doesn't fire first.
-    let wakeup_timeout = Duration::from_secs_f64(timeout_secs + 5.0);
     run_py_async_op(
         registry,
         agent_id,
         reply,
-        Some(wakeup_timeout),
         "wait_for_wakeup",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -382,7 +341,6 @@ pub(in crate::runtime) async fn handle_delete(
         registry,
         agent_id,
         reply,
-        Some(HANDLER_TIMEOUT),
         "delete",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -403,7 +361,6 @@ pub(in crate::runtime) async fn handle_disconnect(
         registry,
         agent_id,
         reply,
-        Some(HANDLER_TIMEOUT),
         "disconnect",
         |_, agent| {
             let conv = agent.getattr("conversation")?;

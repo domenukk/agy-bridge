@@ -1,9 +1,8 @@
 /// Agent lifecycle handlers: creation and shutdown.
 use std::ffi::CString;
-use std::time::Duration;
 
 use pyo3::prelude::*;
-use tokio::{sync::oneshot, time::timeout};
+use tokio::sync::oneshot;
 
 use super::super::{
     AgentId,
@@ -12,9 +11,6 @@ use super::super::{
     py_scripts::PYTHON_AGENT_INIT_SCRIPT,
 };
 use crate::error::Error;
-
-/// Timeout for `__aexit__` cleanup when `__aenter__` times out.
-const AEXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DISPATCH_RUST_TOOL_ATTR: &str = "dispatch_rust_tool";
 const DISPATCH_RUST_HOOK_ATTR: &str = "dispatch_rust_hook";
@@ -81,54 +77,15 @@ fn init_agent_instance(
     Ok((ctx_py, aenter_coro_py))
 }
 
-/// Best-effort `__aexit__` cleanup when `__aenter__` times out.
-///
-/// Without this, timed-out `__aenter__` calls leak zombie localharness
-/// processes that accumulate until fork exhaustion.
-async fn attempt_aexit_cleanup(ctx_py: &Py<PyAny>, cleanup_timeout: Duration) {
-    let cleanup_result: Result<(), String> = async {
-        let aexit_coro_py = Python::attach(|py| {
-            let ctx_bound = ctx_py.bind(py);
-            let none = py.None();
-            let coro = ctx_bound
-                .call_method1("__aexit__", (&none, &none, &none))
-                .map_err(|e| format!("failed to call __aexit__: {e}"))?;
-            Ok::<_, String>(coro.clone().unbind())
-        })?;
-        let aexit_fut = Python::attach(|py| {
-            let coro = aexit_coro_py.into_bound(py);
-            pyo3_async_runtimes::tokio::into_future(coro)
-                .map_err(|e| format!("failed to convert __aexit__ coro: {e}"))
-        })?;
-        match timeout(cleanup_timeout, aexit_fut).await {
-            Ok(Ok(_)) => {
-                tracing::info!("__aexit__ cleanup succeeded after __aenter__ timeout");
-                Ok(())
-            }
-            Ok(Err(e)) => Err(format!("__aexit__ returned error: {e}")),
-            Err(_elapsed) => Err(format!(
-                "__aexit__ cleanup itself timed out after {cleanup_timeout:?}"
-            )
-            .to_string()),
-        }
-    }
-    .await;
-    if let Err(e) = &cleanup_result {
-        tracing::error!(error = %e, "__aexit__ cleanup failed — localharness may be leaked");
-    }
-}
-
 /// Initialize a Python agent via the SDK, run `__aenter__`, and register it.
 pub(in crate::runtime) async fn handle_create_agent(
     registry: AgentRegistry,
     event_loop: Py<PyAny>,
-    chat_timeout: Duration,
+    next_id: u64,
     config_json: String,
     reply: oneshot::Sender<Result<(AgentId, Vec<RawToolInfo>), Error>>,
 ) {
-    static AGENT_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    tracing::info!("Live-SDK: CreateAgent command received");
-    let next_id = AGENT_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(agent_id = next_id, "Live-SDK: CreateAgent command received");
 
     let init_result = Python::attach(|py| {
         prepare_agent_globals(py)?;
@@ -161,28 +118,7 @@ pub(in crate::runtime) async fn handle_create_agent(
     };
 
     tracing::info!("Live-SDK: awaiting __aenter__");
-    let enter_result = match timeout(chat_timeout, aenter_fut).await {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            tracing::error!(
-                timeout_secs = chat_timeout.as_secs(),
-                "CreateAgent __aenter__ timed out"
-            );
-
-            tracing::warn!(
-                "__aenter__ timed out — attempting __aexit__ cleanup for leaked harness"
-            );
-            attempt_aexit_cleanup(&ctx_py, AEXIT_CLEANUP_TIMEOUT).await;
-
-            if let Err(e) = reply.send(Err(Error::Timeout {
-                duration: chat_timeout,
-                operation: "create_agent(__aenter__)".to_string(),
-            })) {
-                tracing::warn!(error = ?e, "CreateAgent reply receiver dropped (aenter timeout)");
-            }
-            return;
-        }
-    };
+    let enter_result = aenter_fut.await;
 
     tracing::info!("Live-SDK: __aenter__ completed");
     match enter_result {
@@ -263,6 +199,7 @@ fn extract_tool_definitions(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
 
         // Extract tool info from each callable in the dict by running
         // a small Python helper that reads __name__, __doc__, input_schema.
+        let ns = pyo3::types::PyDict::new(py);
         let extract_fn = match py
             .run(
                 pyo3::ffi::c_str!(
@@ -278,10 +215,15 @@ def _extract(tools_dict):
 "#
                 ),
                 None,
-                None,
+                Some(&ns),
             )
-            .and_then(|()| py.eval(pyo3::ffi::c_str!("_extract"), None, None))
-        {
+            .and_then(|()| {
+                ns.get_item("_extract")?.ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "_extract function not found after running helper script",
+                    )
+                })
+            }) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
@@ -314,22 +256,7 @@ def _extract(tools_dict):
 
         match serde_json::from_str::<Vec<RawToolInfo>>(&json_str) {
             Ok(infos) => {
-                for info in &infos {
-                    if info.description.is_empty() {
-                        tracing::warn!(
-                            tool = %info.name,
-                            "Tool has no description — consider adding a docstring"
-                        );
-                    }
-                    if info.parameter_schema.is_null()
-                        || info.parameter_schema == serde_json::json!({})
-                    {
-                        tracing::warn!(
-                            tool = %info.name,
-                            "Tool has no parameter schema"
-                        );
-                    }
-                }
+                warn_missing_tool_metadata(&infos);
                 infos
             }
             Err(e) => {
@@ -343,16 +270,43 @@ def _extract(tools_dict):
     })
 }
 
+/// Log warnings for tools missing a description or parameter schema.
+fn warn_missing_tool_metadata(infos: &[RawToolInfo]) {
+    for info in infos {
+        if info.description.is_empty() {
+            tracing::warn!(
+                tool = %info.name,
+                "Tool has no description — consider adding a docstring"
+            );
+        }
+        if info.parameter_schema.is_null() || info.parameter_schema == serde_json::json!({}) {
+            tracing::warn!(
+                tool = %info.name,
+                "Tool has no parameter schema"
+            );
+        }
+    }
+}
+
 /// Fallback: extract just the tool names (no descriptions/schemas) when
 /// the full extraction fails.
 fn extract_tool_names_fallback(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
     Python::attach(|py| {
         let agent = agent_py.bind(py);
-        let names: Vec<String> = agent
+        let names: Vec<String> = match agent
             .getattr("_tool_runner")
             .and_then(|r| r.getattr("tool_names"))
             .and_then(|n| n.extract())
-            .unwrap_or_default();
+        {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to extract tool_names in fallback — returning empty tool list"
+                );
+                Vec::new()
+            }
+        };
         names
             .into_iter()
             .map(|name| {
@@ -373,7 +327,6 @@ fn extract_tool_names_fallback(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
 /// Remove the agent from the registry and run its `__aexit__` cleanup.
 pub(in crate::runtime) async fn handle_shutdown_agent(
     registry: AgentRegistry,
-    chat_timeout: Duration,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
@@ -433,23 +386,7 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
         }
     };
 
-    let exit_res = match timeout(chat_timeout, aexit_fut).await {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            tracing::error!(
-                agent_id = ?agent_id,
-                timeout_secs = chat_timeout.as_secs(),
-                "ShutdownAgent __aexit__ timed out"
-            );
-            if let Err(e) = reply.send(Err(Error::Timeout {
-                duration: chat_timeout,
-                operation: format!("shutdown_agent(__aexit__, agent={agent_id})"),
-            })) {
-                tracing::warn!(error = ?e, "ShutdownAgent reply receiver dropped (aexit timeout)");
-            }
-            return;
-        }
-    };
+    let exit_res = aexit_fut.await;
 
     // Bridge state cleanup handled by AgentHandle::shutdown().
 

@@ -180,6 +180,25 @@ pub struct PostToolCallContext {
 }
 
 /// Context passed to [`HookPoint::OnToolError`] hooks.
+///
+/// # Error contract
+///
+/// A Rust tool signals failure in one of two ways, and only one of them
+/// reaches this hook:
+///
+/// - Returning `Err(ToolError)` is a **hard** error. The model sees exactly
+///   [`ToolError::to_string()`](llm_tool::ToolError) (the human-readable
+///   `message`), and this hook fires. Any structured
+///   [`metadata`](llm_tool::ToolError::metadata) attached to the `ToolError`
+///   — which is *never* shown to the model — is surfaced here on
+///   [`metadata`](Self::metadata) so host code can branch on it.
+/// - Returning `Ok(ToolOutput)` is a **soft** result: it is delivered to the
+///   [`PostToolCall`](HookPoint::PostToolCall) hook instead, carrying its own
+///   `result` string and `metadata`.
+///
+/// This makes success and error handling symmetric: both
+/// [`PostToolCallContext`] and `OnToolErrorContext` carry structured
+/// `metadata` alongside their model-facing payload.
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnToolErrorContext {
@@ -189,8 +208,38 @@ pub struct OnToolErrorContext {
     /// Arguments the tool received.
     #[serde(alias = "args", default)]
     pub tool_args: serde_json::Value,
-    /// The error message.
+    /// The error message — exactly what the model sees
+    /// ([`ToolError::to_string()`](llm_tool::ToolError)).
     pub error: String,
+    /// Structured metadata attached to the originating
+    /// [`ToolError`](llm_tool::ToolError), if any.
+    ///
+    /// This is the error-path counterpart to
+    /// [`PostToolCallContext::metadata`]. It is populated from the
+    /// `ToolError`'s metadata map and is **never** sent to the model — it
+    /// exists purely for hooks, policies, and logging. Defaults to
+    /// [`serde_json::Value::Null`] when the error carried no metadata.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl OnToolErrorContext {
+    /// Whether the error denotes a registry-lookup miss, i.e. the model asked
+    /// for a tool that isn't registered.
+    ///
+    /// This mirrors [`ToolError::is_not_found`](llm_tool::ToolError::is_not_found):
+    /// it inspects [`metadata`](Self::metadata) for the
+    /// [`ERROR_KIND_KEY`](llm_tool::ToolError::ERROR_KIND_KEY) marker set to
+    /// [`KIND_NOT_REGISTERED`](llm_tool::ToolError::KIND_NOT_REGISTERED),
+    /// letting hosts distinguish a routing miss from a genuine handler failure
+    /// without matching on message strings.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        self.metadata
+            .get(llm_tool::ToolError::ERROR_KIND_KEY)
+            .and_then(serde_json::Value::as_str)
+            == Some(llm_tool::ToolError::KIND_NOT_REGISTERED)
+    }
 }
 
 /// Identifies the point in the agent lifecycle where a hook fires.
@@ -943,5 +992,44 @@ mod tests {
         let json_no_name = r#"{"error":"failed"}"#;
         let parsed_no_name: Result<OnToolErrorContext, _> = serde_json::from_str(json_no_name);
         assert!(parsed_no_name.is_err());
+    }
+
+    #[test]
+    fn on_tool_error_context_metadata_defaults_to_null() {
+        let json = r#"{"tool_name":"my_tool","error":"failed"}"#;
+        let parsed: OnToolErrorContext = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.metadata, serde_json::Value::Null);
+        assert!(!parsed.is_not_found());
+    }
+
+    #[test]
+    fn on_tool_error_context_metadata_deserialized() {
+        let json = r#"{"tool_name":"my_tool","error":"failed","metadata":{"status_code":503}}"#;
+        let parsed: OnToolErrorContext = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.metadata["status_code"], 503);
+    }
+
+    #[test]
+    fn on_tool_error_context_is_not_found_detects_registry_miss() {
+        // Metadata mirrors what `ToolError::not_found` attaches.
+        let error = llm_tool::ToolError::not_found(llm_tool::RegistryItem::Tool, "add_nummbers");
+        let ctx = OnToolErrorContext {
+            tool_name: "add_nummbers".into(),
+            tool_args: serde_json::Value::Null,
+            error: error.to_string(),
+            metadata: serde_json::to_value(error.metadata()).unwrap(),
+        };
+        assert!(ctx.is_not_found());
+    }
+
+    #[test]
+    fn on_tool_error_context_is_not_found_false_for_generic_error() {
+        let ctx = OnToolErrorContext {
+            tool_name: "t".into(),
+            tool_args: serde_json::Value::Null,
+            error: "handler blew up".into(),
+            metadata: serde_json::json!({"some": "value"}),
+        };
+        assert!(!ctx.is_not_found());
     }
 }

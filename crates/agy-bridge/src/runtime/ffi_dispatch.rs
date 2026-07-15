@@ -11,15 +11,27 @@ use pyo3::prelude::*;
 
 use super::bridge_state::bridge_state;
 
-/// Fallback `Hooks` registry used during `create_agent` when the permanent entry is not yet registered.
-pub(crate) static INITIALIZING_HOOK_RUNNER: std::sync::Mutex<Option<Arc<crate::hooks::Hooks>>> =
-    std::sync::Mutex::new(None);
+/// Per-agent hook runners installed *during* `create_agent`, before the
+/// permanent [`bridge_state()`] entry exists.
+///
+/// Hooks such as `on_session_start` can fire from the SDK while the agent's
+/// `__aenter__` runs — i.e. before `setup_bridge_state` has registered the
+/// permanent entry. This registry provides the hook runner in that window.
+///
+/// Keyed by (process-globally-unique) agent ID so that concurrent creates —
+/// on the same *or* different bridges — never block on a shared lock or
+/// clobber each other's runner. Entries are inserted before `create_agent`
+/// and removed once the permanent bridge state is registered.
+static INITIALIZING_HOOK_RUNNERS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>>,
+> = std::sync::OnceLock::new();
 
-/// Serializes `create_agent` calls that install a temporary hook runner in
-/// [`INITIALIZING_HOOK_RUNNER`], preventing concurrent creates from
-/// overwriting each other's fallback runner.
-pub(crate) static CREATE_AGENT_HOOK_GUARD: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+/// Access the per-agent initializing hook-runner registry.
+pub(crate) fn initializing_hook_runners()
+-> &'static std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>> {
+    INITIALIZING_HOOK_RUNNERS
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
 
 /// Execute a hook by name, deserializing the context JSON and calling the
 /// appropriate method on the runner. Returns the serialized result (empty
@@ -38,7 +50,7 @@ pub(crate) fn dispatch_hook_by_name(
         "on_compaction" => handle_on_compaction(hook_runner, context_json)?,
         "on_session_start" => handle_on_session_start(agent_id, hook_runner, context_json)?,
         "on_session_end" => handle_on_session_end(hook_runner, context_json)?,
-        "on_tool_error" => handle_on_tool_error(hook_runner, context_json)?,
+        "on_tool_error" => handle_on_tool_error(agent_id, hook_runner, context_json)?,
         "on_interaction" => return handle_on_interaction(hook_runner, context_json),
         _ => {
             return Err(crate::error::Error::BackendError {
@@ -98,12 +110,41 @@ fn handle_on_session_end(
 }
 
 fn handle_on_tool_error(
+    agent_id: u64,
     runner: &crate::hooks::Hooks,
     json: &str,
 ) -> Result<(), crate::error::Error> {
     let ctx = deserialize_ctx(json, "OnToolErrorContext")?;
+    // Recover the structured error captured during dispatch (see
+    // `dispatch_rust_tool`). Taking it clears the slot so it can't leak into a
+    // later, unrelated error.
+    let captured = super::bridge_state::take_last_tool_error(agent_id);
+    let ctx = merge_tool_error_metadata(ctx, captured);
     runner.run_on_tool_error(&ctx);
     Ok(())
+}
+
+/// Enrich an [`OnToolErrorContext`](crate::hooks::OnToolErrorContext) with the
+/// `metadata` from a captured [`ToolError`](llm_tool::ToolError) value.
+///
+/// `captured` is the serialized `ToolError` (`{"message": ..., "metadata":
+/// {...}}`) recorded on the dispatch error path, or `None` when no structured
+/// error was captured (e.g. an error raised on the Python side). When present,
+/// its `metadata` object replaces the context's metadata; when absent — or when
+/// the captured error carried no metadata — the context's metadata is left as
+/// its deserialized default ([`serde_json::Value::Null`]).
+///
+/// Kept pure (no locks, no globals) so it can be unit-tested directly.
+fn merge_tool_error_metadata(
+    mut ctx: crate::hooks::OnToolErrorContext,
+    captured: Option<serde_json::Value>,
+) -> crate::hooks::OnToolErrorContext {
+    if let Some(serde_json::Value::Object(mut map)) = captured
+        && let Some(metadata) = map.remove("metadata")
+    {
+        ctx.metadata = metadata;
+    }
+    ctx
 }
 
 fn handle_on_interaction(
@@ -184,12 +225,12 @@ pub(crate) fn dispatch_rust_hook(
             })?;
             Arc::clone(runner)
         } else {
-            let opt = INITIALIZING_HOOK_RUNNER.lock().map_err(|e| {
+            let map = initializing_hook_runners().read().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to lock INITIALIZING_HOOK_RUNNER: {e}"
+                    "Failed to read initializing hook runners: {e}"
                 ))
             })?;
-            if let Some(ref runner) = *opt {
+            if let Some(runner) = map.get(&agent_id) {
                 Arc::clone(runner)
             } else {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -276,7 +317,11 @@ pub(crate) fn check_tool_execution_allowed(
         })?;
 
     let Some(state) = map.get(&agent_id) else {
-        return Ok(false);
+        return Err(crate::error::Error::BackendError {
+            message: format!(
+                "Agent {agent_id} not found in bridge state — it may have been shut down"
+            ),
+        });
     };
 
     let (is_allowed, needs_confirm) = match state.policies.evaluate(name) {
@@ -341,7 +386,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
                 "No active ToolRegistry found for agent ID {agent_id}"
             ))
         })?;
-        (Arc::clone(registry), Arc::clone(&entry.tool_state))
+        (Arc::clone(registry), entry.tool_state.clone())
     };
 
     let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| {
@@ -349,11 +394,23 @@ pub(crate) fn dispatch_rust_tool<'py>(
     })?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let ctx = crate::tools::ToolContext::with_shared_state(None, tool_state);
-        let output = registry
-            .dispatch(&name, args, &ctx)
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let ctx = crate::tools::ToolContext::new().with_shared_state(tool_state);
+        let output = match registry.dispatch(&name, args, &ctx).await {
+            Ok(output) => {
+                // Success: drop any stale error so a later `on_tool_error`
+                // never surfaces metadata from a previous failed call.
+                super::bridge_state::clear_last_tool_error(agent_id);
+                output
+            }
+            Err(e) => {
+                // Cache the structured error (message + metadata) *before*
+                // collapsing it into a model-facing string, so the
+                // `on_tool_error` hook can recover the metadata. The model
+                // still sees exactly `ToolError::to_string()`.
+                super::bridge_state::record_last_tool_error(agent_id, &e);
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()));
+            }
+        };
         let res = Python::attach(|py| -> PyResult<Py<PyAny>> {
             let dict = pyo3::types::PyDict::new(py);
             dict.set_item("content", output.content())?;
@@ -364,4 +421,58 @@ pub(crate) fn dispatch_rust_tool<'py>(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(res)
     })
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn base_ctx() -> crate::hooks::OnToolErrorContext {
+        crate::hooks::OnToolErrorContext {
+            tool_name: "add".into(),
+            tool_args: serde_json::json!({"a": 1}),
+            error: "boom".into(),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn merge_absent_capture_leaves_metadata_null() {
+        let ctx = merge_tool_error_metadata(base_ctx(), None);
+        assert_eq!(ctx.metadata, serde_json::Value::Null);
+        // Model-facing message is untouched.
+        assert_eq!(ctx.error, "boom");
+    }
+
+    #[test]
+    fn merge_capture_without_metadata_leaves_metadata_null() {
+        // A serialized ToolError with no metadata skips the `metadata` field.
+        let captured = serde_json::json!({"message": "boom"});
+        let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
+        assert_eq!(ctx.metadata, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn merge_capture_with_metadata_enriches_context() {
+        let captured = serde_json::json!({
+            "message": "boom",
+            "metadata": {"status_code": 503}
+        });
+        let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
+        assert_eq!(ctx.metadata["status_code"], 503);
+        // Other fields are preserved unchanged.
+        assert_eq!(ctx.error, "boom");
+        assert_eq!(ctx.tool_name, "add");
+    }
+
+    #[test]
+    fn merge_real_tool_error_roundtrip_surfaces_not_found() {
+        // End-to-end shape: serialize a real ToolError exactly as
+        // `record_last_tool_error` does, then merge and assert the convenience
+        // helper detects it.
+        let error = llm_tool::ToolError::not_found(llm_tool::RegistryItem::Tool, "add_nummbers");
+        let captured = serde_json::to_value(&error).unwrap();
+        let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
+        assert!(ctx.is_not_found());
+    }
 }

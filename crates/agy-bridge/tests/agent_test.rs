@@ -26,14 +26,14 @@ impl MockRuntime {
     }
 }
 
-#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl agy_bridge::agent::Runtime for MockRuntime {
     async fn create_agent(
         &self,
+        agent_id: u64,
         _config: AgentConfig,
     ) -> Result<(agy_bridge::agent::AgentId, Vec<agy_bridge::AvailableTool>), Error> {
         Ok((
-            1,
+            agent_id,
             vec![agy_bridge::AvailableTool {
                 name: "mock_tool".to_owned(),
                 description: "A mock tool for testing.".to_owned(),

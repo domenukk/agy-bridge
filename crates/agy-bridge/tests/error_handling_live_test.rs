@@ -42,48 +42,6 @@ fn live_agent_invalid_config_returns_error() {
 }
 
 // =============================================================================
-// Test 15: Timeout triggers after configured duration
-// =============================================================================
-
-#[test]
-fn live_agent_timeout_triggers() {
-    common::run_live_test("live_agent_timeout_triggers", || {
-        let _api_key = common::api_key();
-        let rt = common::test_runtime();
-
-        rt.block_on(async {
-            let bridge = agy_bridge::AgyBridge::builder()
-                .chat_timeout(std::time::Duration::from_millis(1))
-                .build()?;
-
-            let config = agy_bridge::config::AgentConfig::builder()
-                .system_instructions("Write a very long poem.")
-                .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
-                .build();
-
-            match bridge.agent(config).await {
-                Ok(agent) => {
-                    let result = agent.chat("Write a very long poem about the sea.").await;
-                    assert!(
-                        // NOLINT: test assertion — checking that timeout produces an error
-                        result.is_err(),
-                        "Expected an error due to timeout, got success"
-                    );
-                    if let Err(e) = result {
-                        eprintln!("Got expected error from timeout: {e}");
-                    }
-                    agent.shutdown().await?;
-                }
-                Err(e) => {
-                    eprintln!("Got expected error during agent creation timeout: {e}");
-                }
-            }
-            Ok(())
-        })
-    });
-}
-
-// =============================================================================
 // Test 19: Error recovery - force Python error, verify clean Rust error
 // =============================================================================
 

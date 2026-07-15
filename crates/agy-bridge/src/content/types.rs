@@ -218,6 +218,18 @@ impl From<Vec<ContentPrimitive>> for Content {
     }
 }
 
+impl From<ContentPrimitive> for Content {
+    fn from(prim: ContentPrimitive) -> Self {
+        match prim {
+            ContentPrimitive::Text { text } => Self::Text { text },
+            ContentPrimitive::Image(img) => Self::Image(img),
+            ContentPrimitive::Document(doc) => Self::Document(doc),
+            ContentPrimitive::Audio(audio) => Self::Audio(audio),
+            ContentPrimitive::Video(video) => Self::Video(video),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +508,84 @@ mod tests {
     fn content_as_text_returns_none_for_multi() {
         let c = Content::Multi { parts: vec![] };
         assert_eq!(c.as_text(), None);
+    }
+
+    // ── Display tests ───────────────────────────────────────────────
+
+    #[test]
+    fn display_text_renders_content() {
+        let c = Content::text("hello world");
+        assert_eq!(format!("{c}"), "hello world");
+    }
+
+    #[test]
+    fn display_image_shows_mime_type() {
+        let c = Content::Image(Image::png(vec![1]));
+        assert_eq!(format!("{c}"), "[Image: image/png]");
+    }
+
+    #[test]
+    fn display_document_shows_mime_type() {
+        let c = Content::Document(Document::pdf(vec![1]));
+        assert_eq!(format!("{c}"), "[Document: application/pdf]");
+    }
+
+    #[test]
+    fn display_audio_shows_mime_type() {
+        let c = Content::Audio(Audio::mp3(vec![1]));
+        assert_eq!(format!("{c}"), "[Audio: audio/mpeg]");
+    }
+
+    #[test]
+    fn display_video_shows_mime_type() {
+        let c = Content::Video(Video::mp4(vec![1]));
+        assert_eq!(format!("{c}"), "[Video: video/mp4]");
+    }
+
+    #[test]
+    fn display_multi_shows_part_count() {
+        let c = Content::Multi {
+            parts: vec![
+                ContentPrimitive::Text {
+                    text: "a".to_string(),
+                },
+                ContentPrimitive::Text {
+                    text: "b".to_string(),
+                },
+                ContentPrimitive::Text {
+                    text: "c".to_string(),
+                },
+            ],
+        };
+        assert_eq!(format!("{c}"), "[Multi: 3 parts]");
+    }
+
+    #[test]
+    fn display_empty_text() {
+        let c = Content::text("");
+        assert_eq!(format!("{c}"), "");
+    }
+
+    // ── From<ContentPrimitive> tests ────────────────────────────────
+
+    #[test]
+    fn from_content_primitive_text() {
+        let prim = ContentPrimitive::Text {
+            text: "hello".to_string(),
+        };
+        let content: Content = prim.into();
+        assert_eq!(
+            content,
+            Content::Text {
+                text: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn from_content_primitive_image() {
+        let prim = ContentPrimitive::Image(Image::png(vec![1, 2, 3]));
+        let content: Content = prim.into();
+        assert!(matches!(content, Content::Image(_)));
     }
 }

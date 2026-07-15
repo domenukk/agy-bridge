@@ -45,35 +45,22 @@ use crate::{error::Error, quota::QuotaState};
 
 pub(crate) mod bridge_state;
 pub(crate) mod command_loop;
+mod config;
 pub(crate) mod ffi_dispatch;
 mod handlers;
 pub(crate) mod py_scripts;
 pub(crate) mod streaming;
 pub(crate) mod venv;
 
-// Re-export items used by sibling modules and external crate consumers.
-pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state};
-pub(crate) use ffi_dispatch::{
-    CREATE_AGENT_HOOK_GUARD, INITIALIZING_HOOK_RUNNER, dispatch_rust_hook,
-    dispatch_rust_policy_confirm, dispatch_rust_tool,
-};
+#[cfg(test)]
+mod tests;
 
-/// Safety-net timeout for a single `send_command` round-trip.
-///
-/// This is the *outer* Rust-side timeout that wraps all commands sent to the
-/// Python thread (chat, `create_agent`, cancel, `get_history`, …).  The Python
-/// side applies its own, tighter timeouts (`chat_timeout`, `HANDLER_TIMEOUT`),
-/// so this value should only fire if the Python thread is completely stuck.
-///
-/// Defaults to `chat_timeout + 2 minutes` to give inner timeouts room to
-/// fire first.
-#[must_use]
-pub fn default_operation_timeout(chat_timeout: Duration) -> Duration {
-    chat_timeout + Duration::from_mins(2)
-}
-/// Default timeout (seconds) for a single `agent.chat()` round-trip.
-/// 120s (2 min) is generous for a normal turn while detecting stalls quickly.
-pub const DEFAULT_CHAT_TIMEOUT_SECS: u64 = 120;
+// Re-export items used by sibling modules and external crate consumers.
+pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state, next_agent_id};
+pub use config::{BackendLogLevel, RuntimeConfig};
+pub(crate) use ffi_dispatch::{
+    dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool, initializing_hook_runners,
+};
 
 /// Default delay between successive chat commands to prevent burst requests.
 pub const DEFAULT_INTER_AGENT_DELAY: Duration = Duration::from_millis(500);
@@ -83,23 +70,6 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 
 /// Default timeout for joining the Python thread on shutdown.
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Returns the default chat round-trip timeout, configurable via
-/// `AGI_CHAT_TIMEOUT_SECS` (defaults to 120 s).
-#[must_use]
-pub fn default_chat_timeout() -> Duration {
-    let secs = std::env::var("AGI_CHAT_TIMEOUT_SECS").map_or(DEFAULT_CHAT_TIMEOUT_SECS, |val| {
-        val.parse::<u64>().unwrap_or_else(|e| {
-            tracing::warn!(
-                value = %val,
-                error = %e,
-                "Invalid AGI_CHAT_TIMEOUT_SECS, using default {DEFAULT_CHAT_TIMEOUT_SECS}s"
-            );
-            DEFAULT_CHAT_TIMEOUT_SECS
-        })
-    });
-    Duration::from_secs(secs)
-}
 
 /// Commands sent from Rust to the Python thread.
 ///
@@ -111,6 +81,7 @@ pub(crate) enum PyCommand {
     /// The reply carries both the agent ID and tool definitions discovered
     /// by the Python SDK (Rust tools + MCP tools — builtins are added later).
     CreateAgent {
+        agent_id: u64,
         config_json: String,
         reply: oneshot::Sender<Result<(AgentId, Vec<handlers::agent::RawToolInfo>), Error>>,
     },
@@ -163,6 +134,16 @@ pub(crate) enum PyCommand {
     GetTurnCount {
         agent_id: AgentId,
         reply: oneshot::Sender<Result<u32, Error>>,
+    },
+    /// Return the number of agents currently live in the runtime registry.
+    ///
+    /// Runtime-level query (no `agent_id`): counts agents that have been
+    /// created but not yet shut down or dropped. Used for observability and
+    /// leak detection.
+    ///
+    /// Constructed by `PythonRuntime::active_agent_count()`.
+    GetActiveAgentCount {
+        reply: oneshot::Sender<Result<usize, Error>>,
     },
     /// Return cumulative token usage across all turns.
     GetTotalUsage {
@@ -219,81 +200,6 @@ pub(crate) enum PyCommand {
         agent_id: AgentId,
         reply: oneshot::Sender<Result<bool, Error>>,
     },
-}
-
-/// Log verbosity for the agent backend runtime.
-///
-/// Controls the logging level of the underlying agent runtime. This is
-/// intentionally backend-agnostic — consumers should not need to know
-/// the implementation details of the runtime layer.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendLogLevel {
-    /// Errors only.
-    Error,
-    /// Warnings and errors (default — matches upstream SDK behavior).
-    #[default]
-    Warn,
-    /// Informational messages (verbose — includes raw protocol traffic).
-    Info,
-    /// Full debug output.
-    Debug,
-}
-
-impl BackendLogLevel {
-    /// Return the lowercase string representation used by the Python side.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-        }
-    }
-}
-
-impl std::fmt::Display for BackendLogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Configuration for the bridge runtime.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct RuntimeConfig {
-    /// Channel buffer size for the command channel.
-    pub channel_capacity: usize,
-    /// Timeout for individual runtime operations.
-    pub operation_timeout: Duration,
-    /// Timeout for joining the Python thread on shutdown.
-    pub shutdown_timeout: Duration,
-    /// Timeout for a single `agent.chat()` round-trip.
-    ///
-    /// Defaults to the value of `AGI_CHAT_TIMEOUT_SECS` (env var), or 120 s.
-    pub chat_timeout: Duration,
-    /// Delay injected between successive chat commands to prevent burst requests.
-    pub inter_agent_delay: Duration,
-    /// Backend runtime log verbosity.
-    ///
-    /// Defaults to `Warn`, matching the upstream SDK's default behavior.
-    /// Set to `Info` or `Debug` for verbose protocol-level diagnostics.
-    pub backend_log_level: BackendLogLevel,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        let chat_timeout = default_chat_timeout();
-        Self {
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
-            operation_timeout: default_operation_timeout(chat_timeout),
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-            chat_timeout,
-            inter_agent_delay: DEFAULT_INTER_AGENT_DELAY,
-            backend_log_level: BackendLogLevel::default(),
-        }
-    }
 }
 
 /// Manages a dedicated Python thread with an asyncio event loop.
@@ -360,12 +266,12 @@ impl PythonRuntime {
     /// Send a command to the Python thread and await the result.
     ///
     /// This is the primary interface for all Python interactions. It checks
-    /// quota state before sending and applies a configurable timeout.
+    /// quota state before sending.
     ///
     /// # Errors
     ///
-    /// Returns `Error::ChannelClosed` if the Python thread has exited,
-    /// `Error::Timeout` if the operation exceeds the configured timeout.
+    /// Returns `Error::ChannelClosed` if the Python thread has exited or the
+    /// reply channel is dropped before a response is sent.
     async fn send_command<T>(
         &self,
         operation: &str,
@@ -382,12 +288,9 @@ impl PythonRuntime {
                 message: format!("Python runtime thread has exited (sending {operation}): {e}"),
             })?;
 
-        let result = crate::error::with_timeout(self.config.operation_timeout, operation, async {
-            reply_rx.await.map_err(|e| Error::ChannelClosed {
-                message: format!("Reply channel dropped for {operation}: {e}"),
-            })?
-        })
-        .await?;
+        let result = reply_rx.await.map_err(|e| Error::ChannelClosed {
+            message: format!("Reply channel dropped for {operation}: {e}"),
+        })??;
 
         // Only reset quota backoff for LLM operations (e.g. chat); non-LLM
         // ops succeeding should not clear a 429 backoff.
@@ -396,6 +299,21 @@ impl PythonRuntime {
         }
 
         Ok(result)
+    }
+
+    /// Return the number of agents currently live in this runtime.
+    ///
+    /// Counts agents that have been created but not yet shut down or dropped.
+    /// Primarily useful for observability and for asserting clean teardown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ChannelClosed`] if the runtime thread has exited.
+    pub(crate) async fn active_agent_count(&self) -> Result<usize, Error> {
+        self.send_command("active_agent_count", false, |reply| {
+            PyCommand::GetActiveAgentCount { reply }
+        })
+        .await
     }
 
     /// Graceful shutdown: send `Shutdown` command, then join the thread.
@@ -477,10 +395,47 @@ impl PythonRuntime {
 
 impl Drop for PythonRuntime {
     fn drop(&mut self) {
-        if self.thread.is_some() {
+        // If `shutdown()` was already called it took the thread handle, so
+        // there is nothing left to clean up.
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+
+        // Best-effort: prompt the command loop to stop so it runs
+        // `cleanup_remaining_agents` (calling `__aexit__` on any still-live
+        // agent) and then exits. If the channel buffer is momentarily full
+        // this send fails, but `cmd_tx` is dropped immediately after this
+        // function returns, which closes the channel and also stops the loop.
+        if let Err(e) = self.cmd_tx.try_send(PyCommand::Shutdown) {
+            tracing::debug!(
+                error = %e,
+                "PythonRuntime::drop: could not eagerly signal shutdown; \
+                 relying on channel close"
+            );
+        }
+
+        // Wait — bounded by the configured shutdown timeout — for the Python
+        // thread to finish releasing resources. This keeps teardown
+        // deterministic (no leaked Python objects) without risking an
+        // unbounded block if the thread misbehaves.
+        let deadline = std::time::Instant::now() + self.config.shutdown_timeout;
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        if thread.is_finished() {
+            if thread.join().is_err() {
+                tracing::error!("Python runtime thread panicked during drop cleanup");
+            } else {
+                tracing::debug!("Python runtime thread joined cleanly on drop");
+            }
+        } else {
+            // Dropping `cmd_tx` (right after this returns) closes the channel,
+            // so the loop still exits and cleans up; we simply stop blocking
+            // the dropping thread past the timeout.
             tracing::warn!(
-                "PythonRuntime dropped without calling shutdown() — \
-                 Python thread may still be running"
+                "Python runtime thread still running after shutdown timeout during drop — \
+                 detaching; agent cleanup will complete asynchronously"
             );
         }
     }
@@ -575,18 +530,12 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 
         tracing::info!("Python asyncio event loop created on runtime thread");
 
-        let chat_timeout = config.chat_timeout;
         let inter_agent_delay = config.inter_agent_delay;
         let event_loop_obj = event_loop.clone().unbind();
         let run_fut =
             pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), async move {
-                command_loop::run_async_command_loop(
-                    event_loop_obj,
-                    cmd_rx,
-                    chat_timeout,
-                    inter_agent_delay,
-                )
-                .await
+                command_loop::run_async_command_loop(event_loop_obj, cmd_rx, inter_agent_delay)
+                    .await
             });
 
         if let Err(e) = run_fut {
@@ -616,29 +565,33 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 fn compute_active_builtins(
     config: &crate::config::AgentConfig,
 ) -> Vec<crate::config::BuiltinTools> {
-    match config.capabilities.as_ref() {
-        Some(caps) if caps.enabled_tools.as_ref().is_some_and(|v| !v.is_empty()) => {
-            caps.enabled_tools.clone().unwrap_or_default()
-        }
-        Some(caps) if caps.enabled_tools.as_ref().is_some_and(Vec::is_empty) => {
-            // Explicitly empty = no builtins
-            Vec::new()
-        }
-        Some(caps) if caps.disabled_tools.is_some() => {
-            let disabled = caps.disabled_tools.as_ref().unwrap();
-            crate::config::BuiltinTools::all_tools()
-                .iter()
-                .filter(|t| !disabled.contains(t))
-                .cloned()
-                .collect()
-        }
-        _ => crate::config::BuiltinTools::all_tools().to_vec(),
+    let Some(caps) = config.capabilities.as_ref() else {
+        return crate::config::BuiltinTools::all_tools().to_vec();
+    };
+
+    // `enabled_tools`, when present, is authoritative: an explicit list selects
+    // exactly those tools, and an explicit empty list disables all builtins.
+    if let Some(enabled) = caps.enabled_tools.as_ref() {
+        return enabled.clone();
     }
+
+    // Otherwise, a `disabled_tools` list subtracts from the full builtin set.
+    if let Some(disabled) = caps.disabled_tools.as_ref() {
+        return crate::config::BuiltinTools::all_tools()
+            .iter()
+            .filter(|t| !disabled.contains(t))
+            .cloned()
+            .collect();
+    }
+
+    // Neither set → all builtin tools are active.
+    crate::config::BuiltinTools::all_tools().to_vec()
 }
 
 impl crate::agent::Runtime for PythonRuntime {
     async fn create_agent(
         &self,
+        agent_id: u64,
         config: crate::config::AgentConfig,
     ) -> Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error> {
         // Serialize the AgentConfig and inject the runtime's backend log
@@ -665,6 +618,7 @@ impl crate::agent::Runtime for PythonRuntime {
 
         let (raw_id, raw_tools) = self
             .send_command("create_agent", false, |reply| PyCommand::CreateAgent {
+                agent_id,
                 config_json,
                 reply,
             })
@@ -930,334 +884,5 @@ impl crate::agent::Runtime for PythonRuntime {
             reply,
         })
         .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::{ffi_dispatch::check_tool_execution_allowed, *};
-
-    fn test_config() -> RuntimeConfig {
-        RuntimeConfig {
-            channel_capacity: 16,
-            operation_timeout: Duration::from_secs(10),
-            shutdown_timeout: Duration::from_secs(5),
-            chat_timeout: Duration::from_mins(1),
-            inter_agent_delay: Duration::from_millis(100),
-            backend_log_level: BackendLogLevel::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_runtime_creation_and_shutdown() {
-        // Shutdown should complete cleanly.
-        PythonRuntime::new(test_config())
-            .expect("Failed to create runtime")
-            .shutdown()
-            .await
-            .expect("Shutdown failed");
-    }
-
-    #[test]
-    fn runtime_config_serde_roundtrip() {
-        let config = test_config();
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: RuntimeConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.channel_capacity, 16);
-        assert_eq!(parsed.operation_timeout, Duration::from_secs(10));
-        assert_eq!(parsed.shutdown_timeout, Duration::from_secs(5));
-        assert_eq!(parsed.chat_timeout, Duration::from_mins(1));
-        assert_eq!(parsed.inter_agent_delay, Duration::from_millis(100));
-        assert_eq!(parsed.backend_log_level, BackendLogLevel::Warn);
-    }
-
-    #[test]
-    fn backend_log_level_default_is_warn() {
-        assert_eq!(BackendLogLevel::default(), BackendLogLevel::Warn);
-    }
-
-    #[test]
-    fn backend_log_level_serde_roundtrip_all_variants() {
-        for (variant, expected_str) in [
-            (BackendLogLevel::Error, "\"error\""),
-            (BackendLogLevel::Warn, "\"warn\""),
-            (BackendLogLevel::Info, "\"info\""),
-            (BackendLogLevel::Debug, "\"debug\""),
-        ] {
-            let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected_str, "serialize {variant:?}");
-            let parsed: BackendLogLevel = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, variant, "roundtrip {variant:?}");
-        }
-    }
-
-    #[test]
-    fn backend_log_level_as_str() {
-        assert_eq!(BackendLogLevel::Error.as_str(), "error");
-        assert_eq!(BackendLogLevel::Warn.as_str(), "warn");
-        assert_eq!(BackendLogLevel::Info.as_str(), "info");
-        assert_eq!(BackendLogLevel::Debug.as_str(), "debug");
-    }
-
-    #[test]
-    fn backend_log_level_display() {
-        assert_eq!(format!("{}", BackendLogLevel::Error), "error");
-        assert_eq!(format!("{}", BackendLogLevel::Warn), "warn");
-        assert_eq!(format!("{}", BackendLogLevel::Info), "info");
-        assert_eq!(format!("{}", BackendLogLevel::Debug), "debug");
-    }
-
-    #[test]
-    fn runtime_config_with_custom_backend_log_level() {
-        let config = RuntimeConfig {
-            backend_log_level: BackendLogLevel::Debug,
-            ..test_config()
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: RuntimeConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.backend_log_level, BackendLogLevel::Debug);
-    }
-
-    #[test]
-    fn default_operation_timeout_is_chat_plus_margin() {
-        let config = RuntimeConfig::default();
-        let expected = config.chat_timeout + Duration::from_mins(2);
-        assert_eq!(
-            config.operation_timeout, expected,
-            "operation_timeout should be chat_timeout + 2min safety margin"
-        );
-    }
-
-    #[test]
-    fn stop_candidate_exception_is_backend_error() {
-        Python::initialize();
-        Python::attach(|py| {
-            let globals = pyo3::types::PyDict::new(py);
-            py.run(
-                c"
-class StopCandidateException(Exception):
-    pass
-err = StopCandidateException(\"dummy\")
-",
-                Some(&globals),
-                None,
-            )
-            .unwrap();
-
-            let err_obj = globals.get_item("err").unwrap().unwrap();
-            let err = PyErr::from_value(err_obj);
-
-            let mapped = crate::error::classify_py_error(py, &err);
-
-            assert!(
-                matches!(mapped, crate::error::Error::BackendError { .. }),
-                "StopCandidateException should be classified as BackendError, got: {mapped:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn max_tokens_exception_is_backend_error() {
-        Python::initialize();
-        Python::attach(|py| {
-            let globals = pyo3::types::PyDict::new(py);
-            py.run(
-                c"
-class MaxTokensException(Exception):
-    pass
-err = MaxTokensException(\"dummy\")
-",
-                Some(&globals),
-                None,
-            )
-            .unwrap();
-
-            let err_obj = globals.get_item("err").unwrap().unwrap();
-            let err = PyErr::from_value(err_obj);
-
-            let mapped = crate::error::classify_py_error(py, &err);
-
-            assert!(
-                matches!(mapped, crate::error::Error::BackendError { .. }),
-                "MaxTokensException should be classified as BackendError, got: {mapped:?}"
-            );
-        });
-    }
-
-    struct MockAskUserHandler {
-        should_allow: std::sync::atomic::AtomicBool,
-    }
-
-    impl crate::policies::AskUserHandler for MockAskUserHandler {
-        fn confirm(&self, _tool_name: &str, _tool_args: &serde_json::Value) -> bool {
-            self.should_allow.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[test]
-    fn test_ask_user_policy_custom_tool_gating() {
-        let agent_id: u64 = 999;
-
-        // 1. Setup the PolicySet with an AskUser rule for "dangerous_tool"
-        let mut policies = crate::policies::PolicySet::new();
-        policies
-            .push(crate::policies::PolicyRule::AskUser {
-                tool: "dangerous_tool".to_owned(),
-                handler_id: "confirm_handler".to_owned(),
-            })
-            .unwrap();
-
-        // 2. Setup mock handler
-        let handler = Arc::new(MockAskUserHandler {
-            should_allow: std::sync::atomic::AtomicBool::new(true),
-        });
-
-        // 3. Mock the tool registry
-        let mut registry = crate::tools::ToolRegistry::new();
-
-        /// A dangerous tool.
-        #[crate::llm_tool]
-        fn dangerous_tool() -> Result<String, String> {
-            Ok("Executed dangerous action!".to_owned())
-        }
-        registry.register(DangerousTool);
-
-        // 4. Register all state in a single bridge_state() insertion
-        bridge_state().write().unwrap().insert(
-            agent_id,
-            AgentBridgeState {
-                registry: Some(Arc::new(registry)),
-                hook_runner: None,
-                policies,
-                policy_handler: Some(
-                    Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>
-                ),
-                tool_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            },
-        );
-
-        // 5. Simulate check_tool_execution_allowed when the AskUserHandler allows it (returns true)
-        handler
-            .should_allow
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let res = check_tool_execution_allowed(agent_id, "dangerous_tool", "{}");
-        assert!(res.is_ok(), "Check should succeed");
-        assert!(
-            res.unwrap(),
-            "Should allow tool execution when handler returns true"
-        );
-
-        // 6. Simulate check_tool_execution_allowed when the AskUserHandler denies it (returns false)
-        handler
-            .should_allow
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let res = check_tool_execution_allowed(agent_id, "dangerous_tool", "{}");
-        assert!(res.is_ok(), "Check should succeed");
-        assert!(
-            !res.unwrap(),
-            "Should block tool execution when handler returns false"
-        );
-
-        // Clean up
-        bridge_state().write().unwrap().remove(&agent_id);
-    }
-
-    // ── compute_active_builtins tests ─────────────────────────────────
-
-    #[test]
-    fn builtins_default_config_returns_all() {
-        let config = crate::config::AgentConfig::default();
-        let builtins = super::compute_active_builtins(&config);
-        assert_eq!(
-            builtins.len(),
-            crate::config::BuiltinTools::all_tools().len(),
-            "default config should produce all builtins"
-        );
-    }
-
-    #[test]
-    fn builtins_no_capabilities_returns_all() {
-        let config = crate::config::AgentConfig {
-            capabilities: None,
-            ..crate::config::AgentConfig::default()
-        };
-        let builtins = super::compute_active_builtins(&config);
-        assert_eq!(
-            builtins.len(),
-            crate::config::BuiltinTools::all_tools().len(),
-        );
-    }
-
-    #[test]
-    fn builtins_enabled_tools_filters() {
-        let config = crate::config::AgentConfig {
-            capabilities: Some(crate::config::CapabilitiesConfig {
-                enabled_tools: Some(vec![
-                    crate::config::BuiltinTools::ViewFile,
-                    crate::config::BuiltinTools::ListDir,
-                ]),
-                ..crate::config::CapabilitiesConfig::default()
-            }),
-            ..crate::config::AgentConfig::default()
-        };
-        let builtins = super::compute_active_builtins(&config);
-        assert_eq!(builtins.len(), 2);
-        assert!(builtins.contains(&crate::config::BuiltinTools::ViewFile));
-        assert!(builtins.contains(&crate::config::BuiltinTools::ListDir));
-    }
-
-    #[test]
-    fn builtins_disabled_tools_excludes() {
-        let config = crate::config::AgentConfig {
-            capabilities: Some(crate::config::CapabilitiesConfig {
-                disabled_tools: Some(vec![crate::config::BuiltinTools::RunCommand]),
-                ..crate::config::CapabilitiesConfig::default()
-            }),
-            ..crate::config::AgentConfig::default()
-        };
-        let builtins = super::compute_active_builtins(&config);
-        assert!(
-            !builtins.contains(&crate::config::BuiltinTools::RunCommand),
-            "RunCommand should be excluded"
-        );
-        assert!(
-            builtins.len() == crate::config::BuiltinTools::all_tools().len() - 1,
-            "should have all builtins minus the disabled one"
-        );
-    }
-
-    #[test]
-    fn builtins_custom_tools_only_returns_empty() {
-        let config = crate::config::AgentConfig {
-            capabilities: Some(crate::config::CapabilitiesConfig::custom_tools_only()),
-            ..crate::config::AgentConfig::default()
-        };
-        let builtins = super::compute_active_builtins(&config);
-        assert!(
-            builtins.is_empty(),
-            "custom_tools_only should produce 0 builtins"
-        );
-    }
-
-    #[test]
-    fn builtins_all_descriptions_non_empty() {
-        for tool in crate::config::BuiltinTools::all_tools() {
-            assert!(
-                !tool.description().is_empty(),
-                "builtin {tool:?} has empty description",
-            );
-        }
-    }
-
-    #[test]
-    fn builtins_all_sdk_names_non_empty() {
-        for tool in crate::config::BuiltinTools::all_tools() {
-            assert!(
-                !tool.as_sdk_name().is_empty(),
-                "builtin {tool:?} has empty SDK name",
-            );
-        }
     }
 }

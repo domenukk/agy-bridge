@@ -695,11 +695,7 @@ mod tests {
         let consumer = handle.text();
 
         let ((), result) = tokio::join!(producer, consumer);
-        assert!(
-            result.is_err(),
-            "handle.text() must return Err when error step is sent"
-        );
-        let err = result.unwrap_err();
+        let err = result.expect_err("handle.text() must return Err when error step is sent");
         assert!(
             err.message.contains("503") || err.message.contains("Agent execution terminated"),
             "Error message should contain the backend error: {}",
@@ -736,14 +732,9 @@ mod tests {
 
         // Without the error_tx send, text() returns Ok("") — the bug!
         let ((), result) = tokio::join!(producer, consumer);
-        assert!(
-            result.is_ok(),
-            "Without error_tx, text() should return Ok (demonstrating the old bug)"
-        );
-        assert!(
-            result.unwrap().is_empty(),
-            "Without error_tx, text should be empty"
-        );
+        let text =
+            result.expect("Without error_tx, text() should return Ok (demonstrating the old bug)");
+        assert!(text.is_empty(), "Without error_tx, text should be empty");
     }
 
     #[tokio::test]
@@ -766,10 +757,7 @@ mod tests {
             let second = error_tx.try_send(StreamError {
                 message: "second error".to_owned(),
             });
-            assert!(
-                second.is_err(),
-                "Second try_send should fail (channel full)"
-            );
+            second.expect_err("Second try_send should fail (channel full)");
             // Close text channel so handle.text() can finish draining.
             drop(text_tx);
         };
@@ -812,12 +800,9 @@ mod tests {
         let consumer = handle.text();
 
         let ((), result) = tokio::join!(producer, consumer);
+        let err = result.expect_err("Error should take priority over partial text");
         assert!(
-            result.is_err(),
-            "Error should take priority over partial text"
-        );
-        assert!(
-            result.unwrap_err().message.contains("connection reset"),
+            err.message.contains("connection reset"),
             "Should contain the error message"
         );
     }
