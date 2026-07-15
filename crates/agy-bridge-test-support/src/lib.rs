@@ -49,13 +49,13 @@ impl RustTool for AddTool {
     const NAME: &'static str = "add_numbers";
     const DESCRIPTION: &'static str = "Adds two numbers.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
         let result = params.x + params.y;
-        Ok(format!("{result}").into())
+        std::future::ready(Ok(format!("{result}").into()))
     }
 }
 
@@ -72,17 +72,17 @@ impl RustTool for LookupTool {
     const NAME: &'static str = "lookup";
     const DESCRIPTION: &'static str = "Looks up a value by key.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
         let val = match params.key.as_str() {
             "secret" => "GAMMA-42",
             "status" => "operational",
             _ => "not_found",
         };
-        Ok(val.into())
+        std::future::ready(Ok(val.into()))
     }
 }
 
@@ -99,12 +99,12 @@ impl RustTool for AlwaysFailTool {
     const NAME: &'static str = "always_fail";
     const DESCRIPTION: &'static str = "Always fails with the given reason.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        Err(ToolError::new(params.reason))
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
+        std::future::ready(Err(ToolError::new(params.reason)))
     }
 }
 
@@ -135,13 +135,13 @@ impl RustTool for CountingTool {
     const NAME: &'static str = "counting_tool";
     const DESCRIPTION: &'static str = "Increments a counter and returns the count.";
 
-    async fn call(
+    fn call(
         &self,
         _params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(format!("invocation_{n}").into())
+        std::future::ready(Ok(format!("invocation_{n}").into()))
     }
 }
 
