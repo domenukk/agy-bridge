@@ -588,8 +588,35 @@ fn two_bridges_concurrent_proxy_and_direct_agents() {
             let mut stream_proxy = handle_proxy.take_text_stream().expect("proxy text stream");
             let mut stream_direct = handle_direct.take_text_stream().expect("direct text stream");
 
-            let chunk_proxy = stream_proxy.recv().await.expect("proxy first chunk");
-            let chunk_direct = stream_direct.recv().await.expect("direct first chunk");
+            // A text stream may close before yielding any chunk under transient
+            // upstream pressure (e.g. a 429/503 when the whole live suite has
+            // been hammering the shared TPM quota). Rather than panicking —
+            // which would bypass the harness's structured-error retry — surface
+            // the handle's terminal error (retryable if it's a quota/connection
+            // blip) or, failing that, a retryable `Error::Stream` so the
+            // harness retries the whole test.
+            let chunk_proxy = match stream_proxy.recv().await {
+                Some(chunk) => chunk,
+                None => {
+                    handle_proxy.text().await?;
+                    return Err(agy_bridge::error::Error::Stream(
+                        agy_bridge::streaming::StreamError {
+                            message: "proxy text stream closed before first chunk".to_owned(),
+                        },
+                    ));
+                }
+            };
+            let chunk_direct = match stream_direct.recv().await {
+                Some(chunk) => chunk,
+                None => {
+                    handle_direct.text().await?;
+                    return Err(agy_bridge::error::Error::Stream(
+                        agy_bridge::streaming::StreamError {
+                            message: "direct text stream closed before first chunk".to_owned(),
+                        },
+                    ));
+                }
+            };
 
             eprintln!("Simultaneous in-flight streaming chunk (Proxy): {chunk_proxy}");
             eprintln!("Simultaneous in-flight streaming chunk (Direct): {chunk_direct}");

@@ -36,12 +36,12 @@
 //! `.await` points). This is the standard pattern for PyO3 FFI bridges that need to
 //! associate Rust state with Python-side identifiers.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{error::Error, quota::QuotaState};
+use crate::error::Error;
 
 pub(crate) mod bridge_state;
 pub(crate) mod command_loop;
@@ -210,11 +210,6 @@ pub struct PythonRuntime {
     cmd_tx: mpsc::Sender<PyCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
     config: RuntimeConfig,
-    /// Per-runtime quota registry. Each API key gets its own [`QuotaState`],
-    /// and different `PythonRuntime` instances are fully independent.
-    quota_registry: crate::quota::QuotaRegistry,
-    /// Default quota state used by `send_command` for runtime-level backoff.
-    quota_state: Arc<QuotaState>,
 }
 
 impl std::fmt::Debug for PythonRuntime {
@@ -252,21 +247,16 @@ impl PythonRuntime {
                 message: format!("Failed to spawn Python runtime thread: {e}"),
             })?;
 
-        let quota_registry = crate::quota::QuotaRegistry::new();
-        let quota_state = quota_registry.state_for_key("");
         Ok(Self {
             cmd_tx,
             thread: Some(thread),
             config,
-            quota_registry,
-            quota_state,
         })
     }
 
     /// Send a command to the Python thread and await the result.
     ///
-    /// This is the primary interface for all Python interactions. It checks
-    /// quota state before sending.
+    /// This is the primary interface for all Python interactions.
     ///
     /// # Errors
     ///
@@ -275,7 +265,6 @@ impl PythonRuntime {
     async fn send_command<T>(
         &self,
         operation: &str,
-        is_llm_op: bool,
         build_cmd: impl FnOnce(oneshot::Sender<Result<T, Error>>) -> PyCommand,
     ) -> Result<T, Error> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -292,12 +281,6 @@ impl PythonRuntime {
             message: format!("Reply channel dropped for {operation}: {e}"),
         })??;
 
-        // Only reset quota backoff for LLM operations (e.g. chat); non-LLM
-        // ops succeeding should not clear a 429 backoff.
-        if is_llm_op {
-            self.quota_state.record_success();
-        }
-
         Ok(result)
     }
 
@@ -310,7 +293,7 @@ impl PythonRuntime {
     ///
     /// Returns [`Error::ChannelClosed`] if the runtime thread has exited.
     pub(crate) async fn active_agent_count(&self) -> Result<usize, Error> {
-        self.send_command("active_agent_count", false, |reply| {
+        self.send_command("active_agent_count", |reply| {
             PyCommand::GetActiveAgentCount { reply }
         })
         .await
@@ -384,12 +367,6 @@ impl PythonRuntime {
                 })
             }
         }
-    }
-
-    /// Access the shared quota state.
-    #[must_use]
-    pub const fn quota_state(&self) -> &Arc<QuotaState> {
-        &self.quota_state
     }
 }
 
@@ -617,7 +594,7 @@ impl crate::agent::Runtime for PythonRuntime {
             config.tools.iter().map(|t| t.name.clone()).collect();
 
         let (raw_id, raw_tools) = self
-            .send_command("create_agent", false, |reply| PyCommand::CreateAgent {
+            .send_command("create_agent", |reply| PyCommand::CreateAgent {
                 agent_id,
                 config_json,
                 reply,
@@ -681,7 +658,7 @@ impl crate::agent::Runtime for PythonRuntime {
             crate::content::Content::Text { text } => text.clone(),
             other => crate::content::content_to_json(other)?,
         };
-        self.send_command("chat", true, |reply| PyCommand::Chat {
+        self.send_command("chat", |reply| PyCommand::Chat {
             agent_id: AgentId(agent_id),
             prompt,
             reply,
@@ -690,7 +667,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn shutdown_agent(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("shutdown_agent", false, |reply| PyCommand::ShutdownAgent {
+        self.send_command("shutdown_agent", |reply| PyCommand::ShutdownAgent {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -715,7 +692,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn cancel(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("cancel", false, |reply| PyCommand::Cancel {
+        self.send_command("cancel", |reply| PyCommand::Cancel {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -723,7 +700,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn wait_for_idle(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("wait_for_idle", false, |reply| PyCommand::WaitForIdle {
+        self.send_command("wait_for_idle", |reply| PyCommand::WaitForIdle {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -739,7 +716,7 @@ impl crate::agent::Runtime for PythonRuntime {
             crate::content::Content::Text { text } => text.clone(),
             other => crate::content::content_to_json(other)?,
         };
-        self.send_command("send", false, |reply| PyCommand::Send {
+        self.send_command("send", |reply| PyCommand::Send {
             agent_id: AgentId(agent_id),
             prompt,
             reply,
@@ -748,7 +725,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn signal_idle(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("signal_idle", false, |reply| PyCommand::SignalIdle {
+        self.send_command("signal_idle", |reply| PyCommand::SignalIdle {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -760,7 +737,7 @@ impl crate::agent::Runtime for PythonRuntime {
         agent_id: crate::agent::AgentId,
         timeout: std::time::Duration,
     ) -> Result<bool, Error> {
-        self.send_command("wait_for_wakeup", false, |reply| PyCommand::WaitForWakeup {
+        self.send_command("wait_for_wakeup", |reply| PyCommand::WaitForWakeup {
             agent_id: AgentId(agent_id),
             timeout_secs: timeout.as_secs_f64(),
             reply,
@@ -768,23 +745,11 @@ impl crate::agent::Runtime for PythonRuntime {
         .await
     }
 
-    async fn wait_for_quota(&self) {
-        self.quota_state.wait_for_quota().await;
-    }
-
-    async fn record_quota_hit(&self, retry_after: std::time::Duration) {
-        self.quota_state.record_quota_hit(retry_after);
-    }
-
-    fn quota_registry(&self) -> &crate::quota::QuotaRegistry {
-        &self.quota_registry
-    }
-
     async fn history(
         &self,
         agent_id: crate::agent::AgentId,
     ) -> Result<Vec<crate::types::ConversationMessage>, Error> {
-        self.send_command("get_history", false, |reply| PyCommand::GetHistory {
+        self.send_command("get_history", |reply| PyCommand::GetHistory {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -792,7 +757,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn turn_count(&self, agent_id: crate::agent::AgentId) -> Result<u32, Error> {
-        self.send_command("get_turn_count", false, |reply| PyCommand::GetTurnCount {
+        self.send_command("get_turn_count", |reply| PyCommand::GetTurnCount {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -803,7 +768,7 @@ impl crate::agent::Runtime for PythonRuntime {
         &self,
         agent_id: crate::agent::AgentId,
     ) -> Result<crate::types::UsageMetadata, Error> {
-        self.send_command("get_total_usage", false, |reply| PyCommand::GetTotalUsage {
+        self.send_command("get_total_usage", |reply| PyCommand::GetTotalUsage {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -814,17 +779,15 @@ impl crate::agent::Runtime for PythonRuntime {
         &self,
         agent_id: crate::agent::AgentId,
     ) -> Result<crate::types::UsageMetadata, Error> {
-        self.send_command("get_last_turn_usage", false, |reply| {
-            PyCommand::GetLastTurnUsage {
-                agent_id: AgentId(agent_id),
-                reply,
-            }
+        self.send_command("get_last_turn_usage", |reply| PyCommand::GetLastTurnUsage {
+            agent_id: AgentId(agent_id),
+            reply,
         })
         .await
     }
 
     async fn clear_history(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("clear_history", false, |reply| PyCommand::ClearHistory {
+        self.send_command("clear_history", |reply| PyCommand::ClearHistory {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -832,17 +795,15 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn remove_last_turn(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("remove_last_turn", false, |reply| {
-            PyCommand::RemoveLastTurn {
-                agent_id: AgentId(agent_id),
-                reply,
-            }
+        self.send_command("remove_last_turn", |reply| PyCommand::RemoveLastTurn {
+            agent_id: AgentId(agent_id),
+            reply,
         })
         .await
     }
 
     async fn compaction_indices(&self, agent_id: crate::agent::AgentId) -> Result<Vec<u32>, Error> {
-        self.send_command("compaction_indices", false, |reply| {
+        self.send_command("compaction_indices", |reply| {
             PyCommand::GetCompactionIndices {
                 agent_id: AgentId(agent_id),
                 reply,
@@ -855,7 +816,7 @@ impl crate::agent::Runtime for PythonRuntime {
         &self,
         agent_id: crate::agent::AgentId,
     ) -> Result<Option<String>, Error> {
-        self.send_command("last_response", false, |reply| PyCommand::GetLastResponse {
+        self.send_command("last_response", |reply| PyCommand::GetLastResponse {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -863,7 +824,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn delete(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("delete", false, |reply| PyCommand::Delete {
+        self.send_command("delete", |reply| PyCommand::Delete {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -871,7 +832,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn disconnect(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("disconnect", false, |reply| PyCommand::Disconnect {
+        self.send_command("disconnect", |reply| PyCommand::Disconnect {
             agent_id: AgentId(agent_id),
             reply,
         })
@@ -879,7 +840,7 @@ impl crate::agent::Runtime for PythonRuntime {
     }
 
     async fn is_idle(&self, agent_id: crate::agent::AgentId) -> Result<bool, Error> {
-        self.send_command("is_idle", false, |reply| PyCommand::IsIdle {
+        self.send_command("is_idle", |reply| PyCommand::IsIdle {
             agent_id: AgentId(agent_id),
             reply,
         })

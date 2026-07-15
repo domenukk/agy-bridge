@@ -227,12 +227,6 @@ pub struct AgentConfig {
     #[serde(default, rename = "gemini_config")]
     #[builder(setter(strip_option))]
     pub gemini: Option<GeminiConfig>,
-    /// Maximum number of quota retry attempts before giving up.
-    ///
-    /// If `None`, defaults to 0 (no retries).
-    #[serde(default)]
-    #[builder(setter(into, strip_option))]
-    pub max_quota_retries: Option<u32>,
     /// Optional initial conversation history to inject after agent creation.
     ///
     /// When set, these messages are inserted into the SDK's internal

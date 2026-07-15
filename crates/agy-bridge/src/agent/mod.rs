@@ -16,13 +16,6 @@ use crate::{
     types::{ConversationMessage, UsageMetadata},
 };
 
-/// Default backoff duration when a quota/429 error doesn't include a
-/// `Retry-After` header.
-const DEFAULT_QUOTA_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Duration reported to the caller when all quota retries are exhausted.
-const QUOTA_EXHAUSTED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_mins(2);
-
 #[cfg(test)]
 pub(crate) mod mock;
 
@@ -79,18 +72,6 @@ pub trait Runtime: Send + Sync {
         agent_id: AgentId,
         timeout: std::time::Duration,
     ) -> Result<bool, Error>;
-
-    /// Wait if we're in a quota backoff period.
-    async fn wait_for_quota(&self);
-
-    /// Record a quota hit with the suggested retry duration.
-    async fn record_quota_hit(&self, retry_after: std::time::Duration);
-
-    /// Access this runtime's per-key quota registry.
-    ///
-    /// Each runtime owns its own [`QuotaRegistry`](crate::quota::QuotaRegistry),
-    /// so different runtimes have fully independent quota tracking.
-    fn quota_registry(&self) -> &crate::quota::QuotaRegistry;
 
     /// Retrieve the conversation's message history.
     async fn history(&self, agent_id: AgentId) -> Result<Vec<ConversationMessage>, Error>;
@@ -186,9 +167,6 @@ pub struct AgentHandle<R: Runtime + 'static> {
     id: AgentId,
     runtime: Arc<R>,
     config: AgentConfig,
-    /// Per-API-key quota state. Agents sharing the same effective API key
-    /// share backoff tracking; agents with different keys are independent.
-    quota_state: Arc<crate::quota::QuotaState>,
     /// Kept alive for the agent's lifetime so the global `BRIDGE_STATE`
     /// entry isn't the only strong reference.
     _registry: Option<Arc<crate::tools::ToolRegistry>>,
@@ -248,10 +226,6 @@ impl<R: Runtime> AgentHandle<R> {
         hook_runner: Option<Arc<crate::hooks::Hooks>>,
         policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Self, Error> {
-        // NOLINT: empty string default is intentional — agents without an API key share one quota bucket
-        let quota_key = config.effective_api_key().unwrap_or_default();
-        let quota_state = runtime.quota_registry().state_for_key(&quota_key);
-
         // Allocate the (process-globally-unique) agent ID up front so we can
         // register per-agent initialization state *before* creation, keyed by
         // the ID. This avoids any process-wide lock across `create_agent`, so
@@ -302,7 +276,6 @@ impl<R: Runtime> AgentHandle<R> {
             id: agent_id,
             runtime,
             config,
-            quota_state,
             _registry: registry,
             policy_handler,
             conversation_id,
@@ -367,7 +340,9 @@ impl<R: Runtime> AgentHandle<R> {
     /// [`Audio`](crate::content::Audio), [`Video`](crate::content::Video), or a
     /// `Vec<ContentPrimitive>` for multimodal input.
     ///
-    /// Automatically backs off on quota limits (HTTP 429).
+    /// This is **single-shot**: a quota error (HTTP 429) or any other failure
+    /// is returned immediately. Retrying is the caller's responsibility, so a
+    /// caller running its own retry loop is never double-retried.
     ///
     /// # Errors
     ///
@@ -376,37 +351,13 @@ impl<R: Runtime> AgentHandle<R> {
         if !self.is_started() {
             return Err(Error::AgentNotStarted);
         }
+        self.chat_once(&content.into()).await
+    }
 
-        let content = content.into();
-        // NOLINT: zero retries is the correct default — no automatic retry unless explicitly configured
-        let max_retries = self.config.max_quota_retries.unwrap_or(0);
-
-        let handle = 'retry: {
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    self.quota_state.wait_for_quota().await;
-                }
-                match self.runtime.chat(self.id, &content).await {
-                    Ok(h) => break 'retry h,
-                    Err(Error::QuotaExceeded { retry_after }) => {
-                        self.handle_quota_error("chat", attempt, max_retries, retry_after)?;
-                    }
-                    Err(ref e) if e.is_quota_error() => {
-                        self.handle_quota_error(
-                            "chat",
-                            attempt,
-                            max_retries,
-                            DEFAULT_QUOTA_BACKOFF,
-                        )?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(Error::QuotaExceeded {
-                retry_after: QUOTA_EXHAUSTED_RETRY_AFTER,
-            });
-        };
-
+    /// Perform a single (non-retrying) chat turn, recording the streaming
+    /// shared state for later `get_last_structured_output()` access.
+    async fn chat_once(&self, content: &Content) -> Result<ChatResponseHandle, Error> {
+        let handle = self.runtime.chat(self.id, content).await?;
         match self.last_shared_state.lock() {
             Ok(mut guard) => {
                 *guard = Some(Arc::clone(&handle.shared_state));
@@ -429,68 +380,33 @@ impl<R: Runtime> AgentHandle<R> {
     /// with the agent at creation time, the Python runtime handles tool
     /// execution automatically.
     ///
-    /// Unlike [`chat`](Self::chat), this method includes a full retry loop
-    /// because quota/429 errors from the SDK often surface during streaming
-    /// (after `chat()` already returned `Ok(handle)`), making `chat()`'s own
-    /// retry loop ineffective.
+    /// Like [`chat`](Self::chat), this is **single-shot**: quota / 429 errors
+    /// that surface *during* streaming are returned to the caller immediately.
+    /// Retrying is the caller's responsibility.
     ///
     /// # Errors
     ///
     /// Returns [`Error`] if the chat turn fails or stream errors occur.
     pub async fn chat_text(&self, message: impl Into<Content>) -> Result<String, Error> {
-        let content = message.into();
-        // NOLINT: zero retries is the correct default — no automatic retry unless explicitly configured
-        let max_retries = self.config.max_quota_retries.unwrap_or(0);
+        self.chat_text_once(&message.into()).await
+    }
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                self.quota_state.wait_for_quota().await;
-            }
-
-            let response = match self.chat(content.clone()).await {
-                Ok(h) => h,
-                Err(Error::QuotaExceeded { retry_after }) => {
-                    self.handle_quota_error("chat_text", attempt, max_retries, retry_after)?;
-                    continue;
-                }
-                Err(ref e) if e.is_quota_error() => {
-                    self.handle_quota_error(
-                        "chat_text",
-                        attempt,
-                        max_retries,
-                        DEFAULT_QUOTA_BACKOFF,
-                    )?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            match response.text().await {
-                Ok(text) => return Ok(text.into_string()),
-                Err(stream_err) => {
-                    let err = Error::BackendError {
-                        message: format!(
-                            "Failed to read response text: stream error: {}",
-                            stream_err.message
-                        ),
-                    };
-                    if err.is_quota_error() {
-                        self.handle_quota_error(
-                            "chat_text",
-                            attempt,
-                            max_retries,
-                            DEFAULT_QUOTA_BACKOFF,
-                        )?;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
+    /// Perform a single (non-retrying) chat turn and drain it to text.
+    ///
+    /// A stream error encountered while draining is mapped to a
+    /// [`Error::BackendError`], preserving [`Error::is_quota_error`] semantics so
+    /// the caller's retry loop can react to quota errors that only surface here.
+    async fn chat_text_once(&self, content: &Content) -> Result<String, Error> {
+        let response = self.chat_once(content).await?;
+        match response.text().await {
+            Ok(text) => Ok(text.into_string()),
+            Err(stream_err) => Err(Error::BackendError {
+                message: format!(
+                    "Failed to read response text: stream error: {}",
+                    stream_err.message
+                ),
+            }),
         }
-
-        Err(Error::QuotaExceeded {
-            retry_after: QUOTA_EXHAUSTED_RETRY_AFTER,
-        })
     }
 
     /// Return the current conversation ID, if one has been set.
@@ -784,6 +700,8 @@ impl<R: Runtime> AgentHandle<R> {
     /// Fire-and-forget: the message is delivered to the agent but no
     /// streaming response is produced.
     ///
+    /// This is **single-shot**; retrying is the caller's responsibility.
+    ///
     /// # Errors
     ///
     /// Returns a [`Error`] if sending fails.
@@ -791,30 +709,7 @@ impl<R: Runtime> AgentHandle<R> {
         if !self.is_started() {
             return Err(Error::AgentNotStarted);
         }
-
-        let content = content.into();
-
-        // NOLINT: zero retries is the correct default — no automatic retry unless explicitly configured
-        let max_retries = self.config.max_quota_retries.unwrap_or(0);
-
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                self.quota_state.wait_for_quota().await;
-            }
-            match self.runtime.send(self.id, &content).await {
-                Ok(()) => return Ok(()),
-                Err(Error::QuotaExceeded { retry_after }) => {
-                    self.handle_quota_error("send", attempt, max_retries, retry_after)?;
-                }
-                Err(ref e) if e.is_quota_error() => {
-                    self.handle_quota_error("send", attempt, max_retries, DEFAULT_QUOTA_BACKOFF)?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(Error::QuotaExceeded {
-            retry_after: QUOTA_EXHAUSTED_RETRY_AFTER,
-        })
+        self.runtime.send(self.id, &content.into()).await
     }
 
     /// Signal that this agent is idle and ready to receive input.
@@ -834,31 +729,6 @@ impl<R: Runtime> AgentHandle<R> {
     /// Returns a [`Error`] if the wait call fails.
     pub async fn wait_for_wakeup(&self, timeout: std::time::Duration) -> Result<bool, Error> {
         self.runtime.wait_for_wakeup(self.id, timeout).await
-    }
-
-    /// Handle a quota/429 error from a retryable operation.
-    fn handle_quota_error(
-        &self,
-        operation: &str,
-        attempt: u32,
-        max_retries: u32,
-        retry_after: std::time::Duration,
-    ) -> Result<(), Error> {
-        if attempt >= max_retries {
-            return Err(Error::QuotaExceeded { retry_after });
-        }
-        tracing::warn!(
-            agent_id = self.id,
-            attempt = attempt + 1,
-            max = max_retries,
-            retry_after_ms = u64::try_from(retry_after.as_millis()).unwrap_or_else(|e| {
-                tracing::warn!("Int conversion failed: {e}");
-                u64::MAX
-            }),
-            "Quota exceeded on {operation} — recording hit and retrying"
-        );
-        self.quota_state.record_quota_hit(retry_after);
-        Ok(())
     }
 
     /// Gracefully shut down the agent.

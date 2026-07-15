@@ -12,8 +12,6 @@ struct MockRuntime {
     history: Mutex<Vec<agy_bridge::types::ConversationMessage>>,
     /// Tracks the current turn count.
     turn_count: AtomicU32,
-    /// Per-runtime quota registry.
-    quota_registry: agy_bridge::quota::QuotaRegistry,
 }
 
 impl MockRuntime {
@@ -21,7 +19,6 @@ impl MockRuntime {
         Self {
             history: Mutex::new(Vec::new()),
             turn_count: AtomicU32::new(0),
-            quota_registry: agy_bridge::quota::QuotaRegistry::new(),
         }
     }
 }
@@ -106,14 +103,6 @@ impl agy_bridge::agent::Runtime for MockRuntime {
     ) -> Result<bool, Error> {
         Ok(false)
     }
-
-    async fn wait_for_quota(&self) {}
-
-    fn quota_registry(&self) -> &agy_bridge::quota::QuotaRegistry {
-        &self.quota_registry
-    }
-
-    async fn record_quota_hit(&self, _retry_after: std::time::Duration) {}
 
     async fn history(
         &self,

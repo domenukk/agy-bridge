@@ -18,8 +18,6 @@ pub mod error;
 pub mod hooks;
 /// Policy rules for tool-call filtering and workspace scoping.
 pub mod policies;
-/// Quota tracking and backoff state.
-pub mod quota;
 /// Python runtime bridge: command dispatch over a dedicated thread.
 pub mod runtime;
 
@@ -542,13 +540,6 @@ impl AgentBuilder<'_> {
         self.config
             .skills
             .extend(skills.into_iter().map(Into::into));
-        self
-    }
-
-    /// Set the maximum number of quota retry attempts before giving up.
-    #[must_use]
-    pub fn max_quota_retries(mut self, retries: u32) -> Self {
-        self.config.max_quota_retries = Some(retries);
         self
     }
 

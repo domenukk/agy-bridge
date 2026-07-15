@@ -41,29 +41,23 @@ async fn create_with_invalid_config_returns_error() {
     }
 }
 
-const TEST_MAX_QUOTA_RETRIES: u32 = 1000;
-
 #[tokio::test]
-async fn chat_with_quota_backoff_retries() {
+async fn chat_quota_error_is_single_shot() {
+    // agy-bridge is single-shot by design: a quota error is surfaced to the
+    // caller immediately, with no internal retry. The caller owns retrying
+    // (e.g. via `agent_resilience::backoff` in the consumer).
     let rt = Arc::new(ToolAwareMockRuntime::new());
     rt.fail_quota.store(true, Ordering::SeqCst);
 
-    let config = AgentConfig::builder()
-        .max_quota_retries(TEST_MAX_QUOTA_RETRIES)
-        .build();
-    let agent = AgentHandle::new(Arc::clone(&rt), config, None, None, None)
+    let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
         .await
         .expect("create should succeed");
 
-    {
-        let mut response = agent
-            .chat("Hello")
-            .await
-            .expect("should succeed after retry");
-        if let Some(mut rx) = response.take_tool_call_stream() {
-            let _call = rx.recv().await;
-        }
-    }
+    let result = agent.chat("Hello").await;
+    assert!(
+        matches!(result, Err(Error::QuotaExceeded { .. })),
+        "expected immediate QuotaExceeded (single-shot), got {result:?}"
+    );
 
     agent.shutdown().await.expect("shutdown should succeed");
 }

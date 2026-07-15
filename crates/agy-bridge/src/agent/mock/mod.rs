@@ -39,8 +39,6 @@ pub struct ToolAwareMockRuntime {
     /// assert cleanup of per-agent init state even on the create-failure path
     /// (where no `AgentHandle` — and thus no `id()` — is returned).
     pub(crate) last_create_id: std::sync::Mutex<Option<u64>>,
-    /// Per-runtime quota registry.
-    quota_registry: crate::quota::QuotaRegistry,
 }
 
 impl ToolAwareMockRuntime {
@@ -51,7 +49,6 @@ impl ToolAwareMockRuntime {
             fail_quota: AtomicBool::new(false),
             try_shutdown_called: AtomicBool::new(false),
             last_create_id: std::sync::Mutex::new(None),
-            quota_registry: crate::quota::QuotaRegistry::new(),
         }
     }
 

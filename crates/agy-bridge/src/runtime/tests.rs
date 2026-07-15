@@ -1,5 +1,7 @@
 //! Unit tests for [`super`] — the Python runtime manager.
 
+use std::sync::Arc;
+
 use super::{ffi_dispatch::check_tool_execution_allowed, *};
 
 fn test_config() -> RuntimeConfig {

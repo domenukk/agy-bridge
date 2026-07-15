@@ -140,14 +140,6 @@ impl Runtime for ToolAwareMockRuntime {
         Ok(false)
     }
 
-    async fn wait_for_quota(&self) {}
-
-    async fn record_quota_hit(&self, _retry_after: Duration) {}
-
-    fn quota_registry(&self) -> &crate::quota::QuotaRegistry {
-        &self.quota_registry
-    }
-
     async fn history(&self, _agent_id: AgentId) -> Result<Vec<ConversationMessage>, Error> {
         Ok(vec![
             ConversationMessage {
