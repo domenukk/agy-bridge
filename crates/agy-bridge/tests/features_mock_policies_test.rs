@@ -154,6 +154,49 @@ fn policy_allow_specific_plus_deny_all() {
     });
 }
 
+/// `DenyAll` blocks every tool call — the tool must never execute.
+#[test]
+fn policy_deny_all_blocks_tool() {
+    let rt = multi_thread_rt();
+    rt.block_on(async {
+        let server = MockGeminiServer::start(vec![
+            MockResponse::FunctionCall {
+                name: "counting_tool".into(),
+                args: serde_json::json!({}),
+            },
+            MockResponse::Text("This text should not require the tool.".into()),
+        ])
+        .await;
+
+        let (counting_tool, count) = CountingTool::new();
+        let mut registry = ToolRegistry::new();
+        registry.register(counting_tool);
+
+        let config = agy_bridge::config::AgentConfig::builder()
+            .system_instructions("test")
+            .gemini(agy_bridge::config::GeminiConfig {
+                api_key: Some("test-key".into()),
+                base_url: Some(server.base_url()),
+                models: agy_bridge::config::ModelConfig::default(),
+            })
+            .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+            .policies([PolicyRule::DenyAll])
+            .build();
+
+        let agent = BRIDGE.agent(config).tools(registry).await.expect("agent");
+
+        let _result = agent.chat_text("run the tool").await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "counting_tool must NOT execute under DenyAll"
+        );
+
+        agent.shutdown().await.expect("shutdown");
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SECTION 9: `AskUser` policy with handler
 // ═══════════════════════════════════════════════════════════════════════════

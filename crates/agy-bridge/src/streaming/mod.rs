@@ -655,6 +655,39 @@ mod tests {
         assert!(s.is_empty());
     }
 
+    #[tokio::test]
+    async fn chat_result_ergonomics() {
+        let (writer, handle) = channel();
+        tokio::spawn(async move {
+            writer
+                .text_tx
+                .send("hello world".to_owned())
+                .await
+                .expect("send");
+        });
+
+        let result = handle.text().await.expect("text");
+
+        // Deref<Target = str> — str methods work directly on ChatResult.
+        assert_eq!(result.len(), 11);
+        assert!(result.contains("world"));
+        assert_eq!(result.text(), "hello world");
+
+        // PartialEq<&str> and PartialEq<String>.
+        assert_eq!(result, "hello world");
+        assert_eq!(result, "hello world".to_owned());
+
+        // Display forwards to the inner text.
+        assert_eq!(format!("{result}"), "hello world");
+
+        // No usage / structured output was sent.
+        assert!(result.usage().is_none());
+        assert!(result.structured_output().is_none());
+
+        // into_string() yields the owned inner String.
+        assert_eq!(result.into_string(), "hello world");
+    }
+
     // ── Error routing tests (bug: error steps not routed to error_tx) ──────
 
     #[tokio::test]

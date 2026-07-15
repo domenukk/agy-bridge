@@ -182,6 +182,10 @@ pub fn run_live_test<F>(test_name: &str, f: F)
 where
     F: Fn() -> Result<(), agy_bridge::error::Error>,
 {
+    // Explicit opt-out only: honor AGY_BRIDGE_SKIP_LIVE_TESTS when a developer
+    // deliberately sets it. A *missing* GEMINI_API_KEY is NOT a skip reason —
+    // `api_key()` panics in that case, surfacing as a hard test failure rather
+    // than a silent no-op pass.
     if std::env::var("AGY_BRIDGE_SKIP_LIVE_TESTS").is_ok() {
         eprintln!("[SKIP] '{test_name}' skipped (AGY_BRIDGE_SKIP_LIVE_TESTS is set)");
         return;

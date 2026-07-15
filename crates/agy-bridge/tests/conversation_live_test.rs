@@ -275,3 +275,158 @@ fn live_streaming_token_delivery() {
         })
     });
 }
+
+// =============================================================================
+// Test: Multimodal video (MP4) — exercises the Files API upload path
+//
+// Unlike images (sent inline as base64), video/document are uploaded via the
+// resumable Files API by the localharness binary. This can only be verified
+// live: the mock server never sees the upload (the harness bypasses base_url
+// for it). See `features_mock_multimodal_test.rs` for the mock-observable
+// (image) path and the rationale.
+// =============================================================================
+
+#[test]
+fn live_multimodal_video_mp4() {
+    run_live_test("live_multimodal_video_mp4", || {
+        let _api_key = api_key();
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            use agy_bridge::content::{Content, ContentPrimitive, Video};
+
+            // A tiny (~1.7KB) 1-second solid-red MP4, committed as a fixture.
+            let video_bytes = include_bytes!("assets/tiny_red.mp4").to_vec();
+
+            let config = agy_bridge::config::AgentConfig::builder()
+                .model("gemini-3.5-flash")
+                .api_key(api_key())
+                .system_instructions("You answer questions about media concisely.")
+                .capabilities(agy_bridge::CapabilitiesConfig::custom_tools_only())
+                .build();
+
+            let bridge = agy_bridge::AgyBridge::builder().build()?;
+            let agent = bridge.agent(config).await?;
+
+            let content = Content::Multi {
+                parts: vec![
+                    ContentPrimitive::Text {
+                        text: "What color dominates this video? Answer in one word.".to_string(),
+                    },
+                    ContentPrimitive::Video(Video::mp4(video_bytes)),
+                ],
+            };
+
+            let stream = agent.chat(content).await?;
+            let response = stream.text().await?;
+            let response_text = response.text();
+
+            assert!(
+                response_text.to_lowercase().contains("red"),
+                "Expected the model to see the red video, got: {response_text}"
+            );
+
+            agent.shutdown().await?;
+            Ok(())
+        })
+    });
+}
+
+// =============================================================================
+// Test: Multimodal document (PDF) — exercises the Files API upload path
+// =============================================================================
+
+#[test]
+fn live_multimodal_document_pdf() {
+    run_live_test("live_multimodal_document_pdf", || {
+        let _api_key = api_key();
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            use agy_bridge::content::{Content, ContentPrimitive, Document};
+
+            // A distinctive token the model must read back from the PDF.
+            let marker = "AGYBRIDGE";
+            let pdf_bytes = minimal_pdf(marker);
+
+            let config = agy_bridge::config::AgentConfig::builder()
+                .model("gemini-3.5-flash")
+                .api_key(api_key())
+                .system_instructions("You answer questions about documents concisely.")
+                .capabilities(agy_bridge::CapabilitiesConfig::custom_tools_only())
+                .build();
+
+            let bridge = agy_bridge::AgyBridge::builder().build()?;
+            let agent = bridge.agent(config).await?;
+
+            let content = Content::Multi {
+                parts: vec![
+                    ContentPrimitive::Text {
+                        text: "What single word is written in this PDF? Reply with just that word."
+                            .to_string(),
+                    },
+                    ContentPrimitive::Document(Document::pdf(pdf_bytes)),
+                ],
+            };
+
+            let stream = agent.chat(content).await?;
+            let response = stream.text().await?;
+            let response_text = response.text();
+
+            assert!(
+                response_text.to_uppercase().contains(marker),
+                "Expected the model to read '{marker}' from the PDF, got: {response_text}"
+            );
+
+            agent.shutdown().await?;
+            Ok(())
+        })
+    });
+}
+
+/// Builds a minimal, valid single-page PDF that renders `text`.
+///
+/// Hand-assembles the five standard objects (catalog, pages, page, content
+/// stream, font) with a correct `xref` table so real PDF parsers (and the
+/// Gemini document pipeline) accept it — no external tooling required.
+fn minimal_pdf(text: &str) -> Vec<u8> {
+    let stream = format!("BT /F1 24 Tf 30 120 Td ({text}) Tj ET");
+    let objects: [Vec<u8>; 5] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+          /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        )
+        .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_pos = pdf.len();
+    let object_count = objects.len() + 1; // +1 for the free object 0
+    pdf.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {object_count} /Root 1 0 R >>\n\
+             startxref\n{xref_pos}\n%%EOF"
+        )
+        .as_bytes(),
+    );
+    pdf
+}

@@ -1,6 +1,6 @@
 [package]
 name = "agy-bridge-test-support"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Shared mock-server test infrastructure for agy-bridge integration tests"

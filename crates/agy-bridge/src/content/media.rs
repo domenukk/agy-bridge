@@ -151,8 +151,8 @@ pub mod mime {
     pub const IMAGE_PNG: &str = "image/png";
     /// MIME type for JPEG images.
     pub const IMAGE_JPEG: &str = "image/jpeg";
-    /// MIME type for GIF images.
-    pub const IMAGE_GIF: &str = "image/gif";
+    /// MIME type for BMP images.
+    pub const IMAGE_BMP: &str = "image/bmp";
     /// MIME type for WebP images.
     pub const IMAGE_WEBP: &str = "image/webp";
 
@@ -185,7 +185,7 @@ pub mod mime {
         match ext.to_ascii_lowercase().as_str() {
             "png" => Some(IMAGE_PNG),
             "jpg" | "jpeg" => Some(IMAGE_JPEG),
-            "gif" => Some(IMAGE_GIF),
+            "bmp" => Some(IMAGE_BMP),
             "webp" => Some(IMAGE_WEBP),
             "pdf" => Some(APPLICATION_PDF),
             "txt" => Some(TEXT_PLAIN),
@@ -291,10 +291,10 @@ impl Image {
         Self::new(data, mime::IMAGE_WEBP)
     }
 
-    /// Creates a new [`Image`] with MIME type `image/gif`.
+    /// Creates a new [`Image`] with MIME type `image/bmp`.
     #[must_use]
-    pub fn gif(data: Vec<u8>) -> Self {
-        Self::new(data, mime::IMAGE_GIF)
+    pub fn bmp(data: Vec<u8>) -> Self {
+        Self::new(data, mime::IMAGE_BMP)
     }
 
     /// Sets a description on this image, consuming and returning `self`.
@@ -658,8 +658,8 @@ mod tests {
 
     #[test]
     fn image_new_accepts_string_type() {
-        let img = Image::new(vec![1], String::from("image/gif"));
-        assert_eq!(img.mime_type, "image/gif");
+        let img = Image::new(vec![1], String::from("image/bmp"));
+        assert_eq!(img.mime_type, "image/bmp");
     }
 
     // ── with_description() builder ──────────────────────────────────
@@ -703,11 +703,108 @@ mod tests {
     }
 
     #[test]
-    fn image_gif_creates_correct_image() {
-        let img = Image::gif(vec![0x47, 0x49, 0x46]);
-        assert_eq!(img.mime_type, "image/gif");
-        assert_eq!(img.data, vec![0x47, 0x49, 0x46]);
+    fn image_bmp_creates_correct_image() {
+        let img = Image::bmp(vec![0x42, 0x4D]);
+        assert_eq!(img.mime_type, "image/bmp");
+        assert_eq!(img.data, vec![0x42, 0x4D]);
         assert!(img.description.is_none());
+    }
+
+    #[test]
+    fn convenience_constructors_use_sdk_allowed_mimes() {
+        // Mirrors google.antigravity.types SUPPORTED_*_MIMES (the source of
+        // truth). If the SDK allowlist changes, update these arrays and the
+        // constructors together.
+        const SDK_IMAGE: &[&str] = &["image/bmp", "image/jpeg", "image/png", "image/webp"];
+        const SDK_DOCUMENT: &[&str] = &[
+            "application/pdf",
+            "application/json",
+            "text/css",
+            "text/csv",
+            "text/html",
+            "text/javascript",
+            "text/plain",
+            "text/rtf",
+            "text/xml",
+        ];
+        const SDK_AUDIO: &[&str] = &[
+            "audio/wav",
+            "audio/mp3",
+            "audio/aac",
+            "audio/ogg",
+            "audio/flac",
+            "audio/opus",
+            "audio/mpeg",
+            "audio/m4a",
+            "audio/l16",
+        ];
+        const SDK_VIDEO: &[&str] = &[
+            "video/3gpp",
+            "video/avi",
+            "video/mp4",
+            "video/mpeg",
+            "video/mpg",
+            "video/quicktime",
+            "video/webm",
+            "video/wmv",
+            "video/x-flv",
+        ];
+
+        let d = vec![0u8];
+        for m in [
+            Image::png(d.clone()).mime_type,
+            Image::jpeg(d.clone()).mime_type,
+            Image::webp(d.clone()).mime_type,
+            Image::bmp(d.clone()).mime_type,
+        ] {
+            assert!(
+                SDK_IMAGE.contains(&m.as_str()),
+                "image constructor mime {m} not in SDK allowlist"
+            );
+        }
+        for m in [
+            Document::pdf(d.clone()).mime_type,
+            Document::json(d.clone()).mime_type,
+            Document::plain_text(d.clone()).mime_type,
+        ] {
+            assert!(
+                SDK_DOCUMENT.contains(&m.as_str()),
+                "document constructor mime {m} not in SDK allowlist"
+            );
+        }
+        for m in [
+            Audio::mp3(d.clone()).mime_type,
+            Audio::wav(d.clone()).mime_type,
+            Audio::ogg(d.clone()).mime_type,
+            Audio::flac(d.clone()).mime_type,
+        ] {
+            assert!(
+                SDK_AUDIO.contains(&m.as_str()),
+                "audio constructor mime {m} not in SDK allowlist"
+            );
+        }
+        for m in [
+            Video::mp4(d.clone()).mime_type,
+            Video::webm(d.clone()).mime_type,
+        ] {
+            assert!(
+                SDK_VIDEO.contains(&m.as_str()),
+                "video constructor mime {m} not in SDK allowlist"
+            );
+        }
+
+        // Every extension the bridge infers must map to an SDK-allowed MIME.
+        for ext in [
+            "png", "jpg", "jpeg", "bmp", "webp", "pdf", "txt", "json", "mp3", "wav", "ogg", "flac",
+            "mp4", "webm",
+        ] {
+            let mime = mime::from_extension(ext).expect("known extension");
+            let allowed = SDK_IMAGE.contains(&mime)
+                || SDK_DOCUMENT.contains(&mime)
+                || SDK_AUDIO.contains(&mime)
+                || SDK_VIDEO.contains(&mime);
+            assert!(allowed, "extension .{ext} maps to non-SDK mime {mime}");
+        }
     }
 
     #[test]
@@ -766,8 +863,8 @@ mod tests {
     #[test]
     fn image_from_file_unknown_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("photo.bmp");
-        std::fs::write(&path, b"BM").unwrap();
+        let path = dir.path().join("photo.tiff");
+        std::fs::write(&path, b"II").unwrap();
         let err = Image::from_file(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
@@ -1033,7 +1130,7 @@ mod tests {
 
     #[test]
     fn mime_from_extension_unknown_returns_none() {
-        assert_eq!(mime::from_extension("bmp"), None);
+        assert_eq!(mime::from_extension("tiff"), None);
         assert_eq!(mime::from_extension("avi"), None);
         assert_eq!(mime::from_extension(""), None);
     }

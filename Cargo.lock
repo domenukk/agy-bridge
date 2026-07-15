@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agy-bridge"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "agy-bridge-test-support",
  "base64",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "agy-bridge-test-support"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "agy-bridge",
  "schemars",

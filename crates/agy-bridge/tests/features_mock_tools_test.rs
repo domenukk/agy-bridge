@@ -285,3 +285,55 @@ fn llm_tool_proc_macro_round_trip() {
         agent.shutdown().await.expect("shutdown");
     });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 8: Unified chunk stream (end-to-end)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// End-to-end: the unified chunk stream (`receive_chunks`) surfaces both the
+/// tool-call and the final text chunk when driven through the real mock
+/// pipeline (not just synthetic writer sends).
+#[test]
+fn receive_chunks_surfaces_tool_call_and_text() {
+    use agy_bridge::streaming::StreamChunk;
+    use tokio_stream::StreamExt;
+
+    let rt = multi_thread_rt();
+    rt.block_on(async {
+        let server = MockGeminiServer::start(vec![
+            MockResponse::FunctionCall {
+                name: "add_numbers".into(),
+                args: serde_json::json!({"x": 1.0, "y": 2.0}),
+            },
+            MockResponse::Text("Result: 3".into()),
+        ])
+        .await;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(AddTool);
+
+        let agent = BRIDGE
+            .agent(agent_config(&server.base_url(), "chunks"))
+            .tools(registry)
+            .await
+            .expect("agent");
+
+        let mut handle = agent.chat("1+2").await.expect("chat handle");
+        let mut chunks = handle.receive_chunks().expect("chunk stream");
+
+        let mut saw_tool_call = false;
+        let mut text = String::new();
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                StreamChunk::ToolCall(tc) if tc.name == "add_numbers" => saw_tool_call = true,
+                StreamChunk::Text(t) => text.push_str(&t),
+                _ => {}
+            }
+        }
+
+        assert!(saw_tool_call, "Expected a ToolCall chunk for add_numbers");
+        assert!(text.contains('3'), "Expected final text '3', got: {text}");
+
+        agent.shutdown().await.expect("shutdown");
+    });
+}
