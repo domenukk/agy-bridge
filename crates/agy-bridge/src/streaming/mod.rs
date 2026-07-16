@@ -584,6 +584,53 @@ mod tests {
     }
 
     #[test]
+    fn take_event_stream_returns_none_second_time() {
+        let (_writer, mut handle) = channel();
+        assert!(handle.take_event_stream().is_some());
+        assert!(handle.take_event_stream().is_none());
+    }
+
+    #[test]
+    fn take_chunk_stream_returns_none_second_time() {
+        let (_writer, mut handle) = channel();
+        assert!(handle.take_chunk_stream().is_some());
+        assert!(handle.take_chunk_stream().is_none());
+    }
+
+    /// Regression: `event_tx` uses *blocking* sends and is bounded by
+    /// `CHANNEL_BUFFER`. A consumer that drains it concurrently must be able to
+    /// receive far more than one buffer's worth of events without the writer
+    /// deadlocking. This guards the backpressure-stall class of bug where an
+    /// undrained fan-out channel silently halts the entire stream.
+    #[tokio::test]
+    async fn draining_event_stream_avoids_backpressure_beyond_buffer() {
+        let (writer, mut handle) = channel();
+        let total = CHANNEL_BUFFER * 3;
+
+        let producer = tokio::spawn(async move {
+            for i in 0..total {
+                writer
+                    .event_tx
+                    .send(ResponseEvent::TextChunk(format!("e{i}")))
+                    .await
+                    .expect("send should not fail while consumer drains");
+            }
+        });
+
+        let mut rx = handle.take_event_stream().expect("event rx");
+        let mut count = 0usize;
+        while (rx.recv().await).is_some() {
+            count += 1;
+        }
+
+        producer.await.expect("producer task");
+        assert_eq!(
+            count, total,
+            "all {total} events must flow when the channel is drained concurrently"
+        );
+    }
+
+    #[test]
     fn stream_chunk_serde_roundtrip() {
         let chunks = vec![
             StreamChunk::Text("hello".to_owned()),

@@ -109,6 +109,34 @@ impl ChatResponseHandle {
         self.rx.chunk.take().map(ReceiverStream::new)
     }
 
+    /// Take the unified chunk receiver as a plain `mpsc::Receiver`.
+    ///
+    /// Returns `None` if the receiver was already taken. Prefer
+    /// [`receive_chunks()`](Self::receive_chunks) for `StreamExt`-compatible
+    /// usage; this variant exists for consumers that simply need to drain the
+    /// channel (e.g. to prevent writer backpressure) using `recv()`.
+    pub const fn take_chunk_stream(&mut self) -> Option<mpsc::Receiver<StreamChunk>> {
+        self.rx.chunk.take()
+    }
+
+    /// Take the timeline event receiver.
+    ///
+    /// Returns `None` if the receiver was already taken. Prefer
+    /// [`resolve()`](Self::resolve) if you want the ordered event timeline;
+    /// this variant lets a consumer drain `event_tx` incrementally with
+    /// `recv()`.
+    ///
+    /// # Important
+    ///
+    /// The writer fans every streamed step out to `event_tx` **first** (before
+    /// the unified and type-specific channels) using a *blocking* send. A
+    /// consumer that takes any of the individual streams (text/thought/step/…)
+    /// but leaves `event_tx` undrained will deadlock the whole stream once the
+    /// channel buffer fills. Drain this channel concurrently in that case.
+    pub const fn take_event_stream(&mut self) -> Option<mpsc::Receiver<ResponseEvent>> {
+        self.rx.event.take()
+    }
+
     /// Drain the text stream and return the complete response text.
     ///
     /// Consumes the handle — use the `take_*` methods instead if you need

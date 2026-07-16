@@ -1,6 +1,6 @@
 [package]
 name = "agy-bridge"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Rust bridge for the Google Antigravity SDK (Python) via PyO3"
