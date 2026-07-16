@@ -36,8 +36,9 @@ pub mod types;
 // without diving into sub-modules.
 
 pub use config::{
-    AgentConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig, LocalAgentConfig, McpServer,
-    McpSseServer, McpStdioServer, McpStreamableHttpServer, SystemInstructions,
+    AgentConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig, LocalAgentConfig, McpConfigError,
+    McpConfigFile, McpServer, McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer,
+    SystemInstructions,
 };
 pub use content::{Audio, Content, ContentPrimitive, Document, Image, Video};
 pub use error::Error;
@@ -70,7 +71,8 @@ pub mod prelude {
         Agent, AgyBridge,
         config::{
             AgentConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig, LocalAgentConfig,
-            McpServer, McpSseServer, McpStdioServer, McpStreamableHttpServer, SystemInstructions,
+            McpConfigError, McpConfigFile, McpServer, McpServerSpec, McpSseServer, McpStdioServer,
+            McpStreamableHttpServer, SystemInstructions,
         },
         content::{Audio, Content, ContentPrimitive, Document, Image, Video},
         error::Error,

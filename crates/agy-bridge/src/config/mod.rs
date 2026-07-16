@@ -6,11 +6,13 @@
 pub mod agent;
 pub mod capabilities;
 pub mod mcp;
+pub mod mcp_json;
 pub mod models;
 
 pub use agent::*;
 pub use capabilities::*;
 pub use mcp::*;
+pub use mcp_json::*;
 pub use models::*;
 
 /// Default primary model name.

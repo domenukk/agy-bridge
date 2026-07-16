@@ -6,8 +6,8 @@ resolver = "3"
 # workspace crates
 agy-bridge = { path = "crates/agy-bridge", version = "0.9.0" }
 agy-bridge-test-support = { path = "crates/agy-bridge-test-support" }
-llm-tool = { version = "0.8.0" }
-llm-tool-macros = { version = "0.8.0" }
+llm-tool = { version = "0.9.0" }
+llm-tool-macros = { version = "0.9.0" }
 
 # runtime
 tokio = { version = "1", features = [

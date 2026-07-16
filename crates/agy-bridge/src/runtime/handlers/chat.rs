@@ -83,7 +83,7 @@ fn extract_response_metadata(
         // Get usage metadata
         // NOLINT: `.ok()` — probing optional Python attr; absence is expected
         let mut usage_py = response_bound.getattr("usage_metadata").ok();
-        if (usage_py.is_none() || usage_py.as_ref().unwrap().is_none())
+        if usage_py.as_ref().is_none_or(pyo3::Bound::is_none)
             && let Ok(conv) = agent_bound.getattr("conversation")
             && !conv.is_none()
         {

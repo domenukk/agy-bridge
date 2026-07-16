@@ -595,27 +595,21 @@ fn two_bridges_concurrent_proxy_and_direct_agents() {
             // the handle's terminal error (retryable if it's a quota/connection
             // blip) or, failing that, a retryable `Error::Stream` so the
             // harness retries the whole test.
-            let chunk_proxy = match stream_proxy.recv().await {
-                Some(chunk) => chunk,
-                None => {
-                    handle_proxy.text().await?;
-                    return Err(agy_bridge::error::Error::Stream(
-                        agy_bridge::streaming::StreamError {
-                            message: "proxy text stream closed before first chunk".to_owned(),
-                        },
-                    ));
-                }
+            let Some(chunk_proxy) = stream_proxy.recv().await else {
+                handle_proxy.text().await?;
+                return Err(agy_bridge::error::Error::Stream(
+                    agy_bridge::streaming::StreamError {
+                        message: "proxy text stream closed before first chunk".to_owned(),
+                    },
+                ));
             };
-            let chunk_direct = match stream_direct.recv().await {
-                Some(chunk) => chunk,
-                None => {
-                    handle_direct.text().await?;
-                    return Err(agy_bridge::error::Error::Stream(
-                        agy_bridge::streaming::StreamError {
-                            message: "direct text stream closed before first chunk".to_owned(),
-                        },
-                    ));
-                }
+            let Some(chunk_direct) = stream_direct.recv().await else {
+                handle_direct.text().await?;
+                return Err(agy_bridge::error::Error::Stream(
+                    agy_bridge::streaming::StreamError {
+                        message: "direct text stream closed before first chunk".to_owned(),
+                    },
+                ));
             };
 
             eprintln!("Simultaneous in-flight streaming chunk (Proxy): {chunk_proxy}");
