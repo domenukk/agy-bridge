@@ -10,6 +10,7 @@
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
 
 // =============================================================================
 // Step / ToolCall / ToolResult types (§1.6)
@@ -294,11 +295,32 @@ pub struct ConversationMessage {
 }
 
 /// A single step in the agent trajectory, mirroring the SDK's `Step`.
+///
+/// # Construction
+///
+/// `Step` is `#[non_exhaustive]`, so outside this crate it can only be built
+/// with the [`TypedBuilder`]. Every field defaults (matching [`Default`]), so
+/// callers set only the fields they care about:
+///
+/// ```
+/// use agy_bridge::Step;
+///
+/// let step = Step::builder()
+///     .id("traj:0")
+///     .content("Running command...")
+///     .build();
+/// assert_eq!(step.id, "traj:0");
+/// // Unset fields fall back to their defaults.
+/// assert_eq!(step.step_index, 0);
+/// assert!(step.tool_calls.is_empty());
+/// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TypedBuilder)]
+#[builder(field_defaults(default))]
 pub struct Step {
     /// Unique string identifier for the step.
     #[serde(default)]
+    #[builder(setter(into))]
     pub id: String,
     /// Integer index of the step in the trajectory.
     #[serde(default)]
@@ -317,36 +339,51 @@ pub struct Step {
     pub status: StepStatus,
     /// The text content/output of the step.
     #[serde(default)]
+    #[builder(setter(into))]
     pub content: String,
     /// Incremental text content added since the last update for this step.
     #[serde(default)]
+    #[builder(setter(into))]
     pub content_delta: String,
     /// Full model reasoning/thinking text for planner responses.
     #[serde(default)]
+    #[builder(setter(into))]
     pub thinking: String,
     /// Incremental thinking text added since the last update for this step.
     #[serde(default)]
+    #[builder(setter(into))]
     pub thinking_delta: String,
     /// List of tool calls associated with the step.
     #[serde(default)]
+    #[builder(setter(transform = |v: impl IntoIterator<Item = impl Into<ToolCallInfo>>| v.into_iter().map(Into::into).collect()))]
     pub tool_calls: Vec<ToolCallInfo>,
     /// Short error message if the step failed.
     #[serde(default)]
+    #[builder(setter(into))]
     pub error: String,
+    /// HTTP status code from the harness error, if any (e.g. 400, 429, 503).
+    ///
+    /// The SDK populates this from the harness's `error.http_code` field.
+    /// Used by error detection in `forward_step_to_writer` for logging.
+    #[serde(default)]
+    pub http_code: u16,
     /// Whether this step is a completed model response directed at the user.
     ///
     /// Multiple steps per turn may have this flag set; consumers wanting only
     /// the last response should iterate fully.
     #[serde(default)]
+    #[builder(setter(strip_option))]
     pub is_complete_response: Option<bool>,
     /// Structured output payload extracted from the FINISH step.
     ///
     /// This is `serde_json::Value` because it contains user-defined schema data
     /// whose shape is not known at compile time.
     #[serde(default)]
+    #[builder(setter(strip_option))]
     pub structured_output: Option<serde_json::Value>,
     /// Token usage for this step's model invocation.
     #[serde(default)]
+    #[builder(setter(strip_option))]
     pub usage_metadata: Option<UsageMetadata>,
 }
 
@@ -357,6 +394,7 @@ macro_rules! impl_from_py_object {
                 type Error = pyo3::PyErr;
 
                 fn extract(ob: pyo3::Borrowed<'a, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+                    crate::runtime::py_scripts::warm_up_lazy_imports(ob.py());
                     pythonize::depythonize(&*ob).map_err(|e| {
                         pyo3::exceptions::PyValueError::new_err(format!(
                             "Failed to deserialize {} from Python dict: {}",
@@ -588,6 +626,7 @@ mod tests {
                 canonical_path: None,
             }],
             error: String::new(),
+            http_code: 0,
             is_complete_response: Some(false),
             structured_output: None,
             usage_metadata: Some(UsageMetadata {
@@ -660,6 +699,7 @@ mod tests {
                 },
             ],
             error: String::new(),
+            http_code: 0,
             is_complete_response: None,
             structured_output: None,
             usage_metadata: None,
@@ -1000,6 +1040,7 @@ mod tests {
             thinking_delta: "said hi".to_string(),
             tool_calls: vec![],
             error: String::new(),
+            http_code: 0,
             is_complete_response: Some(true),
             structured_output: None,
             usage_metadata: None,
@@ -1029,6 +1070,7 @@ mod tests {
             thinking_delta: String::new(),
             tool_calls: vec![],
             error: String::new(),
+            http_code: 0,
             is_complete_response: Some(true),
             structured_output: Some(payload.clone()),
             usage_metadata: None,

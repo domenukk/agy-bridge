@@ -68,6 +68,22 @@ test-rust:
 test-python:
     python3 -m pytest crates/agy-bridge/tests/python -q
 
+# Run tests with the bridge's tracing logs enabled, teeing everything to a
+# timestamped file under test-logs/ so failures can be diagnosed after the fact.
+
+# Override verbosity with RUST_LOG, e.g. `RUST_LOG=agy_bridge=trace just test-live-logged`.
+test-live-logged:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    log="test-logs/live-$(date +%Y%m%d-%H%M%S).log"
+    echo "Logging to ${log}"
+    # Runs MULTI-THREADED (libtest default): concurrent multi-bridge/multi-agent
+    # use is safe (see .cargo/config.toml). Live *API* concurrency is bounded by
+    # the semaphore in tests/common/mod.rs, not by serializing the harness.
+    # Override the API-concurrency limit with AGY_BRIDGE_MAX_CONCURRENT_TESTS.
+    RUST_LOG="${RUST_LOG:-agy_bridge=debug}" cargo test --tests -- --nocapture 2>&1 | tee "${log}"
+
 # ── Other ─────────────────────────────────────────────────────────────
 
 # Run all checks (lint + test)

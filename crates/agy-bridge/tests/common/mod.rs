@@ -50,6 +50,35 @@ pub fn create_bridge() -> agy_bridge::AgyBridge {
         .expect("Failed to create bridge")
 }
 
+/// Install a tracing subscriber so the bridge's structured logs surface in the
+/// test run's output (and any tee'd log file), making future failures
+/// diagnosable rather than silent.
+///
+/// Idempotent and safe to call from every test: `try_init` returns `Err` when a
+/// global subscriber is already installed — expected across the many tests that
+/// share one process — and that `Err` is deliberately ignored.
+///
+/// The filter defaults to `agy_bridge=info` but honours `RUST_LOG` when set,
+/// e.g. `RUST_LOG=agy_bridge=debug,agy_bridge::runtime=trace`.
+pub fn init_test_logging() {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    // A missing/invalid RUST_LOG is expected — fall back to a sensible default
+    // that surfaces the bridge's lifecycle/streaming logs.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_env_err| EnvFilter::new("agy_bridge=info"));
+
+    if let Err(e) = fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_writer(std::io::stderr)
+        .try_init()
+    {
+        eprintln!("[init_test_logging] Note: test logger already initialized or failed: {e}");
+    }
+}
+
 // ── Bounded-concurrency gate ─────────────────────────────────────────────────
 
 /// Default number of live tests allowed to run concurrently.
@@ -182,6 +211,9 @@ pub fn run_live_test<F>(test_name: &str, f: F)
 where
     F: Fn() -> Result<(), agy_bridge::error::Error>,
 {
+    // Surface the bridge's tracing logs for this run (idempotent).
+    init_test_logging();
+
     // Explicit opt-out only: honor AGY_BRIDGE_SKIP_LIVE_TESTS when a developer
     // deliberately sets it. A *missing* GEMINI_API_KEY is NOT a skip reason —
     // `api_key()` panics in that case, surfacing as a hard test failure rather

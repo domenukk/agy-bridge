@@ -30,10 +30,11 @@ use tokio::{
 
 // ─── Shared Bridge ───────────────────────────────────────────────────────────
 
-/// All tests share a single `AgyBridge` instance because the Python runtime
-/// can only be meaningfully initialized once per process (due to the GIL and
-/// the SDK's global WebSocket connection state). This `LazyLock` ensures the
-/// bridge is created once and reused across all tests.
+/// All tests in this file share a single `AgyBridge` instance for convenience
+/// (fewer runtime threads to spin up). This is *not* a requirement: multiple
+/// bridges — each with its own Python runtime thread and event loop — can
+/// coexist in one process and be used concurrently (see `concurrency_test`).
+/// This `LazyLock` simply creates the shared bridge once and reuses it.
 static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
     agy_bridge::AgyBridge::builder()
         .build()

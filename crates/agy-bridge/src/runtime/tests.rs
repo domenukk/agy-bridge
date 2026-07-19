@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use super::{ffi_dispatch::check_tool_execution_allowed, *};
+use super::{
+    ffi_dispatch::{build_tool_context, check_tool_execution_allowed},
+    *,
+};
 
 fn test_config() -> RuntimeConfig {
     RuntimeConfig {
@@ -10,6 +13,9 @@ fn test_config() -> RuntimeConfig {
         shutdown_timeout: Duration::from_secs(5),
         inter_agent_delay: Duration::from_millis(100),
         backend_log_level: BackendLogLevel::default(),
+        max_consecutive_model_errors: None,
+        max_consecutive_empty_steps: None,
+        streaming_channel_buffer: None,
     }
 }
 
@@ -184,6 +190,7 @@ fn test_ask_user_policy_custom_tool_gating() {
             policies,
             policy_handler: Some(Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>),
             tool_state: llm_tool::SharedState::new(),
+            conversation_id: Arc::new(std::sync::Mutex::new(None)),
             last_tool_error: std::sync::Mutex::new(None),
         },
     );
@@ -309,4 +316,59 @@ fn builtins_all_sdk_names_non_empty() {
             "builtin {tool:?} has empty SDK name",
         );
     }
+}
+
+// ── build_tool_context tests ──────────────────────────────────────
+
+#[test]
+fn tool_context_carries_conversation_id_when_set() {
+    let ctx = build_tool_context(llm_tool::SharedState::new(), Some("conv-xyz".to_owned()));
+    assert_eq!(
+        ctx.conversation_id(),
+        Some("conv-xyz"),
+        "a set conversation ID must be threaded into the tool context"
+    );
+}
+
+#[test]
+fn tool_context_omits_conversation_id_when_unset() {
+    let ctx = build_tool_context(llm_tool::SharedState::new(), None);
+    assert_eq!(
+        ctx.conversation_id(),
+        None,
+        "an agent with no conversation ID must yield a context without one"
+    );
+}
+
+/// The bridge-state entry shares the *same* `Arc` as the `AgentHandle`, so a
+/// runtime `set_conversation_id` update must be visible to a later dispatch
+/// that reads `entry.conversation_id`. This proves the wiring is a live share,
+/// not a one-time copy taken at agent-creation time.
+#[test]
+fn conversation_id_updates_are_visible_through_shared_arc() {
+    let shared = Arc::new(std::sync::Mutex::new(None::<String>));
+    let entry = AgentBridgeState {
+        registry: None,
+        hook_runner: None,
+        policies: crate::policies::PolicySet::new(),
+        policy_handler: None,
+        tool_state: llm_tool::SharedState::new(),
+        conversation_id: Arc::clone(&shared),
+        last_tool_error: std::sync::Mutex::new(None),
+    };
+
+    // Initially unset: a dispatch would build a context without an ID.
+    assert_eq!(entry.conversation_id.lock().unwrap().clone(), None);
+
+    // Simulate `AgentHandle::set_conversation_id` mutating the shared Arc.
+    *shared.lock().unwrap() = Some("conv-live".to_owned());
+
+    let snapshot = entry.conversation_id.lock().unwrap().clone();
+    assert_eq!(
+        snapshot.as_deref(),
+        Some("conv-live"),
+        "update via the shared Arc must be visible through the bridge-state entry"
+    );
+    let ctx = build_tool_context(entry.tool_state.clone(), snapshot);
+    assert_eq!(ctx.conversation_id(), Some("conv-live"));
 }

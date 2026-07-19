@@ -58,41 +58,6 @@ async fn clear_history_resets_turn_count() {
 }
 
 #[tokio::test]
-async fn remove_last_turn_decrements_turn_count() {
-    let rt = Arc::new(ToolAwareMockRuntime::new());
-    let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
-        .await
-        .expect("create agent");
-
-    let _r1 = agent.chat("Turn 1").await.expect("chat 1");
-    let _r2 = agent.chat("Turn 2").await.expect("chat 2");
-    assert_eq!(agent.turn_count().await.unwrap(), 2);
-
-    agent
-        .remove_last_turn()
-        .await
-        .expect("remove_last_turn should succeed");
-    assert_eq!(agent.turn_count().await.unwrap(), 1);
-}
-
-#[tokio::test]
-async fn remove_last_turn_saturates_at_zero() {
-    let rt = Arc::new(ToolAwareMockRuntime::new());
-    let agent = AgentHandle::new(Arc::clone(&rt), test_config(), None, None, None)
-        .await
-        .expect("create agent");
-
-    assert_eq!(agent.turn_count().await.unwrap(), 0);
-
-    // Should not panic or underflow when no turns exist.
-    agent
-        .remove_last_turn()
-        .await
-        .expect("remove_last_turn on empty history should succeed");
-    assert_eq!(agent.turn_count().await.unwrap(), 0);
-}
-
-#[tokio::test]
 async fn total_usage_returns_metadata() {
     let rt = Arc::new(ToolAwareMockRuntime::new());
     let agent = AgentHandle::new(rt, test_config(), None, None, None)

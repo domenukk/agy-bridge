@@ -183,7 +183,7 @@ pub(crate) fn classify_py_error(py: Python<'_>, err: &PyErr) -> Error {
 }
 
 fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    match py.import("google.antigravity.types") {
+    match crate::runtime::py_scripts::import_serialized(py, "google.antigravity.types") {
         Ok(types_mod) => {
             // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
             if let Ok(conn_err_cls) = types_mod.getattr("AntigravityConnectionError")
@@ -213,7 +213,7 @@ fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
 }
 
 fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    match py.import("pydantic") {
+    match crate::runtime::py_scripts::import_serialized(py, "pydantic") {
         Ok(pydantic) => {
             // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
             if let Ok(validation_err_cls) = pydantic.getattr("ValidationError")

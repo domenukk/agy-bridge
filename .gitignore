@@ -7,3 +7,6 @@ target
 ORIGINAL_REQUEST.md
 PROJECT.md
 .pytest_cache
+
+# Test run logs (just test-live-logged)
+test-logs/

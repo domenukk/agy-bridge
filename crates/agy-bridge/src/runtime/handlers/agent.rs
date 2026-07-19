@@ -61,7 +61,7 @@ fn init_agent_instance(
     })?;
     py.run(c_script.as_c_str(), Some(&globals), None)?;
 
-    let agent_mod = py.import("google.antigravity.agent")?;
+    let agent_mod = crate::runtime::py_scripts::import_serialized(py, "google.antigravity.agent")?;
     let agent_cls = agent_mod.getattr("Agent")?;
     let init_agent_fn = globals.get_item("init_agent")?.ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(

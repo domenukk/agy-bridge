@@ -1,11 +1,15 @@
 //! The sending/writing side of the streaming channel pair.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tokio::sync::mpsc;
 
 use super::types::{
-    ChatResponseSharedState, ResponseEvent, StreamChunk, StreamError, ToolCallEvent,
+    ChatResponseSharedState, ResponseEvent, StreamChunk, StreamError, StreamSubscriptions,
+    ToolCallEvent,
 };
 use crate::types::Step;
 
@@ -75,11 +79,44 @@ pub struct ChatResponseWriter {
     pub(crate) step_tx: mpsc::Sender<Step>,
     /// Sends unified [`StreamChunk`]s.
     pub(crate) chunk_tx: mpsc::Sender<StreamChunk>,
+    /// Per-view subscription flags, shared with the handle.
+    ///
+    /// The writer consults these before fanning out so it never sends to a
+    /// channel the consumer isn't draining (which would block it forever).
+    pub(crate) subs: Arc<StreamSubscriptions>,
     /// Shared state to send metadata updates back to the handle.
     pub(crate) shared_state: Arc<Mutex<ChatResponseSharedState>>,
 }
 
 impl ChatResponseWriter {
+    /// Fan a streamed item out to a single optional "view" channel.
+    ///
+    /// This is the deadlock-safe primitive the bridge uses for its multi-channel
+    /// fan-out. It:
+    ///
+    /// * **Skips** the send entirely when no consumer has subscribed to this
+    ///   view. Its receiver is never drained, so a real send would fill the
+    ///   bounded buffer and block the writer forever — silently stalling the
+    ///   whole stream. This is the root cause of the "no progress" hangs.
+    /// * Treats a **dropped receiver** mid-stream as an implicit unsubscribe:
+    ///   it clears the flag and returns, so subsequent items skip immediately.
+    ///
+    /// A single view channel must never block or abort the entire stream.
+    pub(crate) async fn fan_out<T>(
+        subscribed: &AtomicBool,
+        tx: &mpsc::Sender<T>,
+        item: T,
+        channel: &'static str,
+    ) {
+        if !subscribed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(e) = tx.send(item).await {
+            subscribed.store(false, Ordering::Release);
+            tracing::debug!(channel, error = %e, "fan-out receiver dropped; unsubscribing view");
+        }
+    }
+
     /// Send a text token.
     ///
     /// # Errors

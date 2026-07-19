@@ -348,6 +348,24 @@ pub(crate) fn check_tool_execution_allowed(
     Ok(false)
 }
 
+/// Build the [`ToolContext`](crate::tools::ToolContext) for a custom-tool
+/// dispatch: the agent's shared, cross-call key-value state plus its current
+/// conversation ID (when set), so tools can identify which conversation they
+/// are serving via [`ToolContext::conversation_id`](llm_tool::ToolContext::conversation_id).
+///
+/// The conversation ID is threaded in only when present; an agent that never
+/// had one set yields a context whose `conversation_id()` is `None`.
+pub(crate) fn build_tool_context(
+    tool_state: llm_tool::SharedState,
+    conversation_id: Option<String>,
+) -> crate::tools::ToolContext {
+    let ctx = crate::tools::ToolContext::new().with_shared_state(tool_state);
+    match conversation_id {
+        Some(id) => ctx.with_conversation_id(id),
+        None => ctx,
+    }
+}
+
 /// Dispatches a Rust tool call from the Python thread.
 ///
 /// Called by `AsyncRustProxy.__call__` in the Python SDK. Uses the stored
@@ -372,7 +390,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
         )));
     }
 
-    let (registry, tool_state) = {
+    let (registry, tool_state, conversation_id) = {
         let map = bridge_state().read().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
         })?;
@@ -386,7 +404,27 @@ pub(crate) fn dispatch_rust_tool<'py>(
                 "No active ToolRegistry found for agent ID {agent_id}"
             ))
         })?;
-        (Arc::clone(registry), entry.tool_state.clone())
+        // Snapshot the agent's current conversation ID (if any) so the tool's
+        // `ToolContext` can identify which conversation it serves. A poisoned
+        // mutex is logged (never silently swallowed) and treated as "unset"
+        // rather than failing the dispatch over missing identity metadata.
+        let conversation_id = match entry.conversation_id.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::error!(
+                    agent_id,
+                    error = %e,
+                    "conversation_id mutex poisoned during tool dispatch — \
+                     tool context will omit the conversation ID"
+                );
+                None
+            }
+        };
+        (
+            Arc::clone(registry),
+            entry.tool_state.clone(),
+            conversation_id,
+        )
     };
 
     let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| {
@@ -394,7 +432,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
     })?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let ctx = crate::tools::ToolContext::new().with_shared_state(tool_state);
+        let ctx = build_tool_context(tool_state, conversation_id);
         let output = match registry.dispatch(&name, args, &ctx).await {
             Ok(output) => {
                 // Success: drop any stale error so a later `on_tool_error`
@@ -414,6 +452,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
         let res = Python::attach(|py| -> PyResult<Py<PyAny>> {
             let dict = pyo3::types::PyDict::new(py);
             dict.set_item("content", output.content())?;
+            super::py_scripts::warm_up_lazy_imports(py);
             let metadata_val = pythonize::pythonize(py, output.metadata())?;
             dict.set_item("metadata", metadata_val)?;
             Ok(dict.into_any().unbind())

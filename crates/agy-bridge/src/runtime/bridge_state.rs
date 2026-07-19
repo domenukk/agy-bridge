@@ -47,6 +47,14 @@ pub(crate) struct AgentBridgeState {
     pub(crate) policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     /// Shared key-value state persisted across tool calls for this agent.
     pub(crate) tool_state: llm_tool::SharedState,
+    /// The agent's conversation ID, sharing the same `Arc` as its
+    /// [`AgentHandle`](crate::agent::AgentHandle) so runtime updates via
+    /// `set_conversation_id` are visible here immediately. Threaded into the
+    /// [`ToolContext`](llm_tool::ToolContext) built for every custom-tool
+    /// dispatch, so tools can identify which conversation they serve. `None`
+    /// until the caller sets one (via `AgentConfig::conversation_id` or
+    /// `AgentHandle::set_conversation_id`).
+    pub(crate) conversation_id: Arc<std::sync::Mutex<Option<String>>>,
     /// Structured payload of the most recent failed tool dispatch, if any.
     ///
     /// When a Rust tool returns `Err(ToolError)`, the error is serialized here

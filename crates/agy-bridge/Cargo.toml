@@ -1,6 +1,6 @@
 [package]
 name = "agy-bridge"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Rust bridge for the Google Antigravity SDK (Python) via PyO3"
@@ -38,6 +38,7 @@ pythonize.workspace = true
 agy-bridge-test-support.workspace = true
 tempfile.workspace = true
 fast_rands.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 
 [lints]

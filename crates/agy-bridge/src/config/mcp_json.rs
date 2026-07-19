@@ -20,7 +20,7 @@
 //! ```
 //!
 //! This module parses that format into the strongly-typed [`McpServer`] enum so
-//! callers can point ARTIST (or any other consumer) at an existing, copy-pasted
+//! callers can point any consumer at an existing, copy-pasted
 //! `mcp.json` instead of re-declaring servers in a bespoke format.
 //!
 //! # Transport inference

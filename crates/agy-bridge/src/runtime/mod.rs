@@ -160,14 +160,6 @@ pub(crate) enum PyCommand {
         agent_id: AgentId,
         reply: oneshot::Sender<Result<(), Error>>,
     },
-    /// Remove the last user+model turn pair from conversation history.
-    ///
-    /// Used for safety recovery: when a model safety-filters trip, removing
-    /// the refusal from history gives the model a fresh chance on retry.
-    RemoveLastTurn {
-        agent_id: AgentId,
-        reply: oneshot::Sender<Result<(), Error>>,
-    },
     /// Return step indices where compaction occurred.
     GetCompactionIndices {
         agent_id: AgentId,
@@ -462,7 +454,10 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                 message: format!("Failed to set asyncio event loop: {e}"),
             })?;
 
-        // Register event_loop in globals for access from any thread
+        // Register the event loop in the process-global helper module so it can
+        // be resolved from any thread. It is stored both as the legacy single
+        // `EVENT_LOOP` attribute and (below) in a per-runtime-thread map, so
+        // that multiple bridges in one process never clobber each other's loop.
         let sys = py.import("sys").map_err(|e| Error::BackendError {
             message: format!("Failed to import sys: {e}"),
         })?;
@@ -504,15 +499,22 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
             .map_err(|e| Error::BackendError {
                 message: format!("Failed to set EVENT_LOOP in globals: {e}"),
             })?;
+        register_thread_event_loop(py, &globals_mod, &event_loop)?;
 
         tracing::info!("Python asyncio event loop created on runtime thread");
 
         let inter_agent_delay = config.inter_agent_delay;
+        let stream_limits = streaming::StreamLimits::from_config(config);
         let event_loop_obj = event_loop.clone().unbind();
         let run_fut =
             pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), async move {
-                command_loop::run_async_command_loop(event_loop_obj, cmd_rx, inter_agent_delay)
-                    .await
+                command_loop::run_async_command_loop(
+                    event_loop_obj,
+                    cmd_rx,
+                    inter_agent_delay,
+                    stream_limits,
+                )
+                .await
             });
 
         if let Err(e) = run_fut {
@@ -531,6 +533,53 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 
         Ok(())
     })
+}
+
+/// Register `event_loop` in the process-global `_agy_bridge_globals.EVENT_LOOPS`
+/// map, keyed by the current (runtime) thread's Python identity.
+///
+/// Each [`AgyBridge`](crate::AgyBridge) runs its own runtime thread with its own
+/// asyncio loop. A single shared `EVENT_LOOP` attribute would let a later bridge
+/// overwrite an earlier one's loop; keying by `threading.get_ident()` keeps them
+/// isolated. This map is the per-runtime successor to the legacy `EVENT_LOOP`
+/// attribute and is read by the fallback path in `agent_init.py`, which runs on
+/// this same runtime thread (so the idents match).
+fn register_thread_event_loop(
+    py: Python<'_>,
+    globals_mod: &Bound<'_, PyAny>,
+    event_loop: &Bound<'_, PyAny>,
+) -> Result<(), Error> {
+    let threading = py.import("threading").map_err(|e| Error::BackendError {
+        message: format!("Failed to import threading for event-loop registration: {e}"),
+    })?;
+    let thread_id = threading
+        .call_method0("get_ident")
+        .map_err(|e| Error::BackendError {
+            message: format!("Failed to read threading.get_ident(): {e}"),
+        })?;
+
+    let loops = if globals_mod.hasattr("EVENT_LOOPS").unwrap_or(false) {
+        globals_mod
+            .getattr("EVENT_LOOPS")
+            .map_err(|e| Error::BackendError {
+                message: format!("Failed to get EVENT_LOOPS map: {e}"),
+            })?
+    } else {
+        let dict = pyo3::types::PyDict::new(py).into_any();
+        globals_mod
+            .setattr("EVENT_LOOPS", &dict)
+            .map_err(|e| Error::BackendError {
+                message: format!("Failed to create EVENT_LOOPS map: {e}"),
+            })?;
+        dict
+    };
+
+    loops
+        .set_item(thread_id, event_loop)
+        .map_err(|e| Error::BackendError {
+            message: format!("Failed to register runtime event loop by thread id: {e}"),
+        })?;
+    Ok(())
 }
 
 /// Compute which SDK builtin tools are active based on the agent's
@@ -788,14 +837,6 @@ impl crate::agent::Runtime for PythonRuntime {
 
     async fn clear_history(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
         self.send_command("clear_history", |reply| PyCommand::ClearHistory {
-            agent_id: AgentId(agent_id),
-            reply,
-        })
-        .await
-    }
-
-    async fn remove_last_turn(&self, agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        self.send_command("remove_last_turn", |reply| PyCommand::RemoveLastTurn {
             agent_id: AgentId(agent_id),
             reply,
         })

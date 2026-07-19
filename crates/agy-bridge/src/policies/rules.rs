@@ -220,6 +220,9 @@ pub fn confirm_run_command() -> PolicyRule {
 /// ```
 #[must_use]
 pub fn safe_defaults() -> PolicySet {
+    // These tool names match the SDK's built-in tool registry as of the
+    // version this bridge was written against. If the SDK renames or adds
+    // tools, these lists should be updated to match.
     const READ_TOOLS: &[&str] = &["view_file", "read_file", "list_dir", "search"];
     const WRITE_TOOLS: &[(&str, &str)] = &[
         ("run_command", "confirm_run_command"),

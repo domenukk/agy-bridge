@@ -308,6 +308,38 @@ impl AgyBridgeBuilder {
         self
     }
 
+    /// Set the maximum number of consecutive model-quality errors before
+    /// aborting a stream. Set to `0` to disable entirely (pure SDK pass-through).
+    ///
+    /// Defaults to `3` — enough to catch deterministically-bad model output
+    /// without cutting off transient hiccups.
+    #[must_use]
+    pub fn max_consecutive_model_errors(mut self, limit: u32) -> Self {
+        self.config.max_consecutive_model_errors = Some(limit);
+        self
+    }
+
+    /// Set the maximum number of consecutive thinking-only/empty steps before
+    /// aborting a stream. Set to `0` to disable entirely (pure SDK pass-through).
+    ///
+    /// Defaults to `500` — a generous ceiling to avoid false positives on
+    /// legitimate long chains of thought.
+    #[must_use]
+    pub fn max_consecutive_empty_steps(mut self, limit: u32) -> Self {
+        self.config.max_consecutive_empty_steps = Some(limit);
+        self
+    }
+
+    /// Set the per-channel buffer size for streaming response channels.
+    ///
+    /// Each chat call creates ~7 channels of this size. Defaults to `256` —
+    /// large enough to avoid backpressure under normal workloads.
+    #[must_use]
+    pub fn streaming_channel_buffer(mut self, size: usize) -> Self {
+        self.config.streaming_channel_buffer = Some(size);
+        self
+    }
+
     /// Build the [`AgyBridge`], starting the Python runtime.
     ///
     /// # Errors

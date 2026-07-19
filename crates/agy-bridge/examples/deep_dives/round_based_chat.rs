@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .system_instructions(instructions.to_string())
             .triggers([TriggerEntry::new(
                 "nudge",
-                TriggerConfig::every_secs(60),
+                TriggerConfig::try_every(std::time::Duration::from_mins(1))?,
                 "The discussion is wrapping up. Make your final point concisely.",
             )])
             .build();

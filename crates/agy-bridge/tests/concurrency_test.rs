@@ -299,6 +299,24 @@ async fn wait_for_zero_agents(bridge: &agy_bridge::AgyBridge) -> bool {
     }
 }
 
+/// Force the one-time, process-wide Python SDK import by creating and discarding
+/// a throwaway agent.
+///
+/// Cold-importing `google.antigravity.*` and the compiled `pydantic` core takes
+/// several seconds. The GIL-lockup *canary* tests below measure per-agent
+/// startup latency to detect serialization/deadlock; without warming up first
+/// they would also capture this one-time import, which is load-sensitive and
+/// would make the canaries flaky on a busy machine. Warming up isolates the
+/// signal they care about (per-create GIL contention), while a true deadlock is
+/// still caught by the surrounding 30s timeout.
+async fn warm_up_python_sdk(base_url: &str) {
+    let warmup = BRIDGE
+        .agent(agent_config(base_url, "warmup"))
+        .await
+        .expect("warm-up agent creation");
+    warmup.shutdown().await.expect("warm-up agent shutdown");
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 // =============================================================================
@@ -315,6 +333,10 @@ fn concurrent_agent_startup_no_gil_lockup() {
     rt.block_on(async {
         let server = MockServer::start("startup").await;
         let url = server.base_url();
+
+        // Warm up the one-time cold SDK import so we measure concurrent startup
+        // latency, not the first import (see `warm_up_python_sdk`).
+        warm_up_python_sdk(&url).await;
 
         let start = std::time::Instant::now();
 
@@ -851,6 +873,10 @@ fn sequential_agent_startup_timing() {
 
         let mut agents = Vec::with_capacity(COUNT);
 
+        // Warm up the one-time cold SDK import so the per-agent timings below
+        // exclude the first import (see `warm_up_python_sdk`).
+        warm_up_python_sdk(&url).await;
+
         for i in 0..COUNT {
             let start = std::time::Instant::now();
             let agent = BRIDGE
@@ -1089,4 +1115,109 @@ fn concurrent_create_and_shutdown_storm_no_stall() {
             "Expected exactly {N} POST requests from storm test"
         );
     });
+}
+
+// =============================================================================
+// 14. OS-thread parallelism — multiple bridges, multiple configs, at once
+// =============================================================================
+
+/// The strongest end-to-end guard for concurrent, multi-config use: spawn
+/// several **OS threads** (not just tokio tasks), each of which builds its own
+/// [`AgyBridge`] with a *distinct* configuration and its own multi-threaded
+/// tokio runtime, then drives multiple agents concurrently against its own mock
+/// backend.
+///
+/// This is exactly the scenario the (now removed) `RUST_TEST_THREADS=1` pin used
+/// to serialize away. Each bridge owns its own Python runtime thread + event
+/// loop; agent state is keyed by a process-globally-unique ID; and the loop is
+/// resolved per-runtime. All threads must therefore make progress simultaneously
+/// with full isolation — no GIL lockup, no cross-bridge contamination.
+#[test]
+fn os_threads_multiple_bridges_multiple_configs_concurrent() {
+    const THREADS: usize = 4;
+    const AGENTS_PER_BRIDGE: usize = 3;
+
+    let handles: Vec<std::thread::JoinHandle<()>> = (0..THREADS)
+        .map(|t| {
+            std::thread::spawn(move || {
+                let rt = multi_thread_rt();
+                rt.block_on(async move {
+                    // Distinct per-bridge config: a unique response tag *and* a
+                    // different inter-agent delay, so no two bridges share config.
+                    let tag = format!("thread-{t}");
+                    let server = MockServer::start(&tag).await;
+                    let url = server.base_url();
+
+                    let bridge = agy_bridge::AgyBridge::builder()
+                        .inter_agent_delay(std::time::Duration::from_millis((t as u64) * 5))
+                        .build()
+                        .unwrap_or_else(|e| panic!("thread {t}: bridge build: {e}"));
+
+                    // Create this bridge's agents concurrently.
+                    let agents = futures::future::join_all((0..AGENTS_PER_BRIDGE).map(|a| {
+                        let url = url.clone();
+                        let bridge = &bridge;
+                        async move {
+                            bridge
+                                .agent(agent_config(&url, &format!("t{t}-agent{a}")))
+                                .await
+                        }
+                    }))
+                    .await
+                    .into_iter()
+                    .enumerate()
+                    .map(|(a, r)| r.unwrap_or_else(|e| panic!("thread {t} agent {a} create: {e}")))
+                    .collect::<Vec<_>>();
+
+                    // Isolation: this bridge sees exactly its own agents.
+                    assert_eq!(
+                        bridge
+                            .active_agent_count()
+                            .await
+                            .unwrap_or_else(|e| panic!("thread {t} count: {e}")),
+                        AGENTS_PER_BRIDGE,
+                        "thread {t}: bridge must see exactly its own agents"
+                    );
+
+                    // Chat with all agents concurrently; every response must carry
+                    // *this* bridge's tag (no cross-bridge contamination).
+                    let chats = futures::future::join_all(
+                        agents.iter().map(|agent| agent.chat_text("ping")),
+                    )
+                    .await;
+                    for (a, res) in chats.into_iter().enumerate() {
+                        let text = res.unwrap_or_else(|e| panic!("thread {t} agent {a} chat: {e}"));
+                        assert!(
+                            text.contains(&format!("mock:{tag}")),
+                            "thread {t} agent {a} got wrong tag: {text}"
+                        );
+                    }
+
+                    // Shut all agents down; the bridge must drain to zero.
+                    futures::future::join_all(
+                        agents
+                            .into_iter()
+                            .map(|a| async move { a.shutdown().await }),
+                    )
+                    .await
+                    .into_iter()
+                    .enumerate()
+                    .for_each(|(a, r)| {
+                        r.unwrap_or_else(|e| panic!("thread {t} agent {a} shutdown: {e}"));
+                    });
+
+                    assert_eq!(
+                        server.post_count(),
+                        AGENTS_PER_BRIDGE,
+                        "thread {t}: expected {AGENTS_PER_BRIDGE} POSTs to its own backend"
+                    );
+                });
+            })
+        })
+        .collect();
+
+    for (t, h) in handles.into_iter().enumerate() {
+        h.join()
+            .unwrap_or_else(|_| panic!("thread {t} panicked — concurrent multi-bridge failure"));
+    }
 }

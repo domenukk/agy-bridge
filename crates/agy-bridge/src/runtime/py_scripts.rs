@@ -9,6 +9,89 @@ pub(crate) const MAX_DECODE_DEPTH: usize = 64;
 
 pub const PYTHON_AGENT_INIT_SCRIPT: &str = include_str!("py/agent_init.py");
 
+/// Import `module`, serialising its *first* (uncached) import across threads.
+///
+/// Importing a heavy package such as `google.antigravity.types` executes the
+/// module's top-level code, which pulls in the compiled `pydantic` core and
+/// releases/re-acquires the GIL partway through. If two threads race the very
+/// first import, one can end up parked inside `CPython`'s import machinery while
+/// holding the GIL, starving the thread that must finish the import — a hard
+/// deadlock. This was observed when the test harness runs SDK-touching tests in
+/// parallel, and is equally possible in production when several bridges start at
+/// once.
+///
+/// Once a module is in `sys.modules`, re-importing is a cheap cached lookup that
+/// cannot deadlock, so only the first import is serialised. Threads that lose
+/// the race wait for the leader with the GIL *released* (via [`Python::detach`]),
+/// so a waiter never blocks the importing thread — which is what makes this
+/// deadlock-free regardless of whether the caller already holds the GIL.
+pub(crate) fn import_serialized<'py>(py: Python<'py>, module: &str) -> PyResult<Bound<'py, PyAny>> {
+    static FIRST_IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Fast path: already imported — a cached lookup, safe to run concurrently.
+    if is_in_sys_modules(py, module)? {
+        return py.import(module).map(Bound::into_any);
+    }
+
+    // Slow path: serialise the first import. The GIL is released while
+    // contending for the lock, so the leader — which needs the GIL to run the
+    // import — is never blocked by a waiter that holds the GIL.
+    py.detach(|| {
+        let _guard = FIRST_IMPORT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Python::attach(|py| {
+            // Re-check under the lock: the leader imports once; stragglers that
+            // take the lock afterwards find it cached and skip the work.
+            match is_in_sys_modules(py, module) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(e) = py.import(module) {
+                        // Surface but don't panic: the re-import below returns
+                        // the genuine error to the caller.
+                        tracing::debug!(module, error = %e, "serialized first import failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        module,
+                        error = %e,
+                        "sys.modules probe failed during serialized import",
+                    );
+                }
+            }
+        });
+    });
+
+    // Return the now-cached module (or propagate a genuine ImportError).
+    py.import(module).map(Bound::into_any)
+}
+
+/// Returns whether `module` is already present in `sys.modules`.
+fn is_in_sys_modules(py: Python<'_>, module: &str) -> PyResult<bool> {
+    py.import("sys")?.getattr("modules")?.contains(module)
+}
+
+/// Eagerly import the Python modules that pyo3 / pythonize import *lazily* the
+/// first time they inspect an object's abstract base classes — notably
+/// `collections.abc`, used for the `Sequence` / `Mapping` checks during
+/// (de)serialization.
+///
+/// Routed through [`import_serialized`] so the very first import is serialised
+/// across threads (see that function for the deadlock rationale). Cheap after
+/// the first call, so it is safe to call at every pyo3 (de)serialization
+/// boundary.
+pub(crate) fn warm_up_lazy_imports(py: Python<'_>) {
+    // Never silently ignore: if this import fails, later conversions could still
+    // race, so make the failure visible in the logs.
+    if let Err(e) = import_serialized(py, "collections.abc") {
+        tracing::warn!(
+            error = %e,
+            "failed to pre-import collections.abc during Python warm-up",
+        );
+    }
+}
+
 /// Decode multimodal prompt content from JSON and map it to Python SDK objects.
 pub fn decode_prompt_py<'py>(py: Python<'py>, prompt_str: &str) -> PyResult<Bound<'py, PyAny>> {
     // NOLINT: plain-string fallback is intentional when JSON parse fails
@@ -71,7 +154,7 @@ fn decode_content_value<'py>(
                         ))
                     })?;
 
-                let types_mod = py.import("google.antigravity.types")?;
+                let types_mod = import_serialized(py, "google.antigravity.types")?;
                 let kwargs = pyo3::types::PyDict::new(py);
                 kwargs.set_item("data", pyo3::types::PyBytes::new(py, &raw_bytes))?;
                 kwargs.set_item("mime_type", mime_type)?;
@@ -90,6 +173,7 @@ fn decode_content_value<'py>(
         }
         _ => {
             // Fallback for null, bool, numbers
+            warm_up_lazy_imports(py);
             let obj = pythonize::pythonize(py, value).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!("Serialization failed: {e}"))
             })?;

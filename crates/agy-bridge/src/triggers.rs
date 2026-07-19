@@ -38,6 +38,10 @@ impl TriggerConfig {
     /// # Panics
     ///
     /// Panics if `secs` is 0.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `try_every(Duration::from_secs(secs))` instead, which returns Result"
+    )]
     #[must_use]
     pub const fn every_secs(secs: u64) -> Self {
         assert!(secs >= 1, "trigger interval must be at least 1 second");
@@ -51,6 +55,10 @@ impl TriggerConfig {
     /// # Panics
     ///
     /// Panics if the duration is less than 1 second.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `try_every()` instead, which returns Result"
+    )]
     #[must_use]
     pub fn every(duration: Duration) -> Self {
         assert!(
@@ -65,6 +73,10 @@ impl TriggerConfig {
     /// # Panics
     ///
     /// Panics if `path` is empty, relative, or contains `..`.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `try_on_file_change()` instead, which returns Result"
+    )]
     #[must_use]
     pub fn on_file_change(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
@@ -358,6 +370,8 @@ mod duration_secs {
 }
 
 #[cfg(test)]
+// NOLINT: tests must exercise the deprecated constructors until they are removed.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

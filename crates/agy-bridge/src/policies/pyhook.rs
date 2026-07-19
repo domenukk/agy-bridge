@@ -9,7 +9,12 @@ use super::path::is_path_in_workspace;
 const HOOKS_MODULE_PATH: &str = "google.antigravity.hooks.hooks";
 const HOOK_RESULT_CLASS: &str = "HookResult";
 const ARGS_ATTR_NAME: &str = "args";
-const PATH_KEYS_TO_CHECK: [&str; 10] = [
+/// Default parameter names checked for workspace confinement.
+///
+/// These match the SDK's built-in tool parameter names as of the version this
+/// bridge was written against. If the SDK adds new tools with path parameters
+/// using different names, extend via [`PreToolCallDecideHook::with_extra_path_keys`].
+const DEFAULT_PATH_KEYS: [&str; 10] = [
     "path",
     "file_path",
     "dir_path",
@@ -28,6 +33,7 @@ const MESSAGE_ATTR: &str = "message";
 #[derive(Clone, Debug)]
 pub struct PreToolCallDecideHook {
     workspaces: Vec<PathBuf>,
+    extra_path_keys: Vec<String>,
 }
 
 #[pyo3::pymethods]
@@ -35,7 +41,10 @@ impl PreToolCallDecideHook {
     #[new]
     #[must_use]
     pub fn new(workspaces: Vec<PathBuf>) -> Self {
-        Self { workspaces }
+        Self {
+            workspaces,
+            extra_path_keys: Vec::new(),
+        }
     }
 
     pub fn __call__<'py>(
@@ -46,7 +55,14 @@ impl PreToolCallDecideHook {
         let args: pyo3::Bound<'py, pyo3::types::PyDict> = ctx.getattr(ARGS_ATTR_NAME)?.extract()?;
 
         let mut paths_to_check = Vec::new();
-        for key in PATH_KEYS_TO_CHECK {
+
+        // Check both the built-in path keys and any caller-provided extras.
+        let all_keys = DEFAULT_PATH_KEYS
+            .iter()
+            .copied()
+            .chain(self.extra_path_keys.iter().map(String::as_str));
+
+        for key in all_keys {
             match args.get_item(key) {
                 Ok(Some(val)) => match val.extract::<String>() {
                     Ok(s) => paths_to_check.push(s),
@@ -67,7 +83,8 @@ impl PreToolCallDecideHook {
 
         for p in paths_to_check {
             if !is_path_in_workspace(&p, &self.workspaces) {
-                let hooks_mod = py.import(HOOKS_MODULE_PATH)?;
+                let hooks_mod =
+                    crate::runtime::py_scripts::import_serialized(py, HOOKS_MODULE_PATH)?;
                 let hook_result_cls = hooks_mod.getattr(HOOK_RESULT_CLASS)?;
                 let kwargs = pyo3::types::PyDict::new(py);
                 kwargs.set_item(ALLOW_ATTR, false)?;
@@ -79,10 +96,26 @@ impl PreToolCallDecideHook {
             }
         }
 
-        let hooks_mod = py.import(HOOKS_MODULE_PATH)?;
+        let hooks_mod = crate::runtime::py_scripts::import_serialized(py, HOOKS_MODULE_PATH)?;
         let hook_result_cls = hooks_mod.getattr(HOOK_RESULT_CLASS)?;
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item(ALLOW_ATTR, true)?;
         hook_result_cls.call((), Some(&kwargs))
+    }
+}
+
+impl PreToolCallDecideHook {
+    /// Register additional parameter names to check for workspace confinement.
+    ///
+    /// Use this when custom tools or newer SDK versions introduce path parameters
+    /// with names not in the built-in [`DEFAULT_PATH_KEYS`] list.
+    #[must_use]
+    pub fn with_extra_path_keys(
+        mut self,
+        keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.extra_path_keys
+            .extend(keys.into_iter().map(Into::into));
+        self
     }
 }

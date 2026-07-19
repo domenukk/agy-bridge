@@ -18,7 +18,7 @@ mod common;
 fn trigger_entry_serialization_roundtrip() {
     let entry = agy_bridge::triggers::TriggerEntry::new(
         "test_every",
-        agy_bridge::triggers::TriggerConfig::every_secs(5),
+        agy_bridge::triggers::TriggerConfig::try_every(std::time::Duration::from_secs(5)).unwrap(),
         "ping from every",
     );
     let json = serde_json::to_string(&entry).expect("serialize");
@@ -30,7 +30,8 @@ fn trigger_entry_serialization_roundtrip() {
 
 #[test]
 fn trigger_config_every_validates() {
-    let config = agy_bridge::triggers::TriggerConfig::every_secs(10);
+    let config =
+        agy_bridge::triggers::TriggerConfig::try_every(std::time::Duration::from_secs(10)).unwrap();
     let json = serde_json::to_value(&config).expect("to_value");
     let every = json.get("Every").expect("should have Every variant");
     // interval is f64 in the struct, so serde produces 10.0
@@ -45,7 +46,7 @@ fn trigger_config_every_validates() {
 
 #[test]
 fn trigger_config_on_file_change_validates() {
-    let config = agy_bridge::triggers::TriggerConfig::on_file_change("/tmp/watch");
+    let config = agy_bridge::triggers::TriggerConfig::try_on_file_change("/tmp/watch").unwrap();
     let json = serde_json::to_value(&config).expect("to_value");
     let fc = json
         .get("OnFileChange")
@@ -65,7 +66,8 @@ fn test_trigger_agent_creation() {
             let bridge = common::create_bridge();
             let triggers = vec![agy_bridge::triggers::TriggerEntry::new(
                 "test_every",
-                agy_bridge::triggers::TriggerConfig::every_secs(10),
+                agy_bridge::triggers::TriggerConfig::try_every(std::time::Duration::from_secs(10))
+                    .unwrap(),
                 "ping from every",
             )];
 

@@ -22,7 +22,7 @@ pub use llm_tool::{
 #[serde(rename_all = "snake_case")]
 pub enum ToolSource {
     /// SDK builtin tool (e.g. `view_file`, `run_command`) — implemented by
-    /// the Antigravity localharness process, not by user code.
+    /// the Antigravity SDK backend, not by user code.
     Builtin,
     /// Custom Rust tool registered via [`ToolRegistry`].
     Custom,

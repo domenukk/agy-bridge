@@ -1,13 +1,13 @@
 //! The receiving/reading side of the streaming channel pair.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::types::{
     ChatResponseSharedState, ChatResult, ERROR_DRAIN_TIMEOUT, ResponseEvent, StreamChunk,
-    StreamError, StreamReceivers, ToolCallEvent,
+    StreamError, StreamReceivers, StreamSubscriptions, ToolCallEvent,
 };
 use crate::types::{Step, UsageMetadata};
 
@@ -22,6 +22,11 @@ use crate::types::{Step, UsageMetadata};
 pub struct ChatResponseHandle {
     /// All per-stream receivers, grouped for clarity.
     pub(super) rx: StreamReceivers,
+    /// Per-view subscription flags, shared with the writer.
+    ///
+    /// Set when the consumer attaches to a stream so the writer only fans out
+    /// to channels that are actually being drained.
+    pub(super) subs: Arc<StreamSubscriptions>,
     /// Token usage metadata, populated after the stream completes.
     pub(super) usage: Option<UsageMetadata>,
     /// Structured output from a `response_schema`-configured agent.
@@ -34,21 +39,24 @@ impl ChatResponseHandle {
     /// Take the text token receiver for token-by-token streaming.
     ///
     /// Returns `None` if the receiver was already taken.
-    pub const fn take_text_stream(&mut self) -> Option<mpsc::Receiver<String>> {
+    pub fn take_text_stream(&mut self) -> Option<mpsc::Receiver<String>> {
+        self.subs.text.store(true, Ordering::Release);
         self.rx.text.take()
     }
 
     /// Take the thinking token receiver.
     ///
     /// Returns `None` if the receiver was already taken.
-    pub const fn take_thought_stream(&mut self) -> Option<mpsc::Receiver<String>> {
+    pub fn take_thought_stream(&mut self) -> Option<mpsc::Receiver<String>> {
+        self.subs.thought.store(true, Ordering::Release);
         self.rx.thought.take()
     }
 
     /// Take the tool call event receiver.
     ///
     /// Returns `None` if the receiver was already taken.
-    pub const fn take_tool_call_stream(&mut self) -> Option<mpsc::Receiver<ToolCallEvent>> {
+    pub fn take_tool_call_stream(&mut self) -> Option<mpsc::Receiver<ToolCallEvent>> {
+        self.subs.tool_call.store(true, Ordering::Release);
         self.rx.tool_call.take()
     }
 
@@ -56,7 +64,8 @@ impl ChatResponseHandle {
     ///
     /// Returns `None` if the receiver was already taken.
     /// Prefer [`receive_steps()`](Self::receive_steps) for `StreamExt`-compatible usage.
-    pub const fn take_step_stream(&mut self) -> Option<mpsc::Receiver<Step>> {
+    pub fn take_step_stream(&mut self) -> Option<mpsc::Receiver<Step>> {
+        self.subs.step.store(true, Ordering::Release);
         self.rx.step.take()
     }
 
@@ -79,6 +88,7 @@ impl ChatResponseHandle {
     /// }
     /// # });
     pub fn receive_steps(&mut self) -> Option<impl tokio_stream::Stream<Item = Step>> {
+        self.subs.step.store(true, Ordering::Release);
         self.rx.step.take().map(ReceiverStream::new)
     }
 
@@ -106,6 +116,7 @@ impl ChatResponseHandle {
     /// }
     /// # });
     pub fn receive_chunks(&mut self) -> Option<impl tokio_stream::Stream<Item = StreamChunk>> {
+        self.subs.chunk.store(true, Ordering::Release);
         self.rx.chunk.take().map(ReceiverStream::new)
     }
 
@@ -113,9 +124,10 @@ impl ChatResponseHandle {
     ///
     /// Returns `None` if the receiver was already taken. Prefer
     /// [`receive_chunks()`](Self::receive_chunks) for `StreamExt`-compatible
-    /// usage; this variant exists for consumers that simply need to drain the
-    /// channel (e.g. to prevent writer backpressure) using `recv()`.
-    pub const fn take_chunk_stream(&mut self) -> Option<mpsc::Receiver<StreamChunk>> {
+    /// usage; this variant exists for consumers that drain the channel with
+    /// `recv()`.
+    pub fn take_chunk_stream(&mut self) -> Option<mpsc::Receiver<StreamChunk>> {
+        self.subs.chunk.store(true, Ordering::Release);
         self.rx.chunk.take()
     }
 
@@ -126,14 +138,15 @@ impl ChatResponseHandle {
     /// this variant lets a consumer drain `event_tx` incrementally with
     /// `recv()`.
     ///
-    /// # Important
+    /// # Note
     ///
-    /// The writer fans every streamed step out to `event_tx` **first** (before
-    /// the unified and type-specific channels) using a *blocking* send. A
-    /// consumer that takes any of the individual streams (text/thought/step/…)
-    /// but leaves `event_tx` undrained will deadlock the whole stream once the
-    /// channel buffer fills. Drain this channel concurrently in that case.
-    pub const fn take_event_stream(&mut self) -> Option<mpsc::Receiver<ResponseEvent>> {
+    /// Taking this stream *subscribes* to the event timeline, so the writer
+    /// will fan every step out to `event_tx`. As with any subscribed stream,
+    /// drain it concurrently (e.g. alongside [`text()`](Self::text)) so it
+    /// keeps up. Views you never take are simply skipped by the writer and can
+    /// never stall the stream.
+    pub fn take_event_stream(&mut self) -> Option<mpsc::Receiver<ResponseEvent>> {
+        self.subs.event.store(true, Ordering::Release);
         self.rx.event.take()
     }
 
@@ -146,6 +159,7 @@ impl ChatResponseHandle {
     ///
     /// Returns a [`StreamError`] if the Python side reported an error.
     pub async fn text(mut self) -> Result<ChatResult, StreamError> {
+        self.subs.text.store(true, Ordering::Release);
         let mut buf = String::new();
 
         if let Some(mut rx) = self.rx.text.take() {
@@ -220,6 +234,7 @@ impl ChatResponseHandle {
     /// Consumes the handle — use the `take_*` methods instead if you need
     /// to keep streaming individual channels.
     pub async fn resolve(mut self) -> Vec<ResponseEvent> {
+        self.subs.event.store(true, Ordering::Release);
         let mut events = Vec::new();
         if let Some(mut rx) = self.rx.event.take() {
             while let Some(event) = rx.recv().await {

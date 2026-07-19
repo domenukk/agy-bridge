@@ -1,6 +1,6 @@
 //! Streaming types: chunks, events, errors, and shared state.
 
-use std::time::Duration;
+use std::{sync::atomic::AtomicBool, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -177,6 +177,39 @@ pub struct ChatResponseSharedState {
     pub usage: Option<UsageMetadata>,
     /// Structured output, populated by the writer after the stream completes.
     pub structured_output: Option<serde_json::Value>,
+}
+
+/// Tracks which streaming "views" a consumer has subscribed to.
+///
+/// The bridge fans every step out to several independent channels (text,
+/// thought, tool-call, the ordered `event` timeline, the unified `chunk`
+/// stream, and the raw `step` stream). A given consumer typically attaches to
+/// only a subset — e.g. a CLI wants text only, while an orchestrator wants
+/// text + thought + step + tool-call.
+///
+/// Sending to a channel whose receiver is **never drained** fills its bounded
+/// buffer and then blocks the writer *forever*, silently stalling the entire
+/// stream. To make every consumption pattern deadlock-free, each handle
+/// accessor marks its channel as subscribed, and the writer skips fan-out to
+/// any unsubscribed channel. Channels that *are* consumed still receive every
+/// item (no data loss); only channels nobody listens to are skipped.
+///
+/// The `error` channel is intentionally omitted: it has capacity 1 and is sent
+/// with `try_send` (never blocks), so it needs no gating.
+#[derive(Debug, Default)]
+pub(crate) struct StreamSubscriptions {
+    /// A consumer is draining the text-token stream.
+    pub text: AtomicBool,
+    /// A consumer is draining the thinking-token stream.
+    pub thought: AtomicBool,
+    /// A consumer is draining the tool-call stream.
+    pub tool_call: AtomicBool,
+    /// A consumer is draining the ordered event timeline.
+    pub event: AtomicBool,
+    /// A consumer is draining the raw step stream.
+    pub step: AtomicBool,
+    /// A consumer is draining the unified chunk stream.
+    pub chunk: AtomicBool,
 }
 
 /// Grouped receivers for each independent stream channel.

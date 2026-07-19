@@ -394,3 +394,80 @@ fn live_rust_tool_metadata() {
         })
     });
 }
+
+// =============================================================================
+// Test: custom tool observes the agent's conversation_id via ToolContext
+// =============================================================================
+
+/// A tool that records the `conversation_id` present in its [`ToolContext`],
+/// proving the bridge threads `AgentConfig::conversation_id` all the way into
+/// custom Rust tool dispatch.
+struct WhoAmI {
+    /// Captures the observed conversation ID as a side effect, so the assertion
+    /// does not depend on the model echoing the value back in prose.
+    captured: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl RustTool for WhoAmI {
+    type Params = agy_bridge::tools::EmptyParams;
+    const NAME: &'static str = "who_am_i";
+    const DESCRIPTION: &'static str = "Returns the caller's conversation identifier.";
+
+    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
+    async fn call(
+        &self,
+        _params: Self::Params,
+        ctx: &agy_bridge::tools::ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let observed = ctx.conversation_id().map(str::to_owned);
+        match self.captured.lock() {
+            Ok(mut slot) => slot.clone_from(&observed),
+            // Log rather than swallow: the assertion will fail loudly anyway,
+            // but a poisoned mutex should never be silently ignored.
+            Err(e) => eprintln!("who_am_i: captured mutex poisoned: {e}"),
+        }
+        Ok(observed.unwrap_or_else(|| "unknown".to_owned()).into())
+    }
+}
+
+#[test]
+fn live_custom_tool_observes_conversation_id() {
+    run_live_test("live_custom_tool_observes_conversation_id", || {
+        let _api_key = api_key();
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+            let bridge = create_bridge();
+            let mut registry = ToolRegistry::new();
+            registry.register(WhoAmI {
+                captured: std::sync::Arc::clone(&captured),
+            });
+
+            let config = agy_bridge::config::AgentConfig::builder()
+                .system_instructions(
+                    "When asked who you are or for your conversation id, ALWAYS call the \
+                     who_am_i tool and report exactly what it returns.",
+                )
+                .conversation_id("conv-live-abc123")
+                .policies([agy_bridge::policies::PolicyRule::AllowAll])
+                .build();
+
+            let agent = bridge.agent(config).tools(registry).await?;
+            let _text = agent
+                .chat_text("Call the who_am_i tool and tell me the result.")
+                .await?;
+            agent.shutdown().await?;
+
+            let observed = captured.lock().unwrap().clone();
+            assert_eq!(
+                observed.as_deref(),
+                Some("conv-live-abc123"),
+                "custom tool must observe the agent's conversation_id via ToolContext"
+            );
+            Ok(())
+        })
+    });
+}

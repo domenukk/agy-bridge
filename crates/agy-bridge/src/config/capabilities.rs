@@ -1,6 +1,7 @@
 //! Tool capability configuration.
 
 use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
 
 use super::DEFAULT_IMAGE_GENERATION_MODEL;
 
@@ -149,18 +150,38 @@ impl std::fmt::Display for BuiltinTools {
 }
 
 /// Agent capability toggles: tool allowlists, subagent support, and compaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Construct with the named constructors ([`with_tools`](Self::with_tools),
+/// [`read_only`](Self::read_only), …) for common presets, or with the
+/// [`TypedBuilder`] for fine-grained control. Both preserve the SDK-matching
+/// defaults (subagents enabled, default image model):
+///
+/// ```
+/// use agy_bridge::config::CapabilitiesConfig;
+///
+/// let caps = CapabilitiesConfig::builder()
+///     .enable_subagents(false)
+///     .compaction_threshold(8000)
+///     .build();
+/// assert!(!caps.enable_subagents);
+/// assert_eq!(caps.compaction_threshold, Some(8000));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
 pub struct CapabilitiesConfig {
     /// Whether this agent can spawn subagents.
     #[serde(default = "super::default_true")]
+    #[builder(default = true)]
     pub enable_subagents: bool,
     /// If set, only these built-in tools are available (allowlist).
     #[serde(default)]
+    #[builder(default, setter(strip_option))]
     pub enabled_tools: Option<Vec<BuiltinTools>>,
     /// If set, these built-in tools are removed (denylist).
     #[serde(default)]
+    #[builder(default, setter(strip_option))]
     pub disabled_tools: Option<Vec<BuiltinTools>>,
     /// Token threshold that triggers conversation compaction.
+    #[builder(default, setter(strip_option))]
     pub compaction_threshold: Option<usize>,
     /// The model to use for image generation.
     ///
@@ -168,9 +189,11 @@ pub struct CapabilitiesConfig {
     /// If both are specified, the value in [`GeminiConfig`](super::GeminiConfig) takes precedence and
     /// this field is ignored.
     #[serde(default = "super::default_image_model")]
+    #[builder(default = DEFAULT_IMAGE_GENERATION_MODEL.to_owned(), setter(into))]
     pub image_model: String,
     /// Optional JSON schema string for the finish tool's structured output.
     #[serde(default)]
+    #[builder(default, setter(into, strip_option))]
     pub finish_tool_schema_json: Option<String>,
 }
 
@@ -225,14 +248,8 @@ impl CapabilitiesConfig {
 
 impl Default for CapabilitiesConfig {
     fn default() -> Self {
-        Self {
-            enable_subagents: true,
-            enabled_tools: None,
-            disabled_tools: None,
-            compaction_threshold: None,
-            image_model: DEFAULT_IMAGE_GENERATION_MODEL.to_owned(),
-            finish_tool_schema_json: None,
-        }
+        // Delegate to the builder so field defaults have a single source of truth.
+        Self::builder().build()
     }
 }
 
@@ -477,9 +494,9 @@ mod tests {
         pyo3::Python::attach(|py| {
             crate::runtime::venv::configure_python_sys_path(py)
                 .unwrap_or_else(|e| panic!("Failed to configure python sys.path: {e}"));
-            let types_mod = py
-                .import("google.antigravity.types")
-                .expect("Failed to import google.antigravity.types");
+            let types_mod =
+                crate::runtime::py_scripts::import_serialized(py, "google.antigravity.types")
+                    .expect("Failed to import google.antigravity.types");
             let bt = types_mod
                 .getattr("BuiltinTools")
                 .expect("Failed to get BuiltinTools");

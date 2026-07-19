@@ -152,7 +152,7 @@ fn live_streaming_completion_metadata() {
                 // NOLINT: test assertion — zero fallback makes the assert fail with a clear message
                 assert!(usage.prompt_token_count.unwrap_or(0) > 0, "Expected non-zero prompt tokens");
             } else {
-                eprintln!("Warning: usage metadata is None (known localharness issue with structured outputs)");
+                eprintln!("Warning: usage metadata is None (known SDK issue with structured outputs)");
             }
 
             let structured_json = result.structured_output().ok_or_else(|| {
@@ -280,8 +280,8 @@ fn live_streaming_token_delivery() {
 // Test: Multimodal video (MP4) — exercises the Files API upload path
 //
 // Unlike images (sent inline as base64), video/document are uploaded via the
-// resumable Files API by the localharness binary. This can only be verified
-// live: the mock server never sees the upload (the harness bypasses base_url
+// resumable Files API by the SDK backend binary. This can only be verified
+// live: the mock server never sees the upload (the backend bypasses base_url
 // for it). See `features_mock_multimodal_test.rs` for the mock-observable
 // (image) path and the rationale.
 // =============================================================================

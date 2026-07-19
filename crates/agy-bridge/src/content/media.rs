@@ -162,6 +162,18 @@ pub mod mime {
     pub const TEXT_PLAIN: &str = "text/plain";
     /// MIME type for JSON documents.
     pub const APPLICATION_JSON: &str = "application/json";
+    /// MIME type for CSS stylesheets.
+    pub const TEXT_CSS: &str = "text/css";
+    /// MIME type for CSV data.
+    pub const TEXT_CSV: &str = "text/csv";
+    /// MIME type for HTML documents.
+    pub const TEXT_HTML: &str = "text/html";
+    /// MIME type for JavaScript.
+    pub const TEXT_JAVASCRIPT: &str = "text/javascript";
+    /// MIME type for RTF documents.
+    pub const TEXT_RTF: &str = "text/rtf";
+    /// MIME type for XML documents.
+    pub const TEXT_XML: &str = "text/xml";
 
     /// MIME type for MP3 audio.
     pub const AUDIO_MPEG: &str = "audio/mpeg";
@@ -171,31 +183,72 @@ pub mod mime {
     pub const AUDIO_OGG: &str = "audio/ogg";
     /// MIME type for FLAC audio.
     pub const AUDIO_FLAC: &str = "audio/flac";
+    /// MIME type for AAC audio.
+    pub const AUDIO_AAC: &str = "audio/aac";
+    /// MIME type for Opus audio.
+    pub const AUDIO_OPUS: &str = "audio/opus";
+    /// MIME type for M4A audio.
+    pub const AUDIO_M4A: &str = "audio/m4a";
 
     /// MIME type for MP4 video.
     pub const VIDEO_MP4: &str = "video/mp4";
     /// MIME type for `WebM` video.
     pub const VIDEO_WEBM: &str = "video/webm";
+    /// MIME type for 3GPP video.
+    pub const VIDEO_3GPP: &str = "video/3gpp";
+    /// MIME type for AVI video.
+    pub const VIDEO_AVI: &str = "video/avi";
+    /// MIME type for MPEG video.
+    pub const VIDEO_MPEG: &str = "video/mpeg";
+    /// MIME type for `QuickTime` video.
+    pub const VIDEO_QUICKTIME: &str = "video/quicktime";
+    /// MIME type for WMV video.
+    pub const VIDEO_WMV: &str = "video/wmv";
+    /// MIME type for FLV video.
+    pub const VIDEO_X_FLV: &str = "video/x-flv";
 
     /// Infer a MIME type from a file extension.
     ///
     /// Returns `None` if the extension is unrecognized.
+    ///
+    /// The supported set matches the Python SDK's `SUPPORTED_*_MIMES`
+    /// allowlists. If the SDK adds new types, this function should be
+    /// updated to match.
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<&'static str> {
         match ext.to_ascii_lowercase().as_str() {
+            // Images
             "png" => Some(IMAGE_PNG),
             "jpg" | "jpeg" => Some(IMAGE_JPEG),
             "bmp" => Some(IMAGE_BMP),
             "webp" => Some(IMAGE_WEBP),
+            // Documents
             "pdf" => Some(APPLICATION_PDF),
             "txt" => Some(TEXT_PLAIN),
             "json" => Some(APPLICATION_JSON),
+            "css" => Some(TEXT_CSS),
+            "csv" => Some(TEXT_CSV),
+            "html" | "htm" => Some(TEXT_HTML),
+            "js" | "mjs" => Some(TEXT_JAVASCRIPT),
+            "rtf" => Some(TEXT_RTF),
+            "xml" => Some(TEXT_XML),
+            // Audio
             "mp3" => Some(AUDIO_MPEG),
             "wav" => Some(AUDIO_WAV),
-            "ogg" => Some(AUDIO_OGG),
+            "ogg" | "oga" => Some(AUDIO_OGG),
             "flac" => Some(AUDIO_FLAC),
-            "mp4" => Some(VIDEO_MP4),
+            "aac" => Some(AUDIO_AAC),
+            "opus" => Some(AUDIO_OPUS),
+            "m4a" => Some(AUDIO_M4A),
+            // Video
+            "mp4" | "m4v" => Some(VIDEO_MP4),
             "webm" => Some(VIDEO_WEBM),
+            "3gp" | "3gpp" => Some(VIDEO_3GPP),
+            "avi" => Some(VIDEO_AVI),
+            "mpeg" | "mpg" => Some(VIDEO_MPEG),
+            "mov" => Some(VIDEO_QUICKTIME),
+            "wmv" => Some(VIDEO_WMV),
+            "flv" => Some(VIDEO_X_FLV),
             _ => None,
         }
     }
@@ -795,8 +848,9 @@ mod tests {
 
         // Every extension the bridge infers must map to an SDK-allowed MIME.
         for ext in [
-            "png", "jpg", "jpeg", "bmp", "webp", "pdf", "txt", "json", "mp3", "wav", "ogg", "flac",
-            "mp4", "webm",
+            "png", "jpg", "jpeg", "bmp", "webp", "pdf", "txt", "json", "css", "csv", "html", "htm",
+            "js", "mjs", "rtf", "xml", "mp3", "wav", "ogg", "oga", "flac", "aac", "opus", "m4a",
+            "mp4", "m4v", "webm", "3gp", "3gpp", "avi", "mpeg", "mpg", "mov", "wmv", "flv",
         ] {
             let mime = mime::from_extension(ext).expect("known extension");
             let allowed = SDK_IMAGE.contains(&mime)
@@ -996,7 +1050,7 @@ mod tests {
     #[test]
     fn audio_from_file_unknown_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sound.aac");
+        let path = dir.path().join("sound.mid");
         std::fs::write(&path, b"data").unwrap();
         let err = Audio::from_file(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1057,7 +1111,7 @@ mod tests {
     #[test]
     fn video_from_file_unknown_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("movie.avi");
+        let path = dir.path().join("movie.mkv");
         std::fs::write(&path, b"RIFF").unwrap();
         let err = Video::from_file(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1131,7 +1185,7 @@ mod tests {
     #[test]
     fn mime_from_extension_unknown_returns_none() {
         assert_eq!(mime::from_extension("tiff"), None);
-        assert_eq!(mime::from_extension("avi"), None);
+        assert_eq!(mime::from_extension("tga"), None);
         assert_eq!(mime::from_extension(""), None);
     }
 }

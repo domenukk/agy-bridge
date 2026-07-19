@@ -88,18 +88,6 @@ pub trait Runtime: Send + Sync {
     /// Clear the conversation history and reset state.
     async fn clear_history(&self, agent_id: AgentId) -> Result<(), Error>;
 
-    /// Remove the last user+model turn pair from conversation history.
-    ///
-    /// Used for safety recovery: when a model refuses due to safety filters,
-    /// removing the refusal from history and retrying gives it a fresh chance.
-    /// Removes the last 2 entries from the internal history list (user message
-    /// + model response).
-    ///
-    /// Default implementation is a no-op that returns `Ok(())`.
-    async fn remove_last_turn(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
-    }
-
     /// Return the text of the last model response, if any.
     ///
     /// Default implementation returns `Ok(None)`.
@@ -302,6 +290,7 @@ impl<R: Runtime> AgentHandle<R> {
             policies: policies_set,
             policy_handler: policy_handler.map(Arc::clone),
             tool_state: llm_tool::SharedState::new(),
+            conversation_id: Arc::clone(&conversation_id),
             last_tool_error: std::sync::Mutex::new(None),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
@@ -551,18 +540,6 @@ impl<R: Runtime> AgentHandle<R> {
     /// Returns [`Error`] if the operation fails.
     pub async fn clear_history(&self) -> Result<(), Error> {
         self.runtime.clear_history(self.id).await
-    }
-
-    /// Remove the last user+model turn pair from conversation history.
-    ///
-    /// Used for safety recovery: when a model refuses due to safety filters,
-    /// removing the refusal from history and retrying gives it a fresh chance.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if the operation fails.
-    pub async fn remove_last_turn(&self) -> Result<(), Error> {
-        self.runtime.remove_last_turn(self.id).await
     }
 
     /// Return the text of the last model response, if any.

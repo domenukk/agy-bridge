@@ -57,6 +57,18 @@ pub struct RuntimeConfig {
     /// Defaults to `Warn`, matching the upstream SDK's default behavior.
     /// Set to `Info` or `Debug` for verbose protocol-level diagnostics.
     pub backend_log_level: BackendLogLevel,
+    /// Maximum number of consecutive model-quality error steps before the
+    /// bridge aborts the stream. `None` uses the built-in default (3).
+    /// Set to `0` to disable the limit entirely (pure SDK pass-through).
+    pub max_consecutive_model_errors: Option<u32>,
+    /// Maximum number of consecutive thinking-only/empty steps before the
+    /// bridge aborts the stream. `None` uses the built-in default (500).
+    /// Set to `0` to disable the limit entirely (pure SDK pass-through).
+    pub max_consecutive_empty_steps: Option<u32>,
+    /// Buffer size for streaming response channels.
+    /// `None` uses the built-in default (256). Each chat call creates
+    /// ~7 channels of this size.
+    pub streaming_channel_buffer: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -66,6 +78,9 @@ impl Default for RuntimeConfig {
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             inter_agent_delay: DEFAULT_INTER_AGENT_DELAY,
             backend_log_level: BackendLogLevel::default(),
+            max_consecutive_model_errors: None,
+            max_consecutive_empty_steps: None,
+            streaming_channel_buffer: None,
         }
     }
 }

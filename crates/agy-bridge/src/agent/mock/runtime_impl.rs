@@ -186,13 +186,6 @@ impl Runtime for ToolAwareMockRuntime {
         Ok(())
     }
 
-    async fn remove_last_turn(&self, agent_id: AgentId) -> Result<(), Error> {
-        let mut counts = self.chat_count.lock().unwrap();
-        let entry = counts.entry(agent_id).or_insert(0);
-        *entry = entry.saturating_sub(1);
-        Ok(())
-    }
-
     async fn last_response(&self, _agent_id: AgentId) -> Result<Option<String>, Error> {
         Ok(Some("Hi there!".to_string()))
     }

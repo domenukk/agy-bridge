@@ -153,7 +153,7 @@ fn error_503_json() -> String {
     serde_json::json!({
         "error": {
             "code": 503,
-            "message": "Scope '/aistudio/gemini-v4p1s-rev25-perseus-sc@2026062900' not found",
+            "message": "The service is temporarily unavailable, please retry",
             "status": "UNAVAILABLE"
         }
     })
@@ -305,9 +305,9 @@ fn agent_config_for(base_url: &str, system: &str) -> agy_bridge::config::AgentCo
 
 /// 503 backend error must return `Err(...)`, NOT `Ok("")`.
 ///
-/// This is the exact bug that killed the ARTIST swarm: agy-bridge returned
-/// `Ok("")` for 503 errors, causing the orchestrator to misclassify fatal
-/// backend failures as empty successful responses.
+/// This is the exact bug class this fix targets: agy-bridge previously returned
+/// `Ok("")` for 503 errors, causing a consuming orchestrator to misclassify
+/// fatal backend failures as empty successful responses.
 #[test]
 fn error_503_returns_err_not_empty_ok() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -528,7 +528,7 @@ fn concurrent_agents_all_healthy_baseline() {
 /// Chat timeout must fire when the backend hangs.
 ///
 /// This tests that `tokio::time::timeout` around `agent.chat()` actually
-/// works. The ARTIST bug was that the timeout couldn't fire because the
+/// works. A past bug was that the timeout couldn't fire because the
 /// Python GIL was held — verify that doesn't happen here.
 #[test]
 fn timeout_fires_when_backend_hangs() {
@@ -542,7 +542,7 @@ fn timeout_fires_when_backend_hangs() {
 
         // The bridge no longer imposes a chat timeout — stall detection is a
         // consumer-layer concern. A tokio timeout around chat() must be able to
-        // fire even while Python is busy; this is the ARTIST GIL-starvation
+        // fire even while Python is busy; this is the GIL-starvation
         // regression guard.
         let bridge = agy_bridge::AgyBridge::builder()
             .inter_agent_delay(std::time::Duration::ZERO)
@@ -743,7 +743,7 @@ fn streaming_handle_text_returns_err_on_503() {
 /// 5 agents on 5 different mock backends: 2 healthy, 3 broken (503, 500, 429).
 /// All healthy must succeed, all broken must fail. No cross-contamination.
 ///
-/// This is the core "ARTIST swarm" scenario: multiple agents on different
+/// This is the core multi-backend isolation scenario: multiple agents on different
 /// backend endpoints running concurrently.
 #[test]
 fn five_agents_mixed_backends_full_isolation() {

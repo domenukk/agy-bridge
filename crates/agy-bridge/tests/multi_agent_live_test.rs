@@ -591,10 +591,10 @@ fn two_bridges_concurrent_proxy_and_direct_agents() {
             // A text stream may close before yielding any chunk under transient
             // upstream pressure (e.g. a 429/503 when the whole live suite has
             // been hammering the shared TPM quota). Rather than panicking —
-            // which would bypass the harness's structured-error retry — surface
+            // which would bypass the test retry logic — surface
             // the handle's terminal error (retryable if it's a quota/connection
-            // blip) or, failing that, a retryable `Error::Stream` so the
-            // harness retries the whole test.
+            // blip) or, failing that, a retryable `Error::Stream` so the test
+            // retries the whole test.
             let Some(chunk_proxy) = stream_proxy.recv().await else {
                 handle_proxy.text().await?;
                 return Err(agy_bridge::error::Error::Stream(

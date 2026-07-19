@@ -371,3 +371,122 @@ def test_import_does_not_require_live_sdk():
     module = importlib.reload(agent_init)
     assert hasattr(module, "init_agent")
     assert hasattr(module, "RESULT_HOOK_POINTS")
+
+
+# ── websockets max_size patch (version-gated) ────────────────────────────────
+
+
+class _FakeLogger:
+    """Minimal logger capturing info/warning calls for assertions."""
+
+    def __init__(self):
+        self.infos = []
+        self.warnings = []
+
+    def info(self, *args, **kwargs):
+        self.infos.append((args, kwargs))
+
+    def warning(self, *args, **kwargs):
+        self.warnings.append((args, kwargs))
+
+
+def _install_fake_websockets(monkeypatch):
+    """Register a fake ``websockets`` module and return it plus a call recorder."""
+    import types as _types
+
+    calls = []
+    fake_ws = _types.ModuleType("websockets")
+
+    def _connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "CONNECTION"
+
+    fake_ws.connect = _connect
+    monkeypatch.setitem(sys.modules, "websockets", fake_ws)
+    return fake_ws, calls
+
+
+def test_ws_patch_skipped_for_non_pinned_version():
+    # A version that is not the pinned one must be left untouched (returns before
+    # even importing websockets).
+    logger = _FakeLogger()
+    applied = agent_init._patch_websockets_max_size(
+        logger, sdk_version="99.99.99-not-real"
+    )
+    assert applied is False
+
+
+def test_ws_patch_skipped_for_unknown_version():
+    # An unknown/empty version (e.g. metadata lookup failed) must skip the patch
+    # deterministically, without importing or mutating the real websockets module.
+    logger = _FakeLogger()
+    assert agent_init._patch_websockets_max_size(logger, sdk_version="") is False
+
+
+def test_ws_patch_applied_for_pinned_version(monkeypatch):
+    fake_ws, calls = _install_fake_websockets(monkeypatch)
+    logger = _FakeLogger()
+
+    applied = agent_init._patch_websockets_max_size(
+        logger, sdk_version=agent_init._WS_MAXSIZE_PATCH_SDK_VERSION
+    )
+
+    assert applied is True
+    assert getattr(fake_ws, "_agy_max_size_patched", False) is True
+
+    # Calling the wrapped connect without max_size injects the default cap.
+    assert fake_ws.connect("ws://harness") == "CONNECTION"
+    _, kwargs = calls[-1]
+    assert kwargs["max_size"] == agent_init._WS_MAXSIZE_DEFAULT_CAP
+
+
+def test_ws_patch_respects_explicit_caller_max_size(monkeypatch):
+    fake_ws, calls = _install_fake_websockets(monkeypatch)
+    agent_init._patch_websockets_max_size(
+        _FakeLogger(), sdk_version=agent_init._WS_MAXSIZE_PATCH_SDK_VERSION
+    )
+
+    # An explicit max_size from a (future) SDK caller must win over our default.
+    fake_ws.connect("ws://harness", max_size=4096)
+    _, kwargs = calls[-1]
+    assert kwargs["max_size"] == 4096
+
+
+def test_ws_patch_is_idempotent(monkeypatch):
+    fake_ws, _ = _install_fake_websockets(monkeypatch)
+
+    assert agent_init._patch_websockets_max_size(
+        _FakeLogger(), sdk_version=agent_init._WS_MAXSIZE_PATCH_SDK_VERSION
+    )
+    wrapped = fake_ws.connect
+
+    # Second call is a no-op: it must not re-wrap the already-patched connect.
+    assert agent_init._patch_websockets_max_size(
+        _FakeLogger(), sdk_version=agent_init._WS_MAXSIZE_PATCH_SDK_VERSION
+    )
+    assert fake_ws.connect is wrapped
+
+
+def test_resolve_ws_max_size_default(monkeypatch):
+    monkeypatch.delenv("AGY_WS_MAX_MESSAGE_BYTES", raising=False)
+    assert (
+        agent_init._resolve_ws_max_size(_FakeLogger())
+        == agent_init._WS_MAXSIZE_DEFAULT_CAP
+    )
+
+
+def test_resolve_ws_max_size_env_override(monkeypatch):
+    monkeypatch.setenv("AGY_WS_MAX_MESSAGE_BYTES", "5000")
+    assert agent_init._resolve_ws_max_size(_FakeLogger()) == 5000
+
+
+def test_resolve_ws_max_size_env_unbounded(monkeypatch):
+    monkeypatch.setenv("AGY_WS_MAX_MESSAGE_BYTES", "0")
+    assert agent_init._resolve_ws_max_size(_FakeLogger()) is None
+
+
+def test_resolve_ws_max_size_env_invalid_warns_and_defaults(monkeypatch):
+    monkeypatch.setenv("AGY_WS_MAX_MESSAGE_BYTES", "not-an-int")
+    logger = _FakeLogger()
+    assert agent_init._resolve_ws_max_size(logger) == agent_init._WS_MAXSIZE_DEFAULT_CAP
+    assert logger.warnings, "invalid env value should have logged a warning"

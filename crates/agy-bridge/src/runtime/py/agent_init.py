@@ -8,6 +8,12 @@
 # Hook points whose callbacks must return a `HookResult` (allow/deny gate).
 RESULT_HOOK_POINTS = ("pre_turn", "pre_tool_call_decide", "on_interaction")
 
+# Placeholder API key used when a custom base_url (proxy/gateway) handles auth
+# itself, so no real key is required. It only needs to satisfy the SDK's
+# non-empty API-key validation; it is cleared in `_build_harness_config` before
+# the actual RPC, so its literal value is arbitrary and never sent anywhere.
+_PROXY_AUTH_SENTINEL = "__agy_proxy_auth__"
+
 
 def _to_dict(obj):
     """Best-effort conversion of a pydantic-like object to a plain dict.
@@ -204,6 +210,10 @@ def _munge_config_model(local_config):
     that set *both* the top-level `model` shorthand and
     `gemini_config.models.default`.  When gemini_config carries the model via
     `models.default`, drop the redundant top-level key.
+
+    NOTE: This is tightly coupled to the SDK validator's behavior.  If the SDK
+    changes to accept both fields, or renames `gemini_config`, this function
+    should be updated accordingly.
     """
     if "gemini_config" in local_config and local_config.get("gemini_config"):
         local_config.pop("model", None)
@@ -219,9 +229,132 @@ def _extract_initial_history(local_config):
     return local_config.pop("initial_history", [])
 
 
+# The exact Antigravity SDK version whose LocalConnection WebSocket client calls
+# ``websockets.connect()`` WITHOUT an explicit ``max_size``, so inbound frames
+# are capped at the library default of 1 MiB. The local harness echoes
+# conversation state back to the client at roughly 2x the input size, so any turn
+# whose input exceeds ~512 KiB produces a response frame larger than 1 MiB. The
+# client then aborts the socket with a 1009 (message too big) close, the harness
+# exits, and the SDK surfaces it as ``WS close code 1006`` -- silently breaking
+# every large-context turn.
+#
+# This patch is pinned to the EXACT version we verified. Newer SDK releases are
+# expected to carry the upstream fix (pass ``max_size`` themselves), so we
+# deliberately leave any other version untouched to avoid masking a real change.
+_WS_MAXSIZE_PATCH_SDK_VERSION = "0.1.0"
+
+# Generous but BOUNDED inbound frame cap (128 MiB). This comfortably covers even
+# ~1M-token contexts (harness response ~2x input) while still guarding against a
+# runaway/corrupt frame exhausting memory. Override via the
+# ``AGY_WS_MAX_MESSAGE_BYTES`` env var; a value <= 0 selects unbounded (None).
+_WS_MAXSIZE_DEFAULT_CAP = 128 * 1024 * 1024
+
+
+def _resolve_installed_sdk_version():
+    """Return the installed ``google-antigravity`` version, or None if unknown."""
+    try:
+        import importlib.metadata as _meta
+
+        return _meta.version("google-antigravity")
+    except Exception:
+        # PackageNotFoundError (e.g. in pure unit tests) or any metadata error:
+        # treat as "unknown version" so the version-gated patch is skipped.
+        return None
+
+
+def _resolve_ws_max_size(logger):
+    """Resolve the inbound WS frame cap from env, falling back to the default.
+
+    Returns an int byte cap, or None for unbounded (env value <= 0).
+    """
+    import os
+
+    raw = os.environ.get("AGY_WS_MAX_MESSAGE_BYTES")
+    if not raw:
+        return _WS_MAXSIZE_DEFAULT_CAP
+    try:
+        cap = int(raw)
+    except ValueError:
+        logger.warning(
+            "[MONKEYPATCH] Invalid AGY_WS_MAX_MESSAGE_BYTES=%r; using default %d",
+            raw,
+            _WS_MAXSIZE_DEFAULT_CAP,
+        )
+        return _WS_MAXSIZE_DEFAULT_CAP
+    return None if cap <= 0 else cap
+
+
+def _patch_websockets_max_size(logger, sdk_version=None):
+    """Version-gated fix for the SDK's 1 MiB WebSocket receive cap.
+
+    The Antigravity SDK's ``LocalConnection`` opens its harness WebSocket via
+    ``websockets.connect(...)`` without setting ``max_size``, leaving the client
+    at the library default of 1 MiB for INCOMING frames. The harness echoes
+    conversation state back at ~2x the input size, so large-context turns produce
+    a response frame that exceeds 1 MiB; the client kills the socket with a 1009
+    close (surfaced as ``WS close code 1006``) and the harness exits.
+
+    We wrap ``websockets.connect`` to inject a generous, bounded ``max_size``
+    (see ``_resolve_ws_max_size``) only when the caller did not specify one.
+
+    The patch is applied ONLY for the exact SDK version in
+    ``_WS_MAXSIZE_PATCH_SDK_VERSION``; any other version is left untouched on the
+    assumption that newer releases carry the upstream fix. Idempotent across
+    repeated ``init_agent`` calls. Returns True iff the patch is now in effect.
+    """
+    if sdk_version is None:
+        sdk_version = _resolve_installed_sdk_version()
+
+    if sdk_version != _WS_MAXSIZE_PATCH_SDK_VERSION:
+        logger.info(
+            "[MONKEYPATCH] Skipping WS max_size patch: SDK version %r != pinned "
+            "%r (newer SDKs are expected to carry the upstream fix)",
+            sdk_version,
+            _WS_MAXSIZE_PATCH_SDK_VERSION,
+        )
+        return False
+
+    try:
+        import websockets
+    except ImportError:
+        logger.warning(
+            "[MONKEYPATCH] websockets not importable -- WS max_size patch skipped"
+        )
+        return False
+
+    if getattr(websockets, "_agy_max_size_patched", False):
+        return True
+
+    cap = _resolve_ws_max_size(logger)
+    original_connect = websockets.connect
+
+    def _connect_with_max_size(*args, **kwargs):
+        # Only inject the cap when the SDK did not specify one, so an explicit
+        # future SDK setting always wins.
+        kwargs.setdefault("max_size", cap)
+        return original_connect(*args, **kwargs)
+
+    websockets.connect = _connect_with_max_size
+    websockets._agy_original_connect = original_connect
+    websockets._agy_max_size_patched = True
+    logger.info(
+        "[MONKEYPATCH] Patched websockets.connect max_size=%s for SDK %s "
+        "(default was 1 MiB; harness echoes ~2x input, breaking large contexts)",
+        cap,
+        sdk_version,
+    )
+    return True
+
+
 def _apply_sdk_monkeypatches(logger):
     """Apply the LocalConnection monkeypatches (turn-context/idle-event race,
-    dynamic cascade_id sync, tool-result normalization)."""
+    dynamic cascade_id sync, tool-result normalization).
+
+    Before patching, we verify that the target class has the expected internal
+    structure.  If the SDK has been refactored and the expected attributes are
+    missing, the patches are skipped with a warning rather than silently
+    corrupting class internals.
+    """
     import sys
 
     try:
@@ -231,6 +364,30 @@ def _apply_sdk_monkeypatches(logger):
         import asyncio
 
         if not getattr(LocalConnection, "_is_monkeypatched", False):
+            # ── Structural guard ──
+            # Verify the class still has the internals we patch.
+            # If the SDK refactors these away, patching would silently break.
+            expected_attrs = ["__init__", "_tool_result_to_dict"]
+            missing = [a for a in expected_attrs if not hasattr(LocalConnection, a)]
+            if missing:
+                logger.warning(
+                    "[MONKEYPATCH] SDK structural drift detected! "
+                    "LocalConnection is missing expected attributes: %s. "
+                    "Skipping monkeypatches — the SDK may have been updated "
+                    "past the version these patches were written for.",
+                    missing,
+                )
+                return
+
+            # Check SDK version if available, for diagnostic logging.
+            try:
+                import importlib.metadata as _meta
+
+                sdk_version = _meta.version("google-antigravity")
+                logger.info("[MONKEYPATCH] SDK version: %s", sdk_version)
+            except Exception:
+                sdk_version = "unknown"
+
             logger.info(
                 "[MONKEYPATCH] Applying LocalConnection fix for turn context and idle event race"
             )
@@ -351,6 +508,11 @@ def _apply_sdk_monkeypatches(logger):
 
             LocalConnection._tool_result_to_dict = patched_tool_result_to_dict
             LocalConnection._is_monkeypatched = True
+    except ImportError:
+        logger.warning(
+            "[MONKEYPATCH] google.antigravity.connections.local.local_connection "
+            "not importable — LocalConnection patches skipped"
+        )
     except Exception as e:
         logger.warning("Failed to apply LocalConnection monkeypatch: %s", e)
 
@@ -819,16 +981,36 @@ def _setup_base_url_routing(local_config):
         custom_base_url = local_config["gemini_config"].pop("base_url", None)
 
     if custom_base_url:
-        # When routing through a proxy/gateway that handles auth (e.g., via
-        # LOAS, mTLS, or bearer tokens), no API key is needed.  Set a
-        # sentinel so the SDK's API key validation passes.
+        # When routing through a proxy/gateway that handles auth (e.g. via
+        # mTLS or bearer tokens), no API key is needed. Set a sentinel so the
+        # SDK's API key validation passes.
         if "gemini_config" in local_config and local_config["gemini_config"]:
             if not local_config["gemini_config"].get("api_key"):
-                local_config["gemini_config"]["api_key"] = "LOAS"
+                # FRAGILE: this sentinel bypasses the SDK's API key validation
+                # when routing through a proxy/gateway that handles auth. It is
+                # cleared in _build_harness_config before the actual RPC. If the
+                # SDK changes its API key validation, this will need updating.
+                local_config["gemini_config"]["api_key"] = _PROXY_AUTH_SENTINEL
 
-        from google.antigravity.connections.local.local_connection import (
-            LocalConnectionStrategy,
-        )
+        try:
+            from google.antigravity.connections.local.local_connection import (
+                LocalConnectionStrategy,
+            )
+        except ImportError:
+            logger.warning(
+                "[BASE_URL] LocalConnectionStrategy not importable — "
+                "base_url routing unavailable (SDK may have been restructured)"
+            )
+            return custom_base_url
+
+        # ── Structural guard ──
+        if not hasattr(LocalConnectionStrategy, "_build_harness_config"):
+            logger.warning(
+                "[BASE_URL] SDK structural drift: LocalConnectionStrategy "
+                "no longer has _build_harness_config. base_url routing "
+                "cannot be applied — the SDK may have been updated."
+            )
+            return custom_base_url
 
         import contextvars
 
@@ -851,7 +1033,7 @@ def _setup_base_url_routing(local_config):
                 url = getattr(self, "_agy_base_url", None)
                 if url:
                     config.gemini_config.base_url = url
-                    if config.gemini_config.api_key == "LOAS":
+                    if config.gemini_config.api_key == _PROXY_AUTH_SENTINEL:
                         config.gemini_config.ClearField("api_key")
                         logger.info(
                             "Injected base_url=%s into harness config (auth sentinel cleared)",
@@ -975,9 +1157,26 @@ def _build_agent_lifecycle(
                     exc_info=True,
                 )
                 globals_mod = sys.modules.get("_agy_bridge_globals")
-                if not globals_mod or not hasattr(globals_mod, "EVENT_LOOP"):
+                # Prefer the per-runtime map keyed by this thread's identity so
+                # that, with multiple bridges in one process, we never resolve
+                # another runtime's event loop. Fall back to the legacy single
+                # EVENT_LOOP attribute for backward compatibility.
+                import threading
+
+                loop = None
+                loops = (
+                    getattr(globals_mod, "EVENT_LOOPS", None) if globals_mod else None
+                )
+                if loops is not None:
+                    loop = loops.get(threading.get_ident())
+                if (
+                    loop is None
+                    and globals_mod is not None
+                    and hasattr(globals_mod, "EVENT_LOOP")
+                ):
+                    loop = globals_mod.EVENT_LOOP
+                if loop is None:
                     raise RuntimeError("EVENT_LOOP not found in _agy_bridge_globals")
-                loop = globals_mod.EVENT_LOOP
     future = asyncio.run_coroutine_threadsafe(_agent_lifecycle(), loop)
 
     class AgentLifecycleController:
@@ -1022,6 +1221,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     logger = logging.getLogger("agy_bridge.init")
 
     _apply_sdk_monkeypatches(logger)
+    _patch_websockets_max_size(logger)
 
     if "_agy_bridge_globals" not in sys.modules:
         import types

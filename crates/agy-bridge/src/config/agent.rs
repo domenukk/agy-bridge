@@ -315,6 +315,8 @@ fn default_policies() -> Vec<PolicyRule> {
 }
 
 #[cfg(test)]
+// NOLINT: tests must exercise the deprecated constructors until they are removed.
+#[allow(deprecated)]
 mod tests {
     use pyo3::types::PyAnyMethods;
 
@@ -767,8 +769,7 @@ mod tests {
         pyo3::Python::attach(|py| {
             crate::runtime::venv::configure_python_sys_path(py)
                 .unwrap_or_else(|e| panic!("Failed to configure python sys.path: {e}"));
-            let m = py
-                .import(module)
+            let m = crate::runtime::py_scripts::import_serialized(py, module)
                 .unwrap_or_else(|e| panic!("Failed to import {module}: {e}"));
             m.getattr(attr)
                 .unwrap_or_else(|e| panic!("Failed to get {module}.{attr}: {e}"))

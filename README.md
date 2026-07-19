@@ -26,12 +26,18 @@ Install the Python SDK:
 pip install google-antigravity watchfiles
 ```
 
+Set your API key (or put it in a `.env` file):
+
+```bash
+export GEMINI_API_KEY="your-key-here"
+```
+
 > `watchfiles` is only needed for file-change triggers; timer triggers
 > work without it.
 
 ## Quick Start
 
-```rust
+```rust,no_run
 use agy_bridge::AgyBridge;
 
 #[tokio::main]
@@ -55,7 +61,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
 ### Streaming Responses
 
-```rust
+```rust,no_run
 use agy_bridge::{AgyBridge, config::AgentConfig};
 
 #[tokio::main]
@@ -63,6 +69,8 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agy_bridge::load_dotenv();
     let bridge = AgyBridge::builder().build()?;
 
+    // bridge.agent() returns an AgentBuilder — chain .tools() / .hooks()
+    // before .await, or .await directly for a bare agent.
     let agent = bridge
         .agent(
             AgentConfig::builder()
@@ -91,7 +99,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
 Pass text, images, audio, video, and documents in a single chat turn:
 
-```rust
+```rust,no_run
 use agy_bridge::{
     AgyBridge,
     content::{Content, ContentPrimitive, Image},
@@ -125,7 +133,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
 Define tools with the `#[llm_tool]` proc macro — doc comments become descriptions:
 
-```rust
+```rust,no_run
 use agy_bridge::{AgyBridge, config::AgentConfig, prelude::*, tools::ToolRegistry};
 
 /// Gets the current weather for a city.
@@ -191,8 +199,8 @@ assert_eq!(registry.definitions().len(), 1);
 After agent creation, inspect all available tools — custom Rust tools,
 MCP server tools, and SDK builtins — with source, description, and schema:
 
-```rust
-use agy_bridge::{AgyBridge, ToolSource};
+```rust,no_run
+use agy_bridge::AgyBridge;
 
 #[tokio::main]
 async fn main() -> Result<(), agy_bridge::error::Error> {
@@ -200,6 +208,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     let bridge = AgyBridge::builder().build()?;
     let agent = bridge.default_agent().await?;
 
+    // `tool.source` is a `ToolSource` (Builtin / Custom / Mcp).
     for tool in agent.available_tools() {
         println!("  [{}] {} — {}", tool.source, tool.name, tool.description);
     }
@@ -207,6 +216,32 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agent.shutdown().await?;
     Ok(())
 }
+```
+
+### Structured Output
+
+Constrain agent responses to a typed Rust struct:
+
+```rust
+use agy_bridge::config::{AgentConfig, JsonSchema};
+use schemars::JsonSchema as JsonSchemaTrait;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchemaTrait)]
+struct Summary {
+    title: String,
+    bullet_points: Vec<String>,
+}
+
+let schema = serde_json::to_value(schemars::schema_for!(Summary))
+    .expect("schema serialization");
+
+let config = AgentConfig::builder()
+    .response_schema(JsonSchema::new(schema))
+    .build();
+
+// The agent's response will be valid JSON matching `Summary`.
+assert!(config.response_schema.is_some());
 ```
 
 ### MCP Integration
@@ -232,7 +267,7 @@ assert_eq!(config.mcp_servers.len(), 1);
 
 Register lifecycle callbacks for logging, safety gates, and middleware:
 
-```rust
+```rust,no_run
 use agy_bridge::{
     AgyBridge,
     config::AgentConfig,
@@ -278,22 +313,21 @@ Declarative tool access control — first matching rule wins:
 ```rust
 use agy_bridge::policies::{PolicyRule, PolicySet};
 
-let policies = PolicySet::new()
-    .with_rule(PolicyRule::allow("view_file"))?
-    .with_rule(PolicyRule::deny("run_command"))?
-    .with_rule(PolicyRule::deny_all())?;
+let mut policies = PolicySet::new();
+policies.push(PolicyRule::allow("view_file")).unwrap();
+policies.push(PolicyRule::deny("run_command")).unwrap();
+policies.push(PolicyRule::deny_all()).unwrap();
 
 assert!(policies.evaluate("view_file").is_allowed());
 assert!(policies.evaluate("run_command").is_denied());
 assert!(policies.evaluate("unknown_tool").is_denied());
-# Ok::<(), agy_bridge::Error>(())
 ```
 
 ### Triggers
 
 Run background tasks that react to timers or file changes:
 
-```rust
+```rust,no_run
 use agy_bridge::{
     AgyBridge,
     config::AgentConfig,
@@ -307,18 +341,18 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
     let periodic = TriggerEntry::new(
         "poll_status",
-        TriggerConfig::every_secs(30),
+        TriggerConfig::try_every(std::time::Duration::from_secs(30))?,
         "Check deployment status",
     );
 
     let file_watch = TriggerEntry::new(
         "watch_workspace",
-        TriggerConfig::on_file_change(std::env::current_dir()?),
+        TriggerConfig::try_on_file_change(std::env::current_dir()?)?,
         "Files changed: {changes}",
     );
 
     let config = AgentConfig::builder()
-        .triggers([periodic, file_watch])
+        .triggers(vec![periodic, file_watch])
         .build();
 
     let agent = bridge.agent(config).await?;
@@ -340,7 +374,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
 Spawn child agents that share the parent's runtime:
 
-```rust
+```rust,no_run
 use agy_bridge::{AgyBridge, config::AgentConfig};
 
 #[tokio::main]
@@ -373,7 +407,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
 ## Examples
 
-The [`crates/agy-bridge/examples/`](crates/agy-bridge/examples/) directory contains runnable programs for every feature:
+The [`examples/`](crates/agy-bridge/examples/) directory has runnable demos:
 
 ### Getting Started
 

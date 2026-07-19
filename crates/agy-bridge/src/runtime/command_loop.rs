@@ -54,6 +54,7 @@ pub(crate) async fn run_async_command_loop(
     event_loop: Py<PyAny>,
     mut cmd_rx: mpsc::Receiver<PyCommand>,
     inter_agent_delay: Duration,
+    stream_limits: super::streaming::StreamLimits,
 ) -> PyResult<()> {
     let registry: AgentRegistry = std::sync::Arc::new(std::sync::Mutex::new(RegistryInner::new()));
     let mut active_tasks =
@@ -71,6 +72,7 @@ pub(crate) async fn run_async_command_loop(
                     &registry,
                     &event_loop,
                     inter_agent_delay,
+                    stream_limits,
                     &mut active_tasks,
                 ).await {
                     break;
@@ -90,7 +92,7 @@ pub(crate) async fn run_async_command_loop(
 /// Clean up any agents still in the registry after the command loop exits.
 ///
 /// Calls `__aexit__` on each context manager so Python-side resources
-/// (WebSocket connections, localharness processes, file descriptors) are
+/// (WebSocket connections, SDK backend processes, file descriptors) are
 /// released. Also clears the global tool/hook/policy registries for each agent.
 ///
 /// Recovers from a poisoned mutex — see [`lookup_agent_instance`] for rationale.
@@ -225,6 +227,7 @@ async fn dispatch_async_command(
     registry: &AgentRegistry,
     event_loop: &Py<PyAny>,
     inter_agent_delay: Duration,
+    stream_limits: super::streaming::StreamLimits,
     active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
 ) -> DispatchResult {
     // Phase 1: synchronous query commands — no task spawned.
@@ -253,6 +256,7 @@ async fn dispatch_async_command(
                 reply,
                 active_tasks,
                 inter_agent_delay,
+                stream_limits,
             )
             .await;
             return DispatchResult::Continue;
@@ -328,7 +332,7 @@ fn dispatch_lifecycle_command(
 }
 
 /// Dispatch async agent operations: cancel, idle, send, signal, wakeup,
-/// clear history, remove last turn, delete, disconnect.
+/// clear history, delete, disconnect.
 ///
 /// Returns `Ok(())` if handled, `Err(cmd)` if not an agent operation.
 fn dispatch_agent_operation(
@@ -351,9 +355,6 @@ fn dispatch_agent_operation(
         }
         PyCommand::ClearHistory { agent_id, reply } => {
             async_ops::handle_clear_history(registry, agent_id, reply);
-        }
-        PyCommand::RemoveLastTurn { agent_id, reply } => {
-            async_ops::handle_remove_last_turn(registry, agent_id, reply);
         }
         PyCommand::Send {
             agent_id,

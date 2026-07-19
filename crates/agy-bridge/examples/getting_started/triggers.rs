@@ -17,13 +17,13 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
     let periodic_trigger = TriggerEntry::new(
         "poll_threads",
-        TriggerConfig::every_secs(30),
+        TriggerConfig::try_every(std::time::Duration::from_secs(30))?,
         "Check threads for new updates",
     );
 
     let file_trigger = TriggerEntry::new(
         "watch_workspace",
-        TriggerConfig::on_file_change("/tmp/agy-bridge-demo"),
+        TriggerConfig::try_on_file_change("/tmp/agy-bridge-demo")?,
         "Files changed in workspace: {changes}",
     );
 

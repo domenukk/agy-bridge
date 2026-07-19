@@ -9,9 +9,12 @@
 //!
 //! **No API key required** — everything runs against local TCP mock servers.
 
-use std::sync::{
-    Arc, LazyLock,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    fmt::Write as _,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use agy_bridge::{
@@ -171,6 +174,28 @@ pub enum MockResponse {
     },
     /// Return a final text response.
     Text(String),
+    /// Return a candidate with empty content — no text, no tool calls.
+    ///
+    /// The SDK backend validates that model output contains either text or tool
+    /// calls. When neither is present, it emits a step with
+    /// `status=ERROR, error="model output must contain either output text or
+    /// tool calls, these cannot both be empty, please try again"`.
+    ///
+    /// This variant exercises the SDK's internal retry + agy-bridge's
+    /// recoverable-error classification path.
+    EmptyCandidate,
+    /// Return an HTTP error response (e.g. 503, 500, 429).
+    ///
+    /// The server responds with the given HTTP status code and a JSON error
+    /// body. The SDK treats these as backend failures and may retry internally
+    /// before surfacing the error.
+    HttpError { status: u16, message: String },
+    /// Return a sequence of SSE frames for a single request.
+    ///
+    /// Used to simulate multi-chunk streaming where the first chunk is an
+    /// empty candidate (triggering the backend error) and the second is a
+    /// normal text response (the retry result).
+    Sequence(Vec<MockResponse>),
 }
 
 impl MockGeminiServer {
@@ -229,6 +254,36 @@ impl MockGeminiServer {
                             sse_response(&function_call_json(name, args))
                         }
                         MockResponse::Text(text) => sse_response(&text_response_json(text)),
+                        MockResponse::EmptyCandidate => sse_response(&empty_candidate_json()),
+                        MockResponse::HttpError { status, message } => {
+                            http_error_response(*status, message)
+                        }
+                        MockResponse::Sequence(items) => {
+                            let mut frames = String::new();
+                            for item in items {
+                                let json = match item {
+                                    MockResponse::Text(t) => text_response_json(t),
+                                    MockResponse::FunctionCall { name, args } => {
+                                        function_call_json(name, args)
+                                    }
+                                    MockResponse::EmptyCandidate => empty_candidate_json(),
+                                    MockResponse::HttpError { .. } | MockResponse::Sequence(_) => {
+                                        continue;
+                                    }
+                                };
+                                write!(frames, "data: {json}\n\n")
+                                    .expect("writing to a String is infallible");
+                            }
+                            format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Type: text/event-stream\r\n\
+                                 Content-Length: {}\r\n\
+                                 \r\n\
+                                 {}",
+                                frames.len(),
+                                frames,
+                            )
+                        }
                     };
 
                     if let Err(e) = writer.write_all(response.as_bytes()).await {
@@ -401,6 +456,55 @@ fn text_response_json(text: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// A candidate with empty content — no text parts, no function calls.
+///
+/// The SDK backend rejects this because both text and tool calls are missing.
+/// The SDK emits it as an error step with `status=ERROR` but keeps iterating
+/// (it's recoverable, not fatal).
+fn empty_candidate_json() -> String {
+    serde_json::json!({
+        "candidates": [{
+            "content": {
+                "parts": [],
+                "role": "model"
+            },
+            "finishReason": "STOP",
+            "index": 0
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 15, "candidatesTokenCount": 0, "totalTokenCount": 15
+        }
+    })
+    .to_string()
+}
+
+/// An HTTP error response (503, 500, 429, etc.) with a JSON body.
+fn http_error_response(status: u16, message: &str) -> String {
+    let (reason, grpc_status) = match status {
+        429 => ("Too Many Requests", "RESOURCE_EXHAUSTED"),
+        500 => ("Internal Server Error", "INTERNAL"),
+        503 => ("Service Unavailable", "UNAVAILABLE"),
+        _ => ("Error", "UNKNOWN"),
+    };
+    let body = serde_json::json!({
+        "error": {
+            "code": status,
+            "message": message,
+            "status": grpc_status,
+        }
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    )
 }
 
 /// Build an [`agy_bridge::config::AgentConfig`] pointed at a mock `base_url`
