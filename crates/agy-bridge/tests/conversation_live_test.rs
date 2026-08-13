@@ -102,7 +102,7 @@ fn live_conversation_token_usage_tracking() {
 
             // Verify history is empty
             let history_cleared = agent.history().await?;
-            assert!(history_cleared.is_empty());
+            assert_eq!(history_cleared, []);
 
             agent.shutdown().await?;
             Ok(())
