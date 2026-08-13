@@ -202,7 +202,19 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(setter(transform = |v: impl IntoIterator<Item = impl Into<McpServer>>| v.into_iter().map(Into::into).collect()))]
     pub mcp_servers: Vec<McpServer>,
-    /// Pre-existing conversation ID to resume.
+    /// Resume an existing conversation by its SDK id.
+    ///
+    /// Set this to an id previously returned by
+    /// [`AgentHandle::conversation_id`](crate::agent::AgentHandle::conversation_id)
+    /// to resume that conversation. The SDK (local harness) uses it as the
+    /// trajectory `cascade_id` to reload, so it **must** reference a conversation
+    /// already persisted under [`Self::save_dir`]; passing an unknown id fails
+    /// agent startup with "conversation not found".
+    ///
+    /// Leave unset to start a fresh conversation — the harness assigns a new id,
+    /// which is then observable via
+    /// [`AgentHandle::conversation_id`](crate::agent::AgentHandle::conversation_id)
+    /// and custom-tool [`ToolContext`](crate::tools::ToolContext).
     #[serde(default)]
     #[builder(setter(into, strip_option))]
     pub conversation_id: Option<String>,
@@ -239,6 +251,55 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<crate::types::ConversationMessage>>| v.into_iter().map(Into::into).collect()))]
     pub initial_history: Vec<crate::types::ConversationMessage>,
+    /// Optional retry configuration for API calls and model outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub retry_config: Option<RetryConfig>,
+}
+
+/// Configuration for API retry behavior with exponential backoff.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TypedBuilder)]
+pub struct ModelAPIRetryConfig {
+    /// The maximum number of retries for transient API errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub max_retries: Option<u32>,
+    /// The initial sleep duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub initial_sleep_duration_ms: Option<u32>,
+    /// The multiplier for exponential backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub exponential_multiplier: Option<f64>,
+    /// The range for jitter when calculating backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub jitter_range: Option<f64>,
+}
+
+/// Configuration for model and API retry behavior.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TypedBuilder)]
+pub struct RetryConfig {
+    /// Retry configuration for backend API calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub api_retry: Option<ModelAPIRetryConfig>,
+}
+
+impl RetryConfig {
+    /// Create a retry configuration that disables retries (fails fast on first error).
+    #[must_use]
+    pub fn no_retries() -> Self {
+        Self {
+            api_retry: Some(ModelAPIRetryConfig {
+                max_retries: Some(0),
+                initial_sleep_duration_ms: None,
+                exponential_multiplier: None,
+                jitter_range: None,
+            }),
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -780,7 +841,7 @@ mod tests {
 
     #[test]
     fn default_model_matches_python_sdk() {
-        let py_val = py_str_attr("google.antigravity.types", "DEFAULT_MODEL");
+        let py_val = py_str_attr("google.antigravity.models", "DEFAULT_MODEL");
         assert_eq!(
             DEFAULT_MODEL, py_val,
             "Rust DEFAULT_MODEL ({DEFAULT_MODEL}) != Python SDK ({py_val})"
@@ -789,7 +850,10 @@ mod tests {
 
     #[test]
     fn default_image_model_matches_python_sdk() {
-        let py_val = py_str_attr("google.antigravity.types", "DEFAULT_IMAGE_GENERATION_MODEL");
+        let py_val = py_str_attr(
+            "google.antigravity.models",
+            "DEFAULT_IMAGE_GENERATION_MODEL",
+        );
         assert_eq!(
             DEFAULT_IMAGE_GENERATION_MODEL, py_val,
             "Rust DEFAULT_IMAGE_GENERATION_MODEL ({DEFAULT_IMAGE_GENERATION_MODEL}) != Python SDK ({py_val})"

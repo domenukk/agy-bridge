@@ -59,7 +59,8 @@ mod tests;
 pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state, next_agent_id};
 pub use config::{BackendLogLevel, RuntimeConfig};
 pub(crate) use ffi_dispatch::{
-    dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool, initializing_hook_runners,
+    dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool,
+    initializing_hook_runners, set_agent_conversation_id,
 };
 
 /// Default delay between successive chat commands to prevent burst requests.
@@ -199,7 +200,7 @@ pub(crate) enum PyCommand {
 /// All Python/SDK interactions go through the command channel. This isolates
 /// GIL acquisition to the Python thread and keeps the tokio runtime responsive.
 pub struct PythonRuntime {
-    cmd_tx: mpsc::Sender<PyCommand>,
+    cmd_tx: Option<mpsc::Sender<PyCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
     config: RuntimeConfig,
 }
@@ -240,7 +241,7 @@ impl PythonRuntime {
             })?;
 
         Ok(Self {
-            cmd_tx,
+            cmd_tx: Some(cmd_tx),
             thread: Some(thread),
             config,
         })
@@ -259,15 +260,18 @@ impl PythonRuntime {
         operation: &str,
         build_cmd: impl FnOnce(oneshot::Sender<Result<T, Error>>) -> PyCommand,
     ) -> Result<T, Error> {
+        let Some(ref tx) = self.cmd_tx else {
+            return Err(Error::ChannelClosed {
+                message: format!("Python runtime thread is shut down (sending {operation})"),
+            });
+        };
+
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = build_cmd(reply_tx);
 
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|e| Error::ChannelClosed {
-                message: format!("Python runtime thread has exited (sending {operation}): {e}"),
-            })?;
+        tx.send(cmd).await.map_err(|e| Error::ChannelClosed {
+            message: format!("Python runtime thread has exited (sending {operation}): {e}"),
+        })?;
 
         let result = reply_rx.await.map_err(|e| Error::ChannelClosed {
             message: format!("Reply channel dropped for {operation}: {e}"),
@@ -300,9 +304,9 @@ impl PythonRuntime {
     /// thread panicked.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         // Signal the command loop to exit.
-        // Ignoring send error: if the receiver is already gone the thread
-        // is already exiting, which is the outcome we want.
-        if let Err(e) = self.cmd_tx.send(PyCommand::Shutdown).await {
+        if let Some(tx) = self.cmd_tx.take()
+            && let Err(e) = tx.send(PyCommand::Shutdown).await
+        {
             tracing::warn!("Shutdown command send failed (thread may already be exiting): {e}");
         }
 
@@ -370,18 +374,19 @@ impl Drop for PythonRuntime {
             return;
         };
 
-        // Best-effort: prompt the command loop to stop so it runs
-        // `cleanup_remaining_agents` (calling `__aexit__` on any still-live
-        // agent) and then exits. If the channel buffer is momentarily full
-        // this send fails, but `cmd_tx` is dropped immediately after this
-        // function returns, which closes the channel and also stops the loop.
-        if let Err(e) = self.cmd_tx.try_send(PyCommand::Shutdown) {
+        // Prompt the command loop to stop and close the channel immediately.
+        let tx = self.cmd_tx.take();
+        if let Some(ref tx) = tx
+            && let Err(e) = tx.try_send(PyCommand::Shutdown)
+        {
             tracing::debug!(
                 error = %e,
                 "PythonRuntime::drop: could not eagerly signal shutdown; \
                  relying on channel close"
             );
         }
+        // Explicitly drop sender so the receiver encounters EOF immediately.
+        drop(tx);
 
         // Wait — bounded by the configured shutdown timeout — for the Python
         // thread to finish releasing resources. This keeps teardown
@@ -517,6 +522,8 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                 .await
             });
 
+        unregister_thread_event_loop(py, &globals_mod);
+
         if let Err(e) = run_fut {
             // Close the event loop best-effort before propagating.
             if let Err(close_err) = event_loop.call_method0("close") {
@@ -558,7 +565,11 @@ fn register_thread_event_loop(
             message: format!("Failed to read threading.get_ident(): {e}"),
         })?;
 
-    let loops = if globals_mod.hasattr("EVENT_LOOPS").unwrap_or(false) {
+    let loops = if globals_mod
+        .hasattr("EVENT_LOOPS")
+        .map_err(|e| Error::BackendError {
+            message: format!("Failed to check for EVENT_LOOPS attribute: {e}"),
+        })? {
         globals_mod
             .getattr("EVENT_LOOPS")
             .map_err(|e| Error::BackendError {
@@ -580,6 +591,24 @@ fn register_thread_event_loop(
             message: format!("Failed to register runtime event loop by thread id: {e}"),
         })?;
     Ok(())
+}
+
+/// Unregister the current thread's event loop from the process-global
+/// `_agy_bridge_globals.EVENT_LOOPS` map on runtime thread teardown.
+fn unregister_thread_event_loop(py: Python<'_>, globals_mod: &Bound<'_, PyAny>) {
+    let unregister_res = (|| -> PyResult<()> {
+        let threading = py.import("threading")?;
+        let thread_id = threading.call_method0("get_ident")?;
+        if globals_mod.hasattr("EVENT_LOOPS")? {
+            let loops = globals_mod.getattr("EVENT_LOOPS")?;
+            let dict = loops.cast::<pyo3::types::PyDict>()?;
+            dict.del_item(thread_id)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = unregister_res {
+        tracing::debug!(error = %e, "Failed to unregister thread event loop on teardown");
+    }
 }
 
 /// Compute which SDK builtin tools are active based on the agent's
@@ -620,6 +649,25 @@ impl crate::agent::Runtime for PythonRuntime {
         agent_id: u64,
         config: crate::config::AgentConfig,
     ) -> Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error> {
+        // The local harness persists the trajectory to `save_dir` only if that
+        // directory already exists; neither it nor the Python SDK creates it.
+        // A missing directory means persistence is silently skipped, so a later
+        // resume fails with "conversation not found". Since `save_dir` is an
+        // explicit opt-in to persistence, create it here. On failure we log
+        // rather than abort: the SDK treats a missing directory as an ephemeral
+        // session, and a subsequent resume attempt would surface the problem
+        // loudly on its own.
+        if let Some(save_dir) = config.save_dir.as_ref()
+            && let Err(e) = std::fs::create_dir_all(save_dir)
+        {
+            tracing::warn!(
+                save_dir = %save_dir.display(),
+                error = ?e,
+                "Failed to create save_dir; conversation state may not persist \
+                 and resume may fail with \"conversation not found\""
+            );
+        }
+
         // Serialize the AgentConfig and inject the runtime's backend log
         // level so the Python init script can configure logging without
         // needing a separate FFI parameter.
@@ -727,16 +775,18 @@ impl crate::agent::Runtime for PythonRuntime {
         // Fire-and-forget: create a oneshot whose receiver we drop immediately.
         // The Python thread will still process the shutdown; we just don't wait
         // for the result.
-        let (reply, _) = oneshot::channel();
-        if let Err(e) = self.cmd_tx.try_send(PyCommand::ShutdownAgent {
-            agent_id: AgentId(agent_id),
-            reply,
-        }) {
-            tracing::debug!(
-                agent_id = agent_id,
-                error = %e,
-                "try_shutdown_agent: channel send failed (runtime may already be gone)"
-            );
+        if let Some(ref tx) = self.cmd_tx {
+            let (reply, _) = oneshot::channel();
+            if let Err(e) = tx.try_send(PyCommand::ShutdownAgent {
+                agent_id: AgentId(agent_id),
+                reply,
+            }) {
+                tracing::debug!(
+                    agent_id = agent_id,
+                    error = %e,
+                    "try_shutdown_agent: channel send failed (runtime may already be gone)"
+                );
+            }
         }
     }
 

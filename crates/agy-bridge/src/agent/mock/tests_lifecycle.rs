@@ -71,7 +71,11 @@ async fn conversation_id_tracking() {
 
     assert!(agent.conversation_id().is_none());
 
-    agent.set_conversation_id("conv_abc123".to_owned());
+    // Simulate the local harness assigning a conversation id: the Python bridge
+    // syncs it into the shared bridge-state Arc via `set_agent_conversation_id`,
+    // which the handle observes through the same Arc.
+    crate::runtime::set_agent_conversation_id(agent.id(), "conv_abc123".to_owned())
+        .expect("sync conversation id");
     assert_eq!(agent.conversation_id().as_deref(), Some("conv_abc123"));
 
     agent.shutdown().await.expect("shutdown should succeed");
@@ -87,10 +91,11 @@ async fn ffi_session_start_does_not_inject_session_id_as_conversation_id() {
     assert!(agent.conversation_id().is_none());
 
     // Simulate the dispatch_rust_hook callback for on_session_start.
-    // Previously this would inject session_id as conversation_id, but
-    // session_id is the save-directory basename (e.g. "fixed_run_3"),
-    // NOT a real conversation handle.  The fix ensures conversation_id
-    // stays None unless explicitly set via set_conversation_id().
+    // on_session_start is observe-only: its `session_id` may be a fabricated
+    // fallback (workspace basename or "default_session"), NOT the real SDK
+    // conversation id, so it must not be injected. The authentic id arrives
+    // separately via `set_agent_conversation_id`; conversation_id stays None
+    // until then.
     let ctx = crate::hooks::OnSessionStartContext {
         session: crate::hooks::SessionContext {
             session_id: "dynamically-generated-session-123".to_owned(),

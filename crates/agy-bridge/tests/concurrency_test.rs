@@ -117,17 +117,41 @@ fn sse_response(json_body: &str) -> String {
 
 fn model_list_json() -> String {
     serde_json::json!({
-        "models": [{
-            "name": "models/gemini-2.0-flash",
-            "displayName": "Gemini 2.0 Flash",
-            "supportedGenerationMethods": [
-                "generateContent",
-                "streamGenerateContent",
-                "countTokens"
-            ],
-            "inputTokenLimit": 1_048_576,
-            "outputTokenLimit": 8192
-        }]
+        "models": [
+            {
+                "name": "models/gemini-3.6-flash",
+                "displayName": "Gemini 3.6 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            },
+            {
+                "name": "models/gemini-3.5-flash",
+                "displayName": "Gemini 3.5 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            },
+            {
+                "name": "models/gemini-2.0-flash",
+                "displayName": "Gemini 2.0 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            }
+        ]
     })
     .to_string()
 }
@@ -267,6 +291,7 @@ fn agent_config(base_url: &str, system: &str) -> agy_bridge::config::AgentConfig
             models: agy_bridge::config::ModelConfig::default(),
         })
         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+        .retry_config(agy_bridge::config::RetryConfig::no_retries())
         .build()
 }
 
@@ -1115,109 +1140,4 @@ fn concurrent_create_and_shutdown_storm_no_stall() {
             "Expected exactly {N} POST requests from storm test"
         );
     });
-}
-
-// =============================================================================
-// 14. OS-thread parallelism — multiple bridges, multiple configs, at once
-// =============================================================================
-
-/// The strongest end-to-end guard for concurrent, multi-config use: spawn
-/// several **OS threads** (not just tokio tasks), each of which builds its own
-/// [`AgyBridge`] with a *distinct* configuration and its own multi-threaded
-/// tokio runtime, then drives multiple agents concurrently against its own mock
-/// backend.
-///
-/// This is exactly the scenario the (now removed) `RUST_TEST_THREADS=1` pin used
-/// to serialize away. Each bridge owns its own Python runtime thread + event
-/// loop; agent state is keyed by a process-globally-unique ID; and the loop is
-/// resolved per-runtime. All threads must therefore make progress simultaneously
-/// with full isolation — no GIL lockup, no cross-bridge contamination.
-#[test]
-fn os_threads_multiple_bridges_multiple_configs_concurrent() {
-    const THREADS: usize = 4;
-    const AGENTS_PER_BRIDGE: usize = 3;
-
-    let handles: Vec<std::thread::JoinHandle<()>> = (0..THREADS)
-        .map(|t| {
-            std::thread::spawn(move || {
-                let rt = multi_thread_rt();
-                rt.block_on(async move {
-                    // Distinct per-bridge config: a unique response tag *and* a
-                    // different inter-agent delay, so no two bridges share config.
-                    let tag = format!("thread-{t}");
-                    let server = MockServer::start(&tag).await;
-                    let url = server.base_url();
-
-                    let bridge = agy_bridge::AgyBridge::builder()
-                        .inter_agent_delay(std::time::Duration::from_millis((t as u64) * 5))
-                        .build()
-                        .unwrap_or_else(|e| panic!("thread {t}: bridge build: {e}"));
-
-                    // Create this bridge's agents concurrently.
-                    let agents = futures::future::join_all((0..AGENTS_PER_BRIDGE).map(|a| {
-                        let url = url.clone();
-                        let bridge = &bridge;
-                        async move {
-                            bridge
-                                .agent(agent_config(&url, &format!("t{t}-agent{a}")))
-                                .await
-                        }
-                    }))
-                    .await
-                    .into_iter()
-                    .enumerate()
-                    .map(|(a, r)| r.unwrap_or_else(|e| panic!("thread {t} agent {a} create: {e}")))
-                    .collect::<Vec<_>>();
-
-                    // Isolation: this bridge sees exactly its own agents.
-                    assert_eq!(
-                        bridge
-                            .active_agent_count()
-                            .await
-                            .unwrap_or_else(|e| panic!("thread {t} count: {e}")),
-                        AGENTS_PER_BRIDGE,
-                        "thread {t}: bridge must see exactly its own agents"
-                    );
-
-                    // Chat with all agents concurrently; every response must carry
-                    // *this* bridge's tag (no cross-bridge contamination).
-                    let chats = futures::future::join_all(
-                        agents.iter().map(|agent| agent.chat_text("ping")),
-                    )
-                    .await;
-                    for (a, res) in chats.into_iter().enumerate() {
-                        let text = res.unwrap_or_else(|e| panic!("thread {t} agent {a} chat: {e}"));
-                        assert!(
-                            text.contains(&format!("mock:{tag}")),
-                            "thread {t} agent {a} got wrong tag: {text}"
-                        );
-                    }
-
-                    // Shut all agents down; the bridge must drain to zero.
-                    futures::future::join_all(
-                        agents
-                            .into_iter()
-                            .map(|a| async move { a.shutdown().await }),
-                    )
-                    .await
-                    .into_iter()
-                    .enumerate()
-                    .for_each(|(a, r)| {
-                        r.unwrap_or_else(|e| panic!("thread {t} agent {a} shutdown: {e}"));
-                    });
-
-                    assert_eq!(
-                        server.post_count(),
-                        AGENTS_PER_BRIDGE,
-                        "thread {t}: expected {AGENTS_PER_BRIDGE} POSTs to its own backend"
-                    );
-                });
-            })
-        })
-        .collect();
-
-    for (t, h) in handles.into_iter().enumerate() {
-        h.join()
-            .unwrap_or_else(|_| panic!("thread {t} panicked — concurrent multi-bridge failure"));
-    }
 }

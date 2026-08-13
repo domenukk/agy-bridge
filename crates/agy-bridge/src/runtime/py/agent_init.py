@@ -40,7 +40,7 @@ def _normalize_tool_name(name):
     return name
 
 
-def _serialize_post_tool_call_ctx(ctx, current_tool_call):
+def _serialize_post_tool_call_ctx(ctx, current_tool_call, agent_id_u64=None):
     """Serialize a `post_tool_call` hook context to a JSON string."""
     import json
 
@@ -48,19 +48,49 @@ def _serialize_post_tool_call_ctx(ctx, current_tool_call):
     tool_args = _to_dict(tool_args)
 
     result_val = getattr(ctx, "result", None)
+    if result_val is None:
+        result_val = getattr(ctx, "tool_result", None)
     result_str = ""
     metadata = {}
     if result_val is None:
         result_str = ""
     elif isinstance(result_val, str):
-        result_str = result_val
-    elif isinstance(result_val, dict) and "content" in result_val:
-        result_str = result_val["content"]
+        try:
+            parsed = json.loads(result_val)
+            if isinstance(parsed, dict) and (
+                "content" in parsed or "metadata" in parsed
+            ):
+                result_str = parsed.get("content", result_val)
+                metadata = parsed.get("metadata", {})
+            else:
+                result_str = result_val
+        except (ValueError, TypeError):
+            result_str = result_val
+    elif isinstance(result_val, dict) and (
+        "content" in result_val or "metadata" in result_val
+    ):
+        result_str = result_val.get("content", "")
         metadata = result_val.get("metadata", {})
     else:
         tool_output = getattr(result_val, "result", None)
-        if isinstance(tool_output, dict) and "content" in tool_output:
-            result_str = tool_output["content"]
+        if tool_output is None:
+            tool_output = getattr(result_val, "output", None)
+        if isinstance(tool_output, str):
+            try:
+                parsed = json.loads(tool_output)
+                if isinstance(parsed, dict) and (
+                    "content" in parsed or "metadata" in parsed
+                ):
+                    result_str = parsed.get("content", tool_output)
+                    metadata = parsed.get("metadata", {})
+                else:
+                    result_str = tool_output
+            except (ValueError, TypeError):
+                result_str = tool_output
+        elif isinstance(tool_output, dict) and (
+            "content" in tool_output or "metadata" in tool_output
+        ):
+            result_str = tool_output.get("content", "")
             metadata = tool_output.get("metadata", {})
         else:
             try:
@@ -79,7 +109,23 @@ def _serialize_post_tool_call_ctx(ctx, current_tool_call):
                 )
                 result_str = str(result_val)
 
+    if not metadata and hasattr(ctx, "metadata") and ctx.metadata is not None:
+        metadata = _to_dict(ctx.metadata)
+
+    if not metadata and agent_id_u64 is not None:
+        import sys
+
+        globals_mod = sys.modules.get("_agy_bridge_globals")
+        if globals_mod and hasattr(globals_mod, "LAST_TOOL_METADATA"):
+            cached_meta = globals_mod.LAST_TOOL_METADATA.get(int(agent_id_u64))
+            if cached_meta:
+                metadata = _to_dict(cached_meta)
+
     tool_name = getattr(ctx, "name", "")
+    if not tool_name and hasattr(ctx, "tool_name"):
+        tool_name = ctx.tool_name
+    if not tool_name and current_tool_call:
+        tool_name = getattr(current_tool_call, "name", "")
     tool_name = _normalize_tool_name(tool_name)
 
     payload = {
@@ -203,20 +249,23 @@ def _serialize_generic_ctx(ctx):
 
 
 def _munge_config_model(local_config):
-    """Drop the redundant top-level `model` shorthand when gemini_config is set.
+    """Normalize gemini_config into LocalAgentConfig top-level fields (model, api_key).
 
-    The Rust AgentConfig always serializes a `model` field (it's a required
-    String, not Option).  The SDK's LocalAgentConfig validator rejects configs
-    that set *both* the top-level `model` shorthand and
-    `gemini_config.models.default`.  When gemini_config carries the model via
-    `models.default`, drop the redundant top-level key.
-
-    NOTE: This is tightly coupled to the SDK validator's behavior.  If the SDK
-    changes to accept both fields, or renames `gemini_config`, this function
-    should be updated accordingly.
+    In SDK 0.1.10+, LocalAgentConfig expects top-level `api_key` and `model`.
+    Map `gemini_config.api_key` and `gemini_config.models.default` to top-level
+    fields and remove the obsolete `gemini_config` sub-dict.
     """
-    if "gemini_config" in local_config and local_config.get("gemini_config"):
-        local_config.pop("model", None)
+    if "gemini_config" in local_config:
+        gemini_cfg = local_config.pop("gemini_config")
+        if gemini_cfg:
+            if "api_key" in gemini_cfg and gemini_cfg["api_key"]:
+                local_config["api_key"] = gemini_cfg["api_key"]
+            if "models" in gemini_cfg and gemini_cfg["models"]:
+                if (
+                    "default" in gemini_cfg["models"]
+                    and gemini_cfg["models"]["default"]
+                ):
+                    local_config["model"] = gemini_cfg["models"]["default"]
 
 
 def _extract_initial_history(local_config):
@@ -284,20 +333,20 @@ def _resolve_ws_max_size(logger):
     return None if cap <= 0 else cap
 
 
+def _get_monkeypatch_lock():
+    import sys, threading
+
+    lock = getattr(sys, "_agy_bridge_monkeypatch_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        sys._agy_bridge_monkeypatch_lock = lock
+    return lock
+
+
 def _patch_websockets_max_size(logger, sdk_version=None):
-    """Version-gated fix for the SDK's 1 MiB WebSocket receive cap.
+    """Raise the default websockets frame limit from 1 MiB to 16 MiB for SDK 0.1.10.
 
-    The Antigravity SDK's ``LocalConnection`` opens its harness WebSocket via
-    ``websockets.connect(...)`` without setting ``max_size``, leaving the client
-    at the library default of 1 MiB for INCOMING frames. The harness echoes
-    conversation state back at ~2x the input size, so large-context turns produce
-    a response frame that exceeds 1 MiB; the client kills the socket with a 1009
-    close (surfaced as ``WS close code 1006``) and the harness exits.
-
-    We wrap ``websockets.connect`` to inject a generous, bounded ``max_size``
-    (see ``_resolve_ws_max_size``) only when the caller did not specify one.
-
-    The patch is applied ONLY for the exact SDK version in
+    Scoped strictly to the one SDK release that suffers from the issue,
     ``_WS_MAXSIZE_PATCH_SDK_VERSION``; any other version is left untouched on the
     assumption that newer releases carry the upstream fix. Idempotent across
     repeated ``init_agent`` calls. Returns True iff the patch is now in effect.
@@ -314,36 +363,37 @@ def _patch_websockets_max_size(logger, sdk_version=None):
         )
         return False
 
-    try:
-        import websockets
-    except ImportError:
-        logger.warning(
-            "[MONKEYPATCH] websockets not importable -- WS max_size patch skipped"
+    with _get_monkeypatch_lock():
+        try:
+            import websockets
+        except ImportError:
+            logger.warning(
+                "[MONKEYPATCH] websockets not importable -- WS max_size patch skipped"
+            )
+            return False
+
+        if getattr(websockets, "_agy_max_size_patched", False):
+            return True
+
+        websockets._agy_max_size_patched = True
+        cap = _resolve_ws_max_size(logger)
+        original_connect = websockets.connect
+
+        def _connect_with_max_size(*args, **kwargs):
+            # Only inject the cap when the SDK did not specify one, so an explicit
+            # future SDK setting always wins.
+            kwargs.setdefault("max_size", cap)
+            return original_connect(*args, **kwargs)
+
+        websockets.connect = _connect_with_max_size
+        websockets._agy_original_connect = original_connect
+        logger.info(
+            "[MONKEYPATCH] Patched websockets.connect max_size=%s for SDK %s "
+            "(default was 1 MiB; harness echoes ~2x input, breaking large contexts)",
+            cap,
+            sdk_version,
         )
-        return False
-
-    if getattr(websockets, "_agy_max_size_patched", False):
         return True
-
-    cap = _resolve_ws_max_size(logger)
-    original_connect = websockets.connect
-
-    def _connect_with_max_size(*args, **kwargs):
-        # Only inject the cap when the SDK did not specify one, so an explicit
-        # future SDK setting always wins.
-        kwargs.setdefault("max_size", cap)
-        return original_connect(*args, **kwargs)
-
-    websockets.connect = _connect_with_max_size
-    websockets._agy_original_connect = original_connect
-    websockets._agy_max_size_patched = True
-    logger.info(
-        "[MONKEYPATCH] Patched websockets.connect max_size=%s for SDK %s "
-        "(default was 1 MiB; harness echoes ~2x input, breaking large contexts)",
-        cap,
-        sdk_version,
-    )
-    return True
 
 
 def _apply_sdk_monkeypatches(logger):
@@ -355,15 +405,18 @@ def _apply_sdk_monkeypatches(logger):
     missing, the patches are skipped with a warning rather than silently
     corrupting class internals.
     """
-    import sys
+    with _get_monkeypatch_lock():
+        try:
+            import sys
+            import asyncio
+            from google.antigravity.connections.local.local_connection import (
+                LocalConnection,
+            )
 
-    try:
-        from google.antigravity.connections.local.local_connection import (
-            LocalConnection,
-        )
-        import asyncio
+            if getattr(LocalConnection, "_is_monkeypatched", False):
+                return
+            LocalConnection._is_monkeypatched = True
 
-        if not getattr(LocalConnection, "_is_monkeypatched", False):
             # ── Structural guard ──
             # Verify the class still has the internals we patch.
             # If the SDK refactors these away, patching would silently break.
@@ -379,12 +432,24 @@ def _apply_sdk_monkeypatches(logger):
                 )
                 return
 
-            # Check SDK version if available, for diagnostic logging.
+            # Check SDK version if available, for diagnostic logging and min version enforcement.
+            MIN_SUPPORTED_SDK_VERSION = "0.1.10"
             try:
                 import importlib.metadata as _meta
 
                 sdk_version = _meta.version("google-antigravity")
                 logger.info("[MONKEYPATCH] SDK version: %s", sdk_version)
+                min_parts = [
+                    int(p) for p in MIN_SUPPORTED_SDK_VERSION.split(".") if p.isdigit()
+                ]
+                ver_parts = [int(p) for p in sdk_version.split(".") if p.isdigit()]
+                if ver_parts < min_parts:
+                    raise RuntimeError(
+                        f"[SDK-VERSION] Installed google-antigravity version {sdk_version} is older than "
+                        f"minimum supported {MIN_SUPPORTED_SDK_VERSION}. Please upgrade: pip install --upgrade google-antigravity>={MIN_SUPPORTED_SDK_VERSION}."
+                    )
+            except RuntimeError:
+                raise
             except Exception:
                 sdk_version = "unknown"
 
@@ -409,7 +474,16 @@ def _apply_sdk_monkeypatches(logger):
                         "[MONKEYPATCH] Firing deferred is_idle.set() now that _current_turn_context is None"
                     )
                     # Access the real asyncio.Event inside PatchedEvent to bypass the guard.
-                    self._is_idle._event.set()
+                    if hasattr(self, "_processor") and hasattr(
+                        self._processor, "is_idle"
+                    ):
+                        event = getattr(
+                            self._processor.is_idle, "_event", self._processor.is_idle
+                        )
+                        event.set()
+                    elif hasattr(self, "_is_idle"):
+                        event = getattr(self._is_idle, "_event", self._is_idle)
+                        event.set()
 
             LocalConnection._current_turn_context = current_turn_context
 
@@ -417,7 +491,6 @@ def _apply_sdk_monkeypatches(logger):
 
             def patched_init(self, *args, **kwargs):
                 original_init(self, *args, **kwargs)
-                original_event = self._is_idle
 
                 class PatchedEvent:
                     def __init__(self, event, conn):
@@ -425,7 +498,10 @@ def _apply_sdk_monkeypatches(logger):
                         self._conn = conn
 
                     def set(self):
-                        if self._conn._current_turn_context is not None:
+                        if (
+                            getattr(self._conn, "_current_turn_context", None)
+                            is not None
+                        ):
                             logger.info(
                                 "[MONKEYPATCH] Deferring is_idle.set() because _current_turn_context is not None"
                             )
@@ -442,7 +518,16 @@ def _apply_sdk_monkeypatches(logger):
                     async def wait(self):
                         await self._event.wait()
 
-                self._is_idle = PatchedEvent(original_event, self)
+                if hasattr(self, "_processor") and hasattr(self._processor, "is_idle"):
+                    original_event = self._processor.is_idle
+                    self._processor.is_idle = PatchedEvent(original_event, self)
+                elif hasattr(self, "_is_idle"):
+                    try:
+                        original_event = self._is_idle
+                        self._is_idle = PatchedEvent(original_event, self)
+                    except AttributeError:
+                        pass
+
                 self._real_current_turn_context = None
                 self._idle_deferred = False
 
@@ -466,31 +551,50 @@ def _apply_sdk_monkeypatches(logger):
                     )
                     if agent_id is not None:
                         globals_mod = sys.modules.get("_agy_bridge_globals")
-                        if globals_mod and hasattr(globals_mod, "dispatch_rust_hook"):
-                            payload = {
-                                "session": {
-                                    "session_id": str(value),
-                                    "agent_id": int(agent_id),
+                        if globals_mod is not None:
+                            # Store the harness-assigned conversation id into the
+                            # agent's shared bridge state so
+                            # `AgentHandle::conversation_id` and custom-tool
+                            # `ToolContext` observe the *real* SDK trajectory id.
+                            # This is deliberately separate from the observe-only
+                            # `on_session_start` hook below, whose init-time
+                            # dispatch may carry a fabricated fallback id.
+                            if hasattr(globals_mod, "set_agent_conversation_id"):
+                                try:
+                                    globals_mod.set_agent_conversation_id(
+                                        int(agent_id), str(value)
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        "[MONKEYPATCH] Failed to store SDK conversation id: %s",
+                                        e,
+                                        exc_info=True,
+                                    )
+                            if hasattr(globals_mod, "dispatch_rust_hook"):
+                                payload = {
+                                    "session": {
+                                        "session_id": str(value),
+                                        "agent_id": int(agent_id),
+                                    }
                                 }
-                            }
-                            import json
+                                import json
 
-                            ctx_json = json.dumps(payload)
-                            logger.info(
-                                "[MONKEYPATCH] Syncing dynamic conversation ID %s to Rust for agent %s",
-                                value,
-                                agent_id,
-                            )
-                            try:
-                                globals_mod.dispatch_rust_hook(
-                                    int(agent_id), "on_session_start", ctx_json
+                                ctx_json = json.dumps(payload)
+                                logger.info(
+                                    "[MONKEYPATCH] Syncing dynamic conversation ID %s to Rust for agent %s",
+                                    value,
+                                    agent_id,
                                 )
-                            except Exception as e:
-                                logger.error(
-                                    "[MONKEYPATCH] Failed to sync conversation ID: %s",
-                                    e,
-                                    exc_info=True,
-                                )
+                                try:
+                                    globals_mod.dispatch_rust_hook(
+                                        int(agent_id), "on_session_start", ctx_json
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        "[MONKEYPATCH] Failed to sync conversation ID: %s",
+                                        e,
+                                        exc_info=True,
+                                    )
 
             LocalConnection._cascade_id = _cascade_id
 
@@ -507,14 +611,201 @@ def _apply_sdk_monkeypatches(logger):
                 return original_tool_result_to_dict(self, result)
 
             LocalConnection._tool_result_to_dict = patched_tool_result_to_dict
+
+            original_receive_steps = LocalConnection.receive_steps
+
+            async def patched_receive_steps(self):
+                lock = getattr(self, "_receive_steps_lock", None)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self._receive_steps_lock = lock
+                async with lock:
+                    async for step in original_receive_steps(self):
+                        yield step
+
+            LocalConnection.receive_steps = patched_receive_steps
+
+            try:
+                from google.antigravity.connections.local import event_processor
+
+                LocalHarnessEventProcessor = event_processor.LocalHarnessEventProcessor
+
+                if not getattr(LocalHarnessEventProcessor, "_is_monkeypatched", False):
+
+                    @property
+                    def main_trajectory_id(self):
+                        return getattr(self, "_real_main_trajectory_id", None)
+
+                    @main_trajectory_id.setter
+                    def main_trajectory_id(self, value):
+                        old_val = getattr(self, "_real_main_trajectory_id", None)
+                        self._real_main_trajectory_id = value
+                        if value and value != old_val:
+                            agent_id = getattr(self, "_agent_id", None)
+                            logger.info(
+                                "[MONKEYPATCH] Detected dynamic main_trajectory_id change: %r -> %r for agent %r",
+                                old_val,
+                                value,
+                                agent_id,
+                            )
+                            if agent_id is not None:
+                                globals_mod = sys.modules.get("_agy_bridge_globals")
+                                if globals_mod is not None:
+                                    if hasattr(
+                                        globals_mod, "set_agent_conversation_id"
+                                    ):
+                                        try:
+                                            globals_mod.set_agent_conversation_id(
+                                                int(agent_id), str(value)
+                                            )
+                                        except Exception as e:
+                                            logger.error(
+                                                "[MONKEYPATCH] Failed to store SDK conversation id: %s",
+                                                e,
+                                                exc_info=True,
+                                            )
+                                    if hasattr(globals_mod, "dispatch_rust_hook"):
+                                        payload = {
+                                            "session": {
+                                                "session_id": str(value),
+                                                "agent_id": int(agent_id),
+                                            }
+                                        }
+                                        import json
+
+                                        ctx_json = json.dumps(payload)
+                                        logger.info(
+                                            "[MONKEYPATCH] Syncing dynamic conversation ID %s to Rust for agent %s",
+                                            value,
+                                            agent_id,
+                                        )
+                                        try:
+                                            globals_mod.dispatch_rust_hook(
+                                                int(agent_id),
+                                                "on_session_start",
+                                                ctx_json,
+                                            )
+                                        except Exception as e:
+                                            logger.error(
+                                                "[MONKEYPATCH] Failed to sync conversation ID: %s",
+                                                e,
+                                                exc_info=True,
+                                            )
+
+                    LocalHarnessEventProcessor.main_trajectory_id = main_trajectory_id
+
+                    orig_ep_tool_result = LocalHarnessEventProcessor.tool_result_to_dict
+
+                    def patched_ep_tool_result(self, result):
+                        if result.error is not None:
+                            return {"error": result.error}
+                        output = result.result
+                        if isinstance(output, dict) and "content" in output:
+                            return {"result": output["content"]}
+                        return orig_ep_tool_result(self, result)
+
+                    LocalHarnessEventProcessor.tool_result_to_dict = (
+                        patched_ep_tool_result
+                    )
+
+                    orig_handle_tool_call = LocalHarnessEventProcessor.handle_tool_call
+
+                    async def patched_handle_tool_call(self, tool_call):
+                        import json
+                        from google.antigravity import types
+                        from google.antigravity.connections.local import event_processor
+
+                        try:
+                            args = json.loads(tool_call.arguments_json or "{}")
+                            tc = types.ToolCall(
+                                id=tool_call.id, name=tool_call.name, args=args
+                            )
+                            tool_call_step = event_processor.LocalConnectionStep(
+                                id=tool_call.id,
+                                step_index=1,
+                                type=types.StepType.TOOL_CALL,
+                                source=types.StepSource.MODEL,
+                                target=types.StepTarget.ENVIRONMENT,
+                                status=types.StepStatus.ACTIVE,
+                                tool_calls=[tc],
+                            )
+                            await self.step_queue.put(tool_call_step)
+
+                            if self._tool_runner:
+                                try:
+                                    results = (
+                                        await self._tool_runner.process_tool_calls(
+                                            [types.ToolCall(name=tc.name, args=tc.args)]
+                                        )
+                                    )
+                                    result = results[0]
+                                    result.id = tool_call.id
+                                except Exception as e:
+                                    result = types.ToolResult(
+                                        id=tool_call.id,
+                                        name=tool_call.name,
+                                        error=str(e),
+                                        exception=e,
+                                    )
+
+                                if self._hook_runner:
+                                    try:
+                                        from google.antigravity.hooks import hooks
+
+                                        turn_ctx = (
+                                            self._hook_router.current_turn_context
+                                            if self._hook_router
+                                            else None
+                                        ) or hooks.TurnContext(
+                                            self._hook_runner.session_context
+                                        )
+                                        op_ctx = hooks.OperationContext(turn_ctx)
+                                        await self._hook_runner.dispatch_post_tool_call(
+                                            op_ctx, result
+                                        )
+                                    except Exception as hook_err:
+                                        logger.warning(
+                                            "Error dispatching post_tool_call hook: %s",
+                                            hook_err,
+                                        )
+
+                                await self._send_tool_results([result])
+                            else:
+                                logger.warning(
+                                    "Received tool call %s but no tool runner is configured. Yielding to user.",
+                                    tool_call.name,
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                "_handle_tool_call failed; returning error to model"
+                            )
+                            await self._send_tool_results(
+                                [
+                                    types.ToolResult(
+                                        id=tool_call.id,
+                                        name=tool_call.name,
+                                        error=f"Internal SDK error: {e!r}",
+                                    )
+                                ]
+                            )
+
+                    LocalHarnessEventProcessor.handle_tool_call = (
+                        patched_handle_tool_call
+                    )
+                    LocalHarnessEventProcessor._is_monkeypatched = True
+            except Exception as e:
+                logger.warning("Failed to patch LocalHarnessEventProcessor: %s", e)
+
             LocalConnection._is_monkeypatched = True
-    except ImportError:
-        logger.warning(
-            "[MONKEYPATCH] google.antigravity.connections.local.local_connection "
-            "not importable — LocalConnection patches skipped"
-        )
-    except Exception as e:
-        logger.warning("Failed to apply LocalConnection monkeypatch: %s", e)
+        except ImportError:
+            logger.warning(
+                "[MONKEYPATCH] google.antigravity.connections.local.local_connection "
+                "not importable — LocalConnection patches skipped"
+            )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning("Failed to apply LocalConnection monkeypatch: %s", e)
 
 
 def _wire_tool_proxies(local_config, agent_id_u64):
@@ -556,7 +847,11 @@ def _wire_tool_proxies(local_config, agent_id_u64):
                 int(self.agent_id), self.__name__, args_json
             )
             if inspect.isawaitable(res):
-                return await res
+                res = await res
+            if isinstance(res, dict) and "metadata" in res:
+                if not hasattr(globals_mod, "LAST_TOOL_METADATA"):
+                    globals_mod.LAST_TOOL_METADATA = {}
+                globals_mod.LAST_TOOL_METADATA[int(self.agent_id)] = res.get("metadata")
             return res
 
     def create_proxy(agent_id, name, desc, schema):
@@ -699,9 +994,10 @@ def _wire_hooks(local_config, agent_id_u64):
                     def _make_hook_cb(name, point_label):
                         """Factory to capture name/point_label per hook."""
 
-                        async def _hook_callback(ctx=None):
+                        async def _hook_callback(context=None, data=None):
                             import sys, json, inspect
 
+                            ctx = data if data is not None else context
                             globals_mod = sys.modules.get("_agy_bridge_globals")
                             if not globals_mod or not hasattr(
                                 globals_mod, "dispatch_rust_hook"
@@ -727,7 +1023,14 @@ def _wire_hooks(local_config, agent_id_u64):
                             # The SDK passes known pydantic types: ToolCall, ToolResult,
                             # Content (str or BaseModel), or None (session hooks).
                             try:
-                                if point_label == "post_tool_call":
+                                if point_label in (
+                                    "on_session_start",
+                                    "on_session_end",
+                                ):
+                                    ctx_json = _serialize_session_ctx(
+                                        local_config, agent_id_u64
+                                    )
+                                elif point_label == "post_tool_call":
                                     current_tool_call = (
                                         globals_mod.CURRENT_TOOL_CALLS.get(agent_id_u64)
                                         if globals_mod
@@ -735,7 +1038,7 @@ def _wire_hooks(local_config, agent_id_u64):
                                         else None
                                     )
                                     ctx_json = _serialize_post_tool_call_ctx(
-                                        ctx, current_tool_call
+                                        ctx, current_tool_call, agent_id_u64
                                     )
                                 elif point_label == "on_tool_error":
                                     current_tool_call = (
@@ -748,15 +1051,7 @@ def _wire_hooks(local_config, agent_id_u64):
                                         ctx, current_tool_call, hook_logger
                                     )
                                 elif ctx is None:
-                                    if point_label in (
-                                        "on_session_start",
-                                        "on_session_end",
-                                    ):
-                                        ctx_json = _serialize_session_ctx(
-                                            local_config, agent_id_u64
-                                        )
-                                    else:
-                                        ctx_json = "{}"
+                                    ctx_json = "{}"
                                 elif point_label == "post_turn":
                                     ctx_json = _serialize_post_turn_ctx(ctx)
                                 elif point_label == "pre_turn":
@@ -793,6 +1088,22 @@ def _wire_hooks(local_config, agent_id_u64):
                                         allow=False, message=str(e)
                                     )
                                 return
+
+                            # on_tool_error is a TransformHook: the Rust side
+                            # returns the model-facing error representation as a
+                            # JSON value (a JSON string, or `null` to defer to
+                            # the harness's default error formatting).
+                            if point_label == "on_tool_error":
+                                if not result_json:
+                                    return None
+                                try:
+                                    return json.loads(result_json)
+                                except json.JSONDecodeError:
+                                    hook_logger.error(
+                                        "Failed to decode on_tool_error result JSON %r",
+                                        result_json,
+                                    )
+                                    return None
 
                             if result_json:
                                 try:
@@ -939,11 +1250,11 @@ def _wire_mcp_servers(local_config):
             parsed_mcp = []
             for mcp in local_config.pop("mcp_servers"):
                 typ = mcp.pop("type", None)
+                if "name" not in mcp or not mcp["name"]:
+                    mcp["name"] = "mcp_server"
                 if typ == "stdio":
                     parsed_mcp.append(agy_types.McpStdioServer(**mcp))
-                elif typ == "sse":
-                    parsed_mcp.append(agy_types.McpSseServer(**mcp))
-                elif typ == "http":
+                elif typ in ("sse", "http"):
                     parsed_mcp.append(agy_types.McpStreamableHttpServer(**mcp))
                 else:
                     logging.getLogger("agy_bridge.mcp").warning(
@@ -1032,18 +1343,42 @@ def _setup_base_url_routing(local_config):
                 config = _original_build(self)
                 url = getattr(self, "_agy_base_url", None)
                 if url:
-                    config.gemini_config.base_url = url
-                    if config.gemini_config.api_key == _PROXY_AUTH_SENTINEL:
-                        config.gemini_config.ClearField("api_key")
-                        logger.info(
-                            "Injected base_url=%s into harness config (auth sentinel cleared)",
-                            url,
-                        )
-                    else:
-                        logger.info(
-                            "Injected base_url=%s into harness config (real api_key kept)",
-                            url,
-                        )
+                    try:
+                        if config.HasField("gemini_config"):
+                            config.gemini_config.base_url = url
+                            if config.gemini_config.api_key == _PROXY_AUTH_SENTINEL:
+                                config.gemini_config.ClearField("api_key")
+                                logger.info(
+                                    "Injected base_url=%s into harness config (auth sentinel cleared)",
+                                    url,
+                                )
+                            else:
+                                logger.info(
+                                    "Injected base_url=%s into harness config (real api_key kept)",
+                                    url,
+                                )
+                    except (AttributeError, ValueError):
+                        pass
+                    if hasattr(config, "models"):
+                        for m in config.models:
+                            if m.HasField("gemini_api_endpoint"):
+                                m.gemini_api_endpoint.base_url = url
+                                if (
+                                    m.gemini_api_endpoint.api_key
+                                    == _PROXY_AUTH_SENTINEL
+                                ):
+                                    m.gemini_api_endpoint.ClearField("api_key")
+                                    logger.info(
+                                        "Injected base_url=%s into model %s (auth sentinel cleared)",
+                                        url,
+                                        m.name,
+                                    )
+                                else:
+                                    logger.info(
+                                        "Injected base_url=%s into model %s (real api_key kept)",
+                                        url,
+                                        m.name,
+                                    )
                 return config
 
             LocalConnectionStrategy._build_harness_config = _patched_build
@@ -1056,7 +1391,12 @@ def _setup_base_url_routing(local_config):
                 _original_strategy_init(self, *args, **kwargs)
                 # ContextVar reads are task- and thread-local, so this is
                 # race-free across concurrent agent creations.
-                self._agy_base_url = LocalConnectionStrategy._agy_base_url_var.get()
+                url = LocalConnectionStrategy._agy_base_url_var.get()
+                self._agy_base_url = url
+                if url and getattr(self, "_models", None):
+                    for m in self._models:
+                        if getattr(m, "endpoint", None) is not None:
+                            m.endpoint.base_url = url
 
             LocalConnectionStrategy.__init__ = _patched_strategy_init
 
@@ -1102,7 +1442,10 @@ def _build_agent_lifecycle(
                 if hasattr(agent, "conversation") and hasattr(
                     agent.conversation, "connection"
                 ):
-                    agent.conversation.connection._agent_id = agent_id_u64
+                    conn = agent.conversation.connection
+                    conn._agent_id = agent_id_u64
+                    if hasattr(conn, "_processor"):
+                        conn._processor._agent_id = agent_id_u64
 
                 # Inject initial_history into the conversation's internal
                 # _history list, enabling warm-start with prior context.
@@ -1139,7 +1482,7 @@ def _build_agent_lifecycle(
                 result_holder["instance"] = agent
                 enter_event.set()
                 await exit_event.wait()
-        except Exception as e:
+        except BaseException as e:
             result_holder["error"] = e
             if not enter_event.is_set():
                 enter_event.set()
@@ -1187,9 +1530,10 @@ def _build_agent_lifecycle(
         async def __aexit__(self, exc_type, exc_val, exc_tb):
             self.exit_event.set()
             try:
-                await asyncio.wrap_future(self.future)
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(asyncio.wrap_future(self.future), timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                if not self.future.done():
+                    self.future.cancel()
 
     async def _wait_for_enter():
         await enter_event.wait()
@@ -1252,6 +1596,13 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
         LocalAgentConfig,
     )
 
+    # `conversation_id` is forwarded to the SDK as the harness `cascade_id`
+    # (resume key): a non-empty value tells the local harness to reload that
+    # trajectory from `save_dir`. It MUST reference a conversation the harness
+    # previously persisted; an unknown id fails startup ("conversation not
+    # found"). Leave it unset to start a fresh conversation — the harness then
+    # assigns an id, which the bridge captures (see the `_cascade_id`
+    # monkeypatch) and exposes via `AgentHandle::conversation_id`.
     config = LocalAgentConfig(triggers=sdk_triggers, **local_config)
     agent = agent_cls(config)
 

@@ -158,9 +158,7 @@ mod tests {
                 .expect("send");
             writer
                 .error_tx
-                .send(StreamError {
-                    message: "Python exception: quota exceeded".to_owned(),
-                })
+                .send(StreamError::new("Python exception: quota exceeded"))
                 .await
                 .expect("send error");
         });
@@ -276,17 +274,13 @@ mod tests {
 
     #[test]
     fn stream_error_display() {
-        let err = StreamError {
-            message: "quota exceeded".to_owned(),
-        };
+        let err = StreamError::new("quota exceeded");
         assert_eq!(format!("{err}"), "stream error: quota exceeded");
     }
 
     #[test]
     fn stream_error_is_std_error() {
-        let err = StreamError {
-            message: "test".to_owned(),
-        };
+        let err = StreamError::new("test");
         // Verify it implements std::error::Error
         let _: &dyn std::error::Error = &err;
     }
@@ -528,6 +522,8 @@ mod tests {
                 .send(crate::types::Step {
                     id: "step-0".to_owned(),
                     step_index: 0,
+                    trajectory_id: String::new(),
+                    cascade_id: String::new(),
                     step_type: crate::types::StepType::TextResponse,
                     source: crate::types::StepSource::Model,
                     target: crate::types::StepTarget::User,
@@ -829,9 +825,9 @@ mod tests {
             // Simulate a backend 503 error step — this is what the SDK sends
             // when GenerateContent fails after exhausting retries.
             error_tx
-                .try_send(StreamError {
-                    message: "Agent execution terminated due to error. (request failed (code 503): APP_ERROR(2))".to_owned(),
-                })
+                .try_send(StreamError::new(
+                    "Agent execution terminated due to error. (request failed (code 503): APP_ERROR(2))",
+                ))
                 .expect("error_tx should accept");
             step_tx
                 .send(crate::types::Step {
@@ -902,14 +898,10 @@ mod tests {
         let producer = async move {
             // First error — should succeed
             error_tx
-                .try_send(StreamError {
-                    message: "first error".to_owned(),
-                })
+                .try_send(StreamError::new("first error"))
                 .expect("first try_send should succeed");
             // Second error — should fail (channel full), not block
-            let second = error_tx.try_send(StreamError {
-                message: "second error".to_owned(),
-            });
+            let second = error_tx.try_send(StreamError::new("second error"));
             second.expect_err("Second try_send should fail (channel full)");
             // Close text channel so handle.text() can finish draining.
             drop(text_tx);
@@ -943,9 +935,7 @@ mod tests {
                 .expect("text send");
             // Then backend error
             error_tx
-                .try_send(StreamError {
-                    message: "connection reset during streaming".to_owned(),
-                })
+                .try_send(StreamError::new("connection reset during streaming"))
                 .expect("error send");
             // text_tx is dropped here, closing the text channel.
         };
@@ -981,9 +971,7 @@ mod tests {
 
         let producer = async move {
             error_tx
-                .try_send(StreamError {
-                    message: "model 503".to_owned(),
-                })
+                .try_send(StreamError::new("model 503"))
                 .expect("error send");
             step_tx.send(error_step).await.expect("step send");
         };
@@ -996,5 +984,57 @@ mod tests {
         };
 
         tokio::join!(producer, consumer);
+    }
+
+    #[tokio::test]
+    async fn dropping_one_stream_channel_does_not_affect_sibling_streams() {
+        use tokio_stream::StreamExt;
+
+        const TOKENS: [&str; 3] = ["chunk1 ", "chunk2 ", "chunk3"];
+        const EXPECTED_OUTPUT: &str = "chunk1 chunk2 chunk3";
+
+        // Channel pair A and Channel pair B represent two concurrent turns on the bridge
+        let (writer_a, mut handle_a) = channel();
+        let (writer_b, mut handle_b) = channel();
+
+        // Consumer A subscribes to chunks and immediately drops the stream & handle
+        let stream_a = handle_a.receive_chunks().expect("stream a");
+        drop(stream_a);
+        drop(handle_a);
+
+        // Writer A attempt to send must fail with a WriterError because the receiver is closed
+        let send_a_result = writer_a
+            .send_chunk(StreamChunk::Text("dropped token".to_string()))
+            .await;
+        let err = send_a_result.expect_err("Expected WriterError for dropped stream receiver");
+        assert!(
+            err.message.contains("channel send failed"),
+            "Expected 'channel send failed' in error message, got: {err}"
+        );
+        drop(writer_a);
+
+        // Writer B and Consumer B continue streaming without interference
+        let produce_b = async move {
+            for token in TOKENS {
+                writer_b
+                    .send_chunk(StreamChunk::Text(token.to_string()))
+                    .await
+                    .expect("writer_b send_chunk must succeed");
+            }
+            drop(writer_b);
+        };
+
+        let consume_b = async move {
+            let mut chunks = handle_b.receive_chunks().expect("stream b");
+            let mut collected = String::new();
+            while let Some(chunk) = chunks.next().await {
+                if let StreamChunk::Text(t) = chunk {
+                    collected.push_str(&t);
+                }
+            }
+            assert_eq!(collected, EXPECTED_OUTPUT);
+        };
+
+        tokio::join!(produce_b, consume_b);
     }
 }

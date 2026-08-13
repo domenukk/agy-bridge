@@ -38,6 +38,12 @@ pub enum BuiltinTools {
     /// Generate images from text prompts.
     #[serde(rename = "generate_image")]
     GenerateImage,
+    /// Search the web for information.
+    #[serde(rename = "search_web")]
+    SearchWeb,
+    /// Fetch content from a URL via HTTP request.
+    #[serde(rename = "read_url_content")]
+    ReadUrlContent,
     /// Signal task completion.
     #[serde(rename = "finish")]
     Finish,
@@ -52,6 +58,7 @@ impl BuiltinTools {
             Self::SearchDir,
             Self::FindFile,
             Self::ViewFile,
+            Self::ReadUrlContent,
             Self::Finish,
         ]
     }
@@ -69,6 +76,8 @@ impl BuiltinTools {
             Self::AskQuestion,
             Self::StartSubagent,
             Self::GenerateImage,
+            Self::SearchWeb,
+            Self::ReadUrlContent,
             Self::Finish,
         ]
     }
@@ -87,6 +96,8 @@ impl BuiltinTools {
             Self::AskQuestion,
             Self::StartSubagent,
             Self::GenerateImage,
+            Self::SearchWeb,
+            Self::ReadUrlContent,
             Self::Finish,
         ]
     }
@@ -120,6 +131,8 @@ impl BuiltinTools {
             Self::AskQuestion => "ask_question",
             Self::StartSubagent => "start_subagent",
             Self::GenerateImage => "generate_image",
+            Self::SearchWeb => "search_web",
+            Self::ReadUrlContent => "read_url_content",
             Self::Finish => "finish",
         }
     }
@@ -138,6 +151,8 @@ impl BuiltinTools {
             Self::AskQuestion => "Ask the user a question.",
             Self::StartSubagent => "Spawn a subagent.",
             Self::GenerateImage => "Generate images from text prompts.",
+            Self::SearchWeb => "Search the web for information.",
+            Self::ReadUrlContent => "Fetch content from a URL via HTTP request.",
             Self::Finish => "Signal task completion.",
         }
     }
@@ -262,17 +277,26 @@ mod tests {
     #[test]
     fn test_builtin_tools() {
         let read_only = BuiltinTools::read_only();
-        assert_eq!(read_only.len(), 5);
+        assert_eq!(read_only.len(), 6);
         assert!(read_only.contains(&BuiltinTools::ListDir));
+        assert!(!read_only.contains(&BuiltinTools::SearchWeb));
+        assert!(read_only.contains(&BuiltinTools::ReadUrlContent));
         assert!(read_only.contains(&BuiltinTools::Finish));
         assert!(!read_only.contains(&BuiltinTools::CreateFile));
 
         let all = BuiltinTools::all_tools();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 13);
         assert!(all.contains(&BuiltinTools::CreateFile));
         assert!(all.contains(&BuiltinTools::Finish));
+        assert!(all.contains(&BuiltinTools::SearchWeb));
+        assert!(all.contains(&BuiltinTools::ReadUrlContent));
 
         assert_eq!(BuiltinTools::ListDir.as_sdk_name(), "list_directory");
+        assert_eq!(BuiltinTools::SearchWeb.as_sdk_name(), "search_web");
+        assert_eq!(
+            BuiltinTools::ReadUrlContent.as_sdk_name(),
+            "read_url_content"
+        );
     }
 
     #[test]
@@ -312,6 +336,8 @@ mod tests {
             (BuiltinTools::AskQuestion, "ask_question"),
             (BuiltinTools::StartSubagent, "start_subagent"),
             (BuiltinTools::GenerateImage, "generate_image"),
+            (BuiltinTools::SearchWeb, "search_web"),
+            (BuiltinTools::ReadUrlContent, "read_url_content"),
             (BuiltinTools::Finish, "finish"),
         ];
         for (variant, py_str) in expected {

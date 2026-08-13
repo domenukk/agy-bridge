@@ -137,6 +137,8 @@ define_sdk_enum! {
         Compaction => "COMPACTION",
         /// The agent has signaled task completion.
         Finish => "FINISH",
+        /// Internal model thinking / reasoning step.
+        Thinking => "THINKING",
         /// Unrecognized step type (forward-compatibility fallback).
         #[default]
         Unknown => "UNKNOWN",
@@ -325,6 +327,25 @@ pub struct Step {
     /// Integer index of the step in the trajectory.
     #[serde(default)]
     pub step_index: u32,
+    /// Identifier of the trajectory this step belongs to.
+    ///
+    /// The SDK's connection layer assigns one trajectory id per agent
+    /// trajectory. Compare with [`cascade_id`](Self::cascade_id) to tell a
+    /// primary-agent step (`trajectory_id == cascade_id`) apart from a subagent
+    /// step (`trajectory_id != cascade_id`); see [`Step::is_subagent_step`].
+    /// Empty when the harness did not report one.
+    #[serde(default)]
+    #[builder(setter(into))]
+    pub trajectory_id: String,
+    /// Identifier of the top-level cascade — i.e. the primary agent trajectory.
+    ///
+    /// Every step in a turn, primary and subagent alike, shares the same
+    /// `cascade_id`, so it identifies the parent trajectory. A step originates
+    /// from a subagent when its [`trajectory_id`](Self::trajectory_id) differs
+    /// from this value. Empty when the harness did not report one.
+    #[serde(default)]
+    #[builder(setter(into))]
+    pub cascade_id: String,
     /// The high-level type of the step.
     #[serde(default, rename = "type")]
     pub step_type: StepType,
@@ -387,6 +408,25 @@ pub struct Step {
     pub usage_metadata: Option<UsageMetadata>,
 }
 
+impl Step {
+    /// Whether this step originates from a subagent trajectory rather than the
+    /// primary agent's.
+    ///
+    /// Mirrors the SDK's own parent/subagent discrimination
+    /// (`cascade_id AND trajectory_id AND trajectory_id != cascade_id`): a step
+    /// is a subagent step only when it carries a known parent
+    /// [`cascade_id`](Self::cascade_id) *and* a
+    /// [`trajectory_id`](Self::trajectory_id) that differs from it. Steps
+    /// missing either id — e.g. from mocks or older harnesses — are treated as
+    /// primary.
+    #[must_use]
+    pub fn is_subagent_step(&self) -> bool {
+        !self.cascade_id.is_empty()
+            && !self.trajectory_id.is_empty()
+            && self.trajectory_id != self.cascade_id
+    }
+}
+
 macro_rules! impl_from_py_object {
     ($($t:ty),+) => {
         $(
@@ -437,6 +477,7 @@ mod tests {
             (StepType::SystemMessage, "\"SYSTEM_MESSAGE\""),
             (StepType::Compaction, "\"COMPACTION\""),
             (StepType::Finish, "\"FINISH\""),
+            (StepType::Thinking, "\"THINKING\""),
             (StepType::Unknown, "\"UNKNOWN\""),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
@@ -465,6 +506,7 @@ mod tests {
             StepType::Compaction
         );
         assert_eq!("FINISH".parse::<StepType>().unwrap(), StepType::Finish);
+        assert_eq!("THINKING".parse::<StepType>().unwrap(), StepType::Thinking);
     }
 
     #[test]
@@ -611,6 +653,8 @@ mod tests {
         let step = Step {
             id: "traj:0".to_string(),
             step_index: 3,
+            trajectory_id: "traj-sub".to_string(),
+            cascade_id: "traj-root".to_string(),
             step_type: StepType::ToolCall,
             source: StepSource::Model,
             target: StepTarget::Environment,
@@ -643,6 +687,8 @@ mod tests {
         assert_eq!(parsed, step);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "run_command");
+        // trajectory_id differs from cascade_id => subagent step.
+        assert!(parsed.is_subagent_step());
     }
 
     #[test]
@@ -665,6 +711,51 @@ mod tests {
         assert!(step.is_complete_response.is_none());
         assert!(step.structured_output.is_none());
         assert!(step.usage_metadata.is_none());
+        // No trajectory info => defaults to a primary (non-subagent) step.
+        assert!(step.trajectory_id.is_empty());
+        assert!(step.cascade_id.is_empty());
+        assert!(!step.is_subagent_step());
+    }
+
+    #[test]
+    fn is_subagent_step_matches_sdk_discrimination() {
+        // Primary step: trajectory_id == cascade_id (the SDK's parent rule).
+        let primary = Step {
+            trajectory_id: "traj-root".to_string(),
+            cascade_id: "traj-root".to_string(),
+            ..Step::default()
+        };
+        assert!(!primary.is_subagent_step());
+
+        // Subagent step: trajectory_id differs from the cascade (parent) id.
+        let subagent = Step {
+            trajectory_id: "traj-child".to_string(),
+            cascade_id: "traj-root".to_string(),
+            ..Step::default()
+        };
+        assert!(subagent.is_subagent_step());
+
+        // A trajectory_id with an empty cascade_id is treated as primary: the
+        // SDK only flags a subagent when the parent cascade id is known,
+        // matching the guard `cascade_id and trajectory_id and trajectory_id !=
+        // cascade_id`.
+        let no_cascade = Step {
+            trajectory_id: "traj-child".to_string(),
+            cascade_id: String::new(),
+            ..Step::default()
+        };
+        assert!(!no_cascade.is_subagent_step());
+    }
+
+    #[test]
+    fn step_deserializes_trajectory_and_cascade_ids() {
+        // The SDK's LocalConnectionStep emits these as top-level fields via
+        // model_dump(); verify they round-trip through our extraction path.
+        let json = r#"{"id":"s","trajectory_id":"t","cascade_id":"c"}"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.trajectory_id, "t");
+        assert_eq!(step.cascade_id, "c");
+        assert!(step.is_subagent_step());
     }
 
     // =========================================================================
@@ -676,6 +767,8 @@ mod tests {
         let step = Step {
             id: "multi-tc".to_string(),
             step_index: 7,
+            trajectory_id: String::new(),
+            cascade_id: String::new(),
             step_type: StepType::ToolCall,
             source: StepSource::Model,
             target: StepTarget::Environment,
@@ -836,6 +929,7 @@ mod tests {
         assert_eq!(StepType::SystemMessage.to_string(), "SYSTEM_MESSAGE");
         assert_eq!(StepType::Compaction.to_string(), "COMPACTION");
         assert_eq!(StepType::Finish.to_string(), "FINISH");
+        assert_eq!(StepType::Thinking.to_string(), "THINKING");
         assert_eq!(StepType::Unknown.to_string(), "UNKNOWN");
     }
 
@@ -877,6 +971,7 @@ mod tests {
             StepType::SystemMessage,
             StepType::Compaction,
             StepType::Finish,
+            StepType::Thinking,
             StepType::Unknown,
         ] {
             let s = variant.to_string();
@@ -1030,6 +1125,8 @@ mod tests {
         let step = Step {
             id: "s2".to_string(),
             step_index: 1,
+            trajectory_id: String::new(),
+            cascade_id: String::new(),
             step_type: StepType::TextResponse,
             source: StepSource::Model,
             target: StepTarget::User,
@@ -1060,6 +1157,8 @@ mod tests {
         let step = Step {
             id: "finish-1".to_string(),
             step_index: 5,
+            trajectory_id: String::new(),
+            cascade_id: String::new(),
             step_type: StepType::Finish,
             source: StepSource::Model,
             target: StepTarget::User,

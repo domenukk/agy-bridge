@@ -381,60 +381,34 @@ impl<R: Runtime> AgentHandle<R> {
     }
 
     /// Perform a single (non-retrying) chat turn and drain it to text.
-    ///
-    /// A stream error encountered while draining is mapped to a
-    /// [`Error::BackendError`], preserving [`Error::is_quota_error`] semantics so
-    /// the caller's retry loop can react to quota errors that only surface here.
     async fn chat_text_once(&self, content: &Content) -> Result<String, Error> {
         let response = self.chat_once(content).await?;
-        match response.text().await {
-            Ok(text) => Ok(text.into_string()),
-            Err(stream_err) => Err(Error::BackendError {
-                message: format!(
-                    "Failed to read response text: stream error: {}",
-                    stream_err.message
-                ),
-            }),
-        }
+        let text = response.text().await?;
+        Ok(text.into_string())
     }
 
-    /// Return the current conversation ID, if one has been set.
+    /// Return this agent's SDK conversation id, if one is known.
+    ///
+    /// This mirrors the Antigravity SDK session: it is the trajectory
+    /// (`cascade_id`) that the local harness assigns during the first turn, and
+    /// becomes available once that turn has started. If you supplied a
+    /// [`conversation_id`](crate::config::AgentConfig::conversation_id) to
+    /// resume a prior conversation, this returns that same id. Before the first
+    /// turn (or for a never-run agent) it is `None`.
+    ///
+    /// Persist the returned id (together with the agent's
+    /// [`save_dir`](crate::config::AgentConfig::save_dir)) to resume the
+    /// conversation later.
     ///
     /// Returns a cloned `String` because the underlying value is behind a
     /// [`Mutex`] (interior mutability for `&self` access).
     #[must_use]
     pub fn conversation_id(&self) -> Option<String> {
-        self.conversation_id
-            .lock()
-            .inspect_err(|e| {
-                tracing::error!(
-                    agent_id = self.id,
-                    error = %e,
-                    "conversation_id mutex poisoned"
-                );
-            })
-            // NOLINT: error already logged via inspect_err above; .ok() converts to Option for the return type
-            .ok()
-            .and_then(|guard| guard.clone())
-    }
-
-    /// Set the conversation ID (called when the SDK assigns one).
-    ///
-    /// Takes `&self` rather than `&mut self` so the handle can be shared
-    /// across concurrent tasks.
-    pub fn set_conversation_id(&self, id: String) {
-        match self.conversation_id.lock() {
-            Ok(mut guard) => {
-                *guard = Some(id);
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent_id = self.id,
-                    error = %e,
-                    "conversation_id mutex poisoned — ID will not be updated"
-                );
-            }
-        }
+        let guard = self.conversation_id.lock().unwrap_or_else(|e| {
+            tracing::warn!(agent_id = self.id, error = %e, "conversation_id mutex was poisoned, recovering");
+            e.into_inner()
+        });
+        guard.clone()
     }
 
     /// Check whether the agent has been started and is not yet shut down.
@@ -597,37 +571,29 @@ impl<R: Runtime> AgentHandle<R> {
         self.runtime.is_idle(self.id).await
     }
 
-    /// Return the structured output from the last chat response, if any.
+    /// Return the structured output from the last chat response as raw JSON.
     ///
-    /// Only populated after a [`chat()`](Self::chat) round-trip when the
-    /// agent was configured with a `response_schema` and the model returned
-    /// a valid JSON payload.
+    /// Returns `None` if the agent was not configured with `response_schema`
+    /// or if the model did not produce structured output.
     #[must_use]
     pub fn get_last_structured_output(&self) -> Option<serde_json::Value> {
-        let guard = self
-            .last_shared_state
-            .lock()
-            .inspect_err(|e| {
-                tracing::error!(
-                    agent_id = self.id,
-                    error = %e,
-                    "last_shared_state mutex poisoned in get_last_structured_output"
-                );
-            })
-            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
-            .ok()?;
-        let state = guard
-            .as_ref()?
-            .lock()
-            .inspect_err(|e| {
-                tracing::error!(
-                    agent_id = self.id,
-                    error = %e,
-                    "ChatResponseSharedState mutex poisoned in get_last_structured_output"
-                );
-            })
-            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
-            .ok()?;
+        let guard = self.last_shared_state.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                agent_id = self.id,
+                error = %e,
+                "last_shared_state mutex was poisoned, recovering"
+            );
+            e.into_inner()
+        });
+        let state_arc = guard.as_ref()?;
+        let state = state_arc.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                agent_id = self.id,
+                error = %e,
+                "ChatResponseSharedState mutex was poisoned, recovering"
+            );
+            e.into_inner()
+        });
         state.structured_output.clone()
     }
 
@@ -645,30 +611,23 @@ impl<R: Runtime> AgentHandle<R> {
     /// Return the usage metadata from the last chat response, if any.
     #[must_use]
     pub fn get_last_usage(&self) -> Option<UsageMetadata> {
-        let guard = self
-            .last_shared_state
-            .lock()
-            .inspect_err(|e| {
-                tracing::error!(
-                    agent_id = self.id,
-                    error = %e,
-                    "last_shared_state mutex poisoned in get_last_usage"
-                );
-            })
-            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
-            .ok()?;
-        let state = guard
-            .as_ref()?
-            .lock()
-            .inspect_err(|e| {
-                tracing::error!(
-                    agent_id = self.id,
-                    error = %e,
-                    "ChatResponseSharedState mutex poisoned in get_last_usage"
-                );
-            })
-            // NOLINT: error already logged via inspect_err above; .ok()? propagates None on poison
-            .ok()?;
+        let guard = self.last_shared_state.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                agent_id = self.id,
+                error = %e,
+                "last_shared_state mutex was poisoned, recovering"
+            );
+            e.into_inner()
+        });
+        let state_arc = guard.as_ref()?;
+        let state = state_arc.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                agent_id = self.id,
+                error = %e,
+                "ChatResponseSharedState mutex was poisoned, recovering"
+            );
+            e.into_inner()
+        });
         state.usage.clone()
     }
 

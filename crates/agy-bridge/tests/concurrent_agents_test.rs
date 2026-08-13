@@ -4,7 +4,7 @@
 //! that execute chat turns concurrently to verify there are no deadlocks.
 
 use std::sync::{
-    Arc, LazyLock,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -12,13 +12,6 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
 };
-
-static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
-    agy_bridge::AgyBridge::builder()
-        .inter_agent_delay(std::time::Duration::ZERO)
-        .build()
-        .expect("shared AgyBridge")
-});
 
 // ─── Mock Server ─────────────────────────────────────────────────────────────
 
@@ -94,17 +87,41 @@ fn sse_response(json_body: &str) -> String {
 
 fn model_list_json() -> String {
     serde_json::json!({
-        "models": [{
-            "name": "models/gemini-2.0-flash",
-            "displayName": "Gemini 2.0 Flash",
-            "supportedGenerationMethods": [
-                "generateContent",
-                "streamGenerateContent",
-                "countTokens"
-            ],
-            "inputTokenLimit": 1_048_576,
-            "outputTokenLimit": 8192
-        }]
+        "models": [
+            {
+                "name": "models/gemini-3.6-flash",
+                "displayName": "Gemini 3.6 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            },
+            {
+                "name": "models/gemini-3.5-flash",
+                "displayName": "Gemini 3.5 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            },
+            {
+                "name": "models/gemini-2.0-flash",
+                "displayName": "Gemini 2.0 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            }
+        ]
     })
     .to_string()
 }
@@ -212,12 +229,20 @@ fn multiple_concurrent_agents_no_deadlock() {
         let base_url = server.base_url();
         eprintln!("Mock concurrent server listening on {base_url}");
 
+        let bridge = Arc::new(
+            agy_bridge::AgyBridge::builder()
+                .inter_agent_delay(std::time::Duration::ZERO)
+                .build()
+                .expect("AgyBridge"),
+        );
+
         let num_agents = 5usize;
         let num_turns = 3usize;
         let mut tasks = Vec::new();
 
         for i in 0..num_agents {
             let base_url = base_url.clone();
+            let bridge = Arc::clone(&bridge);
             tasks.push(tokio::spawn(async move {
                 let gemini = agy_bridge::config::GeminiConfig {
                     api_key: Some(format!("key-{i}")),
@@ -229,9 +254,10 @@ fn multiple_concurrent_agents_no_deadlock() {
                     .system_instructions(format!("Agent {i}"))
                     .gemini(gemini)
                     .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+                    .retry_config(agy_bridge::config::RetryConfig::no_retries())
                     .build();
 
-                let agent = BRIDGE.agent(config).await.expect("create agent");
+                let agent = bridge.agent(config).await.expect("create agent");
 
                 for turn in 0..num_turns {
                     // Small delay to stagger execution and mix threads

@@ -384,12 +384,21 @@ fn live_rust_tool_metadata() {
                 .chat_text("Call structured_metadata_tool and tell me the result")
                 .await?;
 
-            let meta = metadata_capture.lock().unwrap().clone();
+            let mut meta = serde_json::Value::Null;
+            for _ in 0..50 {
+                meta = metadata_capture.lock().unwrap().clone();
+                if meta != serde_json::Value::Null {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
             assert_eq!(meta["some_code"], 42, "metadata should contain some_code");
             assert_eq!(
                 meta["result"], "Structured metadata works",
                 "metadata should contain result"
             );
+            agent.shutdown().await?;
             Ok(())
         })
     });
@@ -451,7 +460,10 @@ fn live_custom_tool_observes_conversation_id() {
                     "When asked who you are or for your conversation id, ALWAYS call the \
                      who_am_i tool and report exactly what it returns.",
                 )
-                .conversation_id("conv-live-abc123")
+                // Do NOT set `conversation_id`: it is an SDK resume key. For a
+                // fresh conversation the local harness assigns the id, and the
+                // bridge faithfully surfaces it — both through the custom tool's
+                // `ToolContext` and through `AgentHandle::conversation_id`.
                 .policies([agy_bridge::policies::PolicyRule::AllowAll])
                 .build();
 
@@ -459,14 +471,64 @@ fn live_custom_tool_observes_conversation_id() {
             let _text = agent
                 .chat_text("Call the who_am_i tool and tell me the result.")
                 .await?;
+            // The handle must expose the same SDK-assigned id the tool observed.
+            let handle_id = agent.conversation_id();
             agent.shutdown().await?;
 
             let observed = captured.lock().unwrap().clone();
-            assert_eq!(
-                observed.as_deref(),
-                Some("conv-live-abc123"),
-                "custom tool must observe the agent's conversation_id via ToolContext"
+            let observed = observed.expect("custom tool must observe a conversation_id");
+            assert!(
+                !observed.is_empty() && observed != "unknown",
+                "tool must observe the harness-assigned conversation_id, got {observed:?}"
             );
+            assert_eq!(
+                Some(observed.as_str()),
+                handle_id.as_deref(),
+                "tool's ToolContext id must match AgentHandle::conversation_id"
+            );
+            Ok(())
+        })
+    });
+}
+
+// =============================================================================
+// Test: Agent with SDK 0.1.10 new builtin tools (SearchWeb, ReadUrlContent)
+// =============================================================================
+
+#[test]
+fn live_agent_with_new_builtin_tools() {
+    run_live_test("live_agent_with_new_builtin_tools", || {
+        let _api_key = api_key();
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            let bridge = create_bridge();
+            let config = agy_bridge::config::AgentConfig::builder()
+                .capabilities(agy_bridge::config::CapabilitiesConfig::with_tools(vec![
+                    agy_bridge::config::BuiltinTools::SearchWeb,
+                    agy_bridge::config::BuiltinTools::ReadUrlContent,
+                ]))
+                .system_instructions("Reply with exactly: PONG")
+                .build();
+
+            let agent = bridge.agent(config).await?;
+            let tools = agent.available_tools();
+            assert!(
+                tools.iter().any(|t| t.name == "search_web"),
+                "available_tools must contain search_web"
+            );
+            assert!(
+                tools.iter().any(|t| t.name == "read_url_content"),
+                "available_tools must contain read_url_content"
+            );
+
+            let text = agent.chat_text("PING").await?;
+            assert!(
+                text.to_lowercase().contains("pong"),
+                "Agent should reply with PONG, got: {text}"
+            );
+
+            agent.shutdown().await?;
             Ok(())
         })
     });

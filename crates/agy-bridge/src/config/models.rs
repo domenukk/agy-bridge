@@ -10,7 +10,7 @@ use super::{DEFAULT_IMAGE_GENERATION_MODEL, DEFAULT_MODEL};
 /// of increased latency and token usage.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum ThinkingLevel {
     /// Least reasoning depth; fastest and cheapest.
@@ -20,8 +20,10 @@ pub enum ThinkingLevel {
     /// Balanced reasoning depth (the default).
     #[default]
     Medium,
-    /// Maximum reasoning depth; highest latency and token usage.
+    /// High reasoning depth.
     High,
+    /// Maximum reasoning depth; highest latency and token usage.
+    ExtraHigh,
 }
 
 impl ThinkingLevel {
@@ -33,6 +35,7 @@ impl ThinkingLevel {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::ExtraHigh => "extra_high",
         }
     }
 }
@@ -259,6 +262,7 @@ mod tests {
         assert_eq!(ThinkingLevel::Low.as_str(), "low");
         assert_eq!(ThinkingLevel::Medium.as_str(), "medium");
         assert_eq!(ThinkingLevel::High.as_str(), "high");
+        assert_eq!(ThinkingLevel::ExtraHigh.as_str(), "extra_high");
     }
 
     #[test]
@@ -268,6 +272,7 @@ mod tests {
             (ThinkingLevel::Low, "\"low\""),
             (ThinkingLevel::Medium, "\"medium\""),
             (ThinkingLevel::High, "\"high\""),
+            (ThinkingLevel::ExtraHigh, "\"extra_high\""),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected);

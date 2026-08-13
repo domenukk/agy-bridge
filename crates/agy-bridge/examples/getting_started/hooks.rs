@@ -22,6 +22,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
                 "  [hook:turn_logger] Turn {} prompt: {}",
                 ctx.turn_number, ctx.prompt
             );
+            HookResult::allow()
         })
         // Gate hook: denies calls to "dangerous_tool".
         .with_pre_tool_call_decide("safety_gate", |ctx: &PreToolCallDecideContext| {

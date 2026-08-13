@@ -18,7 +18,7 @@
 //! ```
 
 use std::sync::{
-    Arc, LazyLock,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -28,18 +28,11 @@ use tokio::{
     sync::Mutex,
 };
 
-// ─── Shared Bridge ───────────────────────────────────────────────────────────
+// ─── Helper ──────────────────────────────────────────────────────────────────
 
-/// All tests in this file share a single `AgyBridge` instance for convenience
-/// (fewer runtime threads to spin up). This is *not* a requirement: multiple
-/// bridges — each with its own Python runtime thread and event loop — can
-/// coexist in one process and be used concurrently (see `concurrency_test`).
-/// This `LazyLock` simply creates the shared bridge once and reuses it.
-static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
-    agy_bridge::AgyBridge::builder()
-        .build()
-        .expect("shared AgyBridge")
-});
+fn test_bridge() -> agy_bridge::AgyBridge {
+    agy_bridge::AgyBridge::builder().build().expect("AgyBridge")
+}
 
 // ─── Mock Server ─────────────────────────────────────────────────────────────
 
@@ -165,6 +158,16 @@ fn sse_response(json_body: &str) -> String {
 fn model_list_json() -> String {
     serde_json::json!({
         "models": [{
+            "name": "models/gemini-3.6-flash",
+            "displayName": "Gemini 3.6 Flash",
+            "supportedGenerationMethods": [
+                "generateContent",
+                "streamGenerateContent",
+                "countTokens"
+            ],
+            "inputTokenLimit": 1_048_576,
+            "outputTokenLimit": 65_536
+        }, {
             "name": "models/gemini-2.0-flash",
             "displayName": "Gemini 2.0 Flash",
             "supportedGenerationMethods": [
@@ -325,6 +328,8 @@ fn base_url_routes_requests_to_custom_endpoint() {
         let base_url = server.base_url();
         eprintln!("Mock server listening on {base_url}");
 
+        let bridge = test_bridge();
+
         let gemini = agy_bridge::config::GeminiConfig {
             api_key: Some("test-key-for-mock".to_string()),
             base_url: Some(base_url.clone()),
@@ -335,9 +340,10 @@ fn base_url_routes_requests_to_custom_endpoint() {
             .system_instructions("Reply with exactly: PONG")
             .gemini(gemini)
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+            .retry_config(agy_bridge::config::RetryConfig::no_retries())
             .build();
 
-        let agent = BRIDGE.agent(config).await.expect("create agent");
+        let agent = bridge.agent(config).await.expect("create agent");
 
         let result = agent.chat_text("PING").await;
         eprintln!("Chat result: {result:?}");
@@ -396,6 +402,8 @@ fn multiple_agents_use_independent_base_urls() {
         eprintln!("Server A: {url_a}");
         eprintln!("Server B: {url_b}");
 
+        let bridge = test_bridge();
+
         let config_a = agy_bridge::config::AgentConfig::builder()
             .system_instructions("Agent A")
             .gemini(agy_bridge::config::GeminiConfig {
@@ -404,6 +412,7 @@ fn multiple_agents_use_independent_base_urls() {
                 models: agy_bridge::config::ModelConfig::default(),
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+            .retry_config(agy_bridge::config::RetryConfig::no_retries())
             .build();
 
         let config_b = agy_bridge::config::AgentConfig::builder()
@@ -414,10 +423,11 @@ fn multiple_agents_use_independent_base_urls() {
                 models: agy_bridge::config::ModelConfig::default(),
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+            .retry_config(agy_bridge::config::RetryConfig::no_retries())
             .build();
 
-        let agent_a = BRIDGE.agent(config_a).await.expect("create agent A");
-        let agent_b = BRIDGE.agent(config_b).await.expect("create agent B");
+        let agent_a = bridge.agent(config_a).await.expect("create agent A");
+        let agent_b = bridge.agent(config_b).await.expect("create agent B");
 
         if let Err(e) = agent_a.chat_text("Hello from A").await {
             eprintln!("Agent A chat error (expected with mock): {e}");

@@ -7,6 +7,7 @@
 //! - `Hooks` for callback storage + `HookEntry` config for the builder
 
 use std::{
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -37,68 +38,81 @@ fn send_notification(
 
 /// Check whether `tool_name` has exceeded `max_calls` within `window`.
 ///
-/// Returns `(current_count, is_at_limit)`.  If not at the limit, the
+/// Returns `(current_count, is_at_limit)`. If not at the limit, the
 /// current timestamp is recorded.
 fn check_rate_limit(
-    calls: &Mutex<std::collections::HashMap<String, Vec<Instant>>>,
+    calls: &Mutex<HashMap<String, VecDeque<Instant>>>,
     tool_name: &str,
     max_calls: usize,
     window: Duration,
 ) -> (usize, bool) {
-    let mut map = calls.lock().unwrap();
-    let history = map.entry(tool_name.to_owned()).or_default();
+    let mut map = match calls.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let history = match map.get_mut(tool_name) {
+        Some(history) => history,
+        None => map.entry(tool_name.to_owned()).or_default(),
+    };
     let now = Instant::now();
-    history.retain(|t| now.duration_since(*t) < window);
+    // Sliding window: timestamps are monotonically ordered, so pop expired entries from front in O(1).
+    while let Some(&front) = history.front() {
+        if now.duration_since(front) >= window {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
     let at_limit = history.len() >= max_calls;
     if !at_limit {
-        history.push(now);
+        history.push_back(now);
     }
-    let count = history.len();
-    drop(map);
-    (count, at_limit)
+    (history.len(), at_limit)
 }
 
-fn register_rate_limit_hook(runner: &mut Hooks) {
-    let calls = Arc::new(Mutex::new(
-        std::collections::HashMap::<String, Vec<Instant>>::new(),
-    ));
+fn build_middleware_hooks(audit_log: &Arc<Mutex<Vec<String>>>) -> Hooks {
+    let calls = Arc::new(Mutex::new(HashMap::<String, VecDeque<Instant>>::new()));
     let max_calls = 3;
     let window = Duration::from_mins(1);
 
-    runner.on_pre_tool_call_decide("rate_limit", move |ctx| {
-        let (count, at_limit) = check_rate_limit(&calls, &ctx.tool_name, max_calls, window);
-        if at_limit {
-            println!(
-                "  🚫 [RateLimit] Denied {} ({count} calls in {}s)",
-                ctx.tool_name,
-                window.as_secs()
-            );
-            HookResult::deny(format!(
-                "Rate limit exceeded: {} called {max_calls} times",
-                ctx.tool_name
-            ))
-        } else {
-            HookResult::allow()
-        }
-    });
-}
+    let log_audit = Arc::clone(audit_log);
+    let log_fallback = Arc::clone(audit_log);
 
-fn register_audit_log_hook(runner: &mut Hooks, audit_log: &Arc<Mutex<Vec<String>>>) {
-    let log = Arc::clone(audit_log);
-    runner.on_post_tool_call("audit_log", move |ctx| {
-        let entry = format!("✅ {}: {}", ctx.tool_name, ctx.result);
-        println!("  📝 [Audit] {entry}");
-        log.lock().unwrap().push(entry);
-    });
-}
-
-fn register_fallback_hook(runner: &mut Hooks, audit_log: &Arc<Mutex<Vec<String>>>) {
-    let log = Arc::clone(audit_log);
-    runner.on_tool_error("fallback", move |ctx| {
-        let entry = format!("❌ {}: {}", ctx.tool_name, ctx.error);
-        println!("  🔧 [Fallback] {entry}");
-        log.lock().unwrap().push(entry);
-    });
+    Hooks::new()
+        .with_pre_tool_call_decide("rate_limit", move |ctx| {
+            let (count, at_limit) = check_rate_limit(&calls, &ctx.tool_name, max_calls, window);
+            if at_limit {
+                println!(
+                    "  🚫 [RateLimit] Denied {} ({count} calls in {}s)",
+                    ctx.tool_name,
+                    window.as_secs()
+                );
+                HookResult::deny(format!(
+                    "Rate limit exceeded: {} called {max_calls} times",
+                    ctx.tool_name
+                ))
+            } else {
+                HookResult::allow()
+            }
+        })
+        .with_post_tool_call("audit_log", move |ctx| {
+            let entry = format!("✅ {}: {}", ctx.tool_name, ctx.result);
+            println!("  📝 [Audit] {entry}");
+            match log_audit.lock() {
+                Ok(mut log) => log.push(entry),
+                Err(poisoned) => poisoned.into_inner().push(entry),
+            }
+        })
+        .with_tool_error("fallback", move |ctx| {
+            let entry = format!("❌ {}: {}", ctx.tool_name, ctx.error);
+            println!("  🔧 [Fallback] {entry}");
+            match log_fallback.lock() {
+                Ok(mut log) => log.push(entry),
+                Err(poisoned) => poisoned.into_inner().push(entry),
+            }
+            // Log only — let the harness use its default error representation.
+            None
+        })
 }
 
 #[tokio::main]
@@ -112,10 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(SendNotification);
 
     let audit_log = Arc::new(Mutex::new(Vec::new()));
-    let mut hook_runner = Hooks::new();
-    register_rate_limit_hook(&mut hook_runner);
-    register_audit_log_hook(&mut hook_runner, &audit_log);
-    register_fallback_hook(&mut hook_runner, &audit_log);
+    let hook_runner = build_middleware_hooks(&audit_log);
 
     let config = AgentConfig::builder()
         .system_instructions("You have access to user lookup and notification tools. Use them as needed. Keep responses under 2 sentences.".to_string())

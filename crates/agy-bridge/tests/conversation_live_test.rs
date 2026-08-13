@@ -384,6 +384,115 @@ fn live_multimodal_document_pdf() {
     });
 }
 
+// =============================================================================
+// Test: Faithful conversation resume — capture the SDK-assigned id, then resume
+//
+// Mirrors the SDK contract exactly: the harness assigns the conversation id and
+// persists the trajectory under `save_dir`. Passing that id back as
+// `conversation_id` together with the same `save_dir` must reload the prior
+// trajectory — verified both structurally (history/turn count carries over) and
+// semantically (the model recalls a fact from before the restart).
+// =============================================================================
+
+#[test]
+fn live_conversation_resume_by_id_and_save_dir() {
+    run_live_test("live_conversation_resume_by_id_and_save_dir", || {
+        let _api_key = api_key();
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            // A unique directory shared by both agents makes resume possible
+            // while avoiding collisions across parallel/prior runs. We do NOT
+            // create it here on purpose: the bridge must create `save_dir` for
+            // persistence to work (the harness silently skips persistence for a
+            // missing directory), so leaving it absent exercises that fix.
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            let save_dir = std::env::temp_dir().join(format!("agy_bridge_resume_live_{unique}"));
+
+            let bridge = create_bridge();
+
+            // ── Turn 1: state a distinctive fact, then capture the id ────────
+            let config1 = agy_bridge::config::AgentConfig::builder()
+                .save_dir(save_dir.clone())
+                .system_instructions("Answer concisely.")
+                .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+                .build();
+            let agent1 = bridge.agent(config1).await?;
+
+            let _ack = agent1
+                .chat("Remember this: my favorite color is cerulean.")
+                .await?
+                .text()
+                .await?;
+
+            // The harness assigns the id during the turn; it must be observable.
+            let conversation_id = agent1
+                .conversation_id()
+                .expect("harness must assign a conversation id after the first turn");
+            assert!(
+                !conversation_id.is_empty(),
+                "assigned conversation id must be non-empty"
+            );
+            agent1.shutdown().await?;
+
+            // The bridge must have created save_dir and the harness must have
+            // persisted the trajectory under the captured id there.
+            let traj_file = save_dir.join(format!("{conversation_id}.db"));
+            let traj_legacy = save_dir.join(format!("traj-{conversation_id}"));
+            assert!(
+                traj_file.exists() || traj_legacy.exists(),
+                "expected persisted trajectory ({}) in {} after shutdown",
+                conversation_id,
+                save_dir.display()
+            );
+
+            // ── Turn 2: resume by id + same save_dir ────────────────────────
+            let config2 = agy_bridge::config::AgentConfig::builder()
+                .conversation_id(conversation_id.clone())
+                .save_dir(save_dir.clone())
+                .system_instructions("Answer concisely.")
+                .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+                .build();
+            let agent2 = bridge.agent(config2).await?;
+
+            // Faithful getter: a resumed agent reports the same id it resumed.
+            assert_eq!(
+                agent2.conversation_id().as_deref(),
+                Some(conversation_id.as_str()),
+                "resumed agent must report the conversation id it was resumed with"
+            );
+
+            // End-to-end proof: the model recalls the fact stated before the
+            // restart, which is only possible if the harness reloaded the
+            // persisted trajectory for this id from save_dir.
+            let answer = agent2
+                .chat("What is my favorite color? Reply with just the color word.")
+                .await?
+                .text()
+                .await?;
+            eprintln!("Resumed recall answer: {answer}");
+            assert!(
+                answer.to_lowercase().contains("cerulean"),
+                "resumed agent should recall the fact from before restart, got: {answer}"
+            );
+
+            agent2.shutdown().await?;
+
+            // Best-effort cleanup of the persisted trajectory directory.
+            if let Err(e) = std::fs::remove_dir_all(&save_dir) {
+                eprintln!(
+                    "warning: failed to clean up resume save_dir {}: {e}",
+                    save_dir.display()
+                );
+            }
+            Ok(())
+        })
+    });
+}
+
 /// Builds a minimal, valid single-page PDF that renders `text`.
 ///
 /// Hand-assembles the five standard objects (catalog, pages, page, content

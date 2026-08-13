@@ -17,6 +17,7 @@ fn hook_runner_pre_turn_callback_fires() {
         "counter",
         HookCallback::PreTurn(Box::new(move |ctx| {
             c.fetch_add(ctx.turn_number, Ordering::SeqCst);
+            HookResult::allow()
         })),
     );
 
@@ -85,6 +86,7 @@ fn hook_runner_multiple_callbacks_fire_in_order() {
             format!("hook_{i}"),
             HookCallback::PreTurn(Box::new(move |_ctx| {
                 l.lock().unwrap().push(format!("hook_{i}"));
+                HookResult::allow()
             })),
         );
     }
@@ -138,6 +140,7 @@ fn hook_runner_on_tool_error_fires_with_context() {
         HookCallback::OnToolError(Box::new(move |ctx| {
             *ce.lock().unwrap() = ctx.error.clone();
             *ct.lock().unwrap() = ctx.tool_name.clone();
+            None
         })),
     );
 
@@ -169,7 +172,7 @@ fn hook_runner_default_is_empty() {
 #[test]
 fn hook_callback_debug_format() {
     // NOLINT: |_| closure arg intentionally unused — mock callback for Debug format test
-    let cb = HookCallback::PreTurn(Box::new(|_| {}));
+    let cb = HookCallback::PreTurn(Box::new(|_| HookResult::allow()));
     let dbg = format!("{cb:?}");
     assert_eq!(dbg, "HookCallback::pre_turn");
 }
@@ -177,7 +180,7 @@ fn hook_callback_debug_format() {
 // ── Panic recovery tests ────────────────────────────────────────────
 
 #[test]
-fn hook_runner_pre_turn_panic_recovery() {
+fn hook_runner_pre_turn_panic_returns_deny() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -194,24 +197,102 @@ fn hook_runner_pre_turn_panic_recovery() {
             panic!("intentional test panic in pre_turn hook");
         })),
     );
-    // Register a second hook after the panicking one — it should still fire.
+    // Register a second hook after the panicking one — it should NOT fire,
+    // because a panicking pre_turn hook denies the turn and short-circuits.
     runner.register(
         "after_panic",
         HookCallback::PreTurn(Box::new(move |_ctx| {
             r.store(true, Ordering::SeqCst);
+            HookResult::allow()
         })),
     );
 
-    // run_pre_turn should NOT propagate the panic.
-    runner.run_pre_turn(&PreTurnContext {
+    // run_pre_turn should NOT propagate the panic; it denies the turn instead.
+    let result = runner.run_pre_turn(&PreTurnContext {
         prompt: "test".into(),
         turn_number: 1,
     });
 
     assert!(
-        reached.load(Ordering::SeqCst),
-        "second hook should fire even after the first panicked"
+        !result.allow,
+        "panicking pre_turn hook should deny the turn"
     );
+    assert!(
+        result.message.contains("panicked"),
+        "deny message should mention the panic: {:?}",
+        result.message
+    );
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "second hook should not fire after the first panicked and denied"
+    );
+}
+
+#[test]
+fn hook_runner_pre_turn_deny_short_circuits() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let mut runner = Hooks::new();
+    runner.register(
+        "deny_gate",
+        HookCallback::PreTurn(Box::new(|_ctx| HookResult::deny("blocked turn"))),
+    );
+    let reached = Arc::new(AtomicBool::new(false));
+    let r = Arc::clone(&reached);
+    runner.register(
+        "unreachable",
+        HookCallback::PreTurn(Box::new(move |_ctx| {
+            r.store(true, Ordering::SeqCst);
+            HookResult::allow()
+        })),
+    );
+
+    let result = runner.run_pre_turn(&PreTurnContext {
+        prompt: "hi".into(),
+        turn_number: 1,
+    });
+
+    assert!(!result.allow, "deny should propagate");
+    assert_eq!(result.message, "blocked turn");
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "second pre_turn hook should not fire after a deny"
+    );
+}
+
+#[test]
+fn hook_runner_on_tool_error_transform_returns_representation() {
+    let mut runner = Hooks::new();
+    // First hook observes but provides no representation (None).
+    runner.on_tool_error("observer", |_ctx| None);
+    // Second hook provides a custom model-facing representation.
+    runner.on_tool_error("rewriter", |ctx| {
+        Some(format!("tool {} failed gracefully", ctx.tool_name))
+    });
+
+    let repr = runner.run_on_tool_error(&OnToolErrorContext {
+        tool_name: "write_file".into(),
+        tool_args: serde_json::Value::Null,
+        error: "permission denied".into(),
+        metadata: serde_json::Value::Null,
+    });
+    assert_eq!(repr.as_deref(), Some("tool write_file failed gracefully"));
+}
+
+#[test]
+fn hook_runner_on_tool_error_no_representation_returns_none() {
+    let mut runner = Hooks::new();
+    runner.on_tool_error("observer", |_ctx| None);
+    let repr = runner.run_on_tool_error(&OnToolErrorContext {
+        tool_name: "t".into(),
+        tool_args: serde_json::Value::Null,
+        error: "boom".into(),
+        metadata: serde_json::Value::Null,
+    });
+    assert!(repr.is_none(), "no hook provided a representation");
 }
 
 #[test]
@@ -296,6 +377,7 @@ fn hook_runner_duplicate_replaces_previous() {
         "counter_hook",
         HookCallback::PreTurn(Box::new(move |_ctx| {
             c1.fetch_add(10, Ordering::SeqCst);
+            HookResult::allow()
         })),
     );
 
@@ -305,6 +387,7 @@ fn hook_runner_duplicate_replaces_previous() {
         "counter_hook",
         HookCallback::PreTurn(Box::new(move |_ctx| {
             c2.fetch_add(1, Ordering::SeqCst);
+            HookResult::allow()
         })),
     );
 
@@ -336,6 +419,7 @@ fn convenience_on_pre_turn() {
     let mut runner = Hooks::new();
     runner.on_pre_turn("test", move |_ctx| {
         f.store(true, Ordering::SeqCst);
+        HookResult::allow()
     });
     runner.run_pre_turn(&PreTurnContext {
         prompt: "hi".into(),
@@ -419,6 +503,7 @@ fn convenience_on_tool_error() {
     let mut runner = Hooks::new();
     runner.on_tool_error("err_log", move |ctx| {
         *c.lock().unwrap() = ctx.error.clone();
+        None
     });
     runner.run_on_tool_error(&OnToolErrorContext {
         tool_name: "t".into(),
@@ -619,9 +704,11 @@ fn convenience_builders_chain() {
     runner
         .on_pre_turn("a", move |_ctx| {
             c1.fetch_add(1, Ordering::SeqCst);
+            HookResult::allow()
         })
         .on_pre_turn("b", move |_ctx| {
             c2.fetch_add(10, Ordering::SeqCst);
+            HookResult::allow()
         });
 
     runner.run_pre_turn(&PreTurnContext {
@@ -645,6 +732,7 @@ fn hooks_fluent_chaining() {
     let hooks = Hooks::new()
         .with_pre_turn("a", move |_ctx| {
             c1.fetch_add(1, Ordering::SeqCst);
+            HookResult::allow()
         })
         .with_post_turn("b", move |_ctx| {
             c2.fetch_add(10, Ordering::SeqCst);

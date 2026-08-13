@@ -89,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn basic_execution() {
         let tool = SearchFiles;
-        let ctx = ToolContext::new(None);
+        let ctx = ToolContext::new();
         let output = tool
             .call(
                 SearchFilesParams {
@@ -108,7 +108,7 @@ mod tests {
     #[tokio::test]
     async fn exact_output_format() {
         let tool = SearchFiles;
-        let ctx = ToolContext::new(None);
+        let ctx = ToolContext::new();
         let output = tool
             .call(
                 SearchFilesParams {
@@ -132,7 +132,7 @@ Results for \"test.rs\":
     #[tokio::test]
     async fn template_injection_is_literal() {
         let tool = SearchFiles;
-        let ctx = ToolContext::new(None);
+        let ctx = ToolContext::new();
 
         // Values containing template syntax must be treated as literal strings,
         // never re-evaluated by the template engine.
@@ -156,7 +156,7 @@ Results for \"test.rs\":
     #[tokio::test]
     async fn unicode_and_special_characters() {
         let tool = SearchFiles;
-        let ctx = ToolContext::new(None);
+        let ctx = ToolContext::new();
 
         let pattern = "🦀_test_\"quotes\"_
 _newline";
@@ -181,7 +181,7 @@ _newline"
     #[tokio::test]
     async fn empty_inputs() {
         let tool = SearchFiles;
-        let ctx = ToolContext::new(None);
+        let ctx = ToolContext::new();
 
         let output = tool
             .call(

@@ -42,6 +42,7 @@ fn hooks_pre_and_post_turn_fire() {
         let hooks = Hooks::new()
             .with_pre_turn("test_pre", move |ctx| {
                 e1.lock().unwrap().push(format!("pre:{}", ctx.turn_number));
+                HookResult::allow()
             })
             .with_post_turn("test_post", move |ctx| {
                 e2.lock().unwrap().push(format!("post:{}", ctx.turn_number));
@@ -187,6 +188,7 @@ fn hooks_on_tool_error_fires() {
             errs.lock()
                 .unwrap()
                 .push(format!("error:{}:{}", ctx.tool_name, ctx.error));
+            None
         });
 
         let mut registry = ToolRegistry::new();
@@ -236,6 +238,7 @@ fn hooks_multiple_combined() {
         let hooks = Hooks::new()
             .with_pre_turn("pre", move |_ctx| {
                 e1.lock().unwrap().push("pre_turn".into());
+                HookResult::allow()
             })
             .with_post_turn("post", move |_ctx| {
                 e2.lock().unwrap().push("post_turn".into());

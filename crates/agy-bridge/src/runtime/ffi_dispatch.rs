@@ -43,14 +43,14 @@ pub(crate) fn dispatch_hook_by_name(
     context_json: &str,
 ) -> Result<String, crate::error::Error> {
     match hook_point {
-        "pre_turn" => handle_pre_turn(hook_runner, context_json)?,
+        "pre_turn" => return handle_pre_turn(hook_runner, context_json),
         "post_turn" => handle_post_turn(hook_runner, context_json)?,
         "pre_tool_call_decide" => return handle_pre_tool_call_decide(hook_runner, context_json),
         "post_tool_call" => handle_post_tool_call(hook_runner, context_json)?,
         "on_compaction" => handle_on_compaction(hook_runner, context_json)?,
         "on_session_start" => handle_on_session_start(agent_id, hook_runner, context_json)?,
         "on_session_end" => handle_on_session_end(hook_runner, context_json)?,
-        "on_tool_error" => handle_on_tool_error(agent_id, hook_runner, context_json)?,
+        "on_tool_error" => return handle_on_tool_error(agent_id, hook_runner, context_json),
         "on_interaction" => return handle_on_interaction(hook_runner, context_json),
         _ => {
             return Err(crate::error::Error::BackendError {
@@ -70,10 +70,15 @@ fn deserialize_ctx<'a, T: serde::Deserialize<'a>>(
     })
 }
 
-fn handle_pre_turn(runner: &crate::hooks::Hooks, json: &str) -> Result<(), crate::error::Error> {
+fn handle_pre_turn(
+    runner: &crate::hooks::Hooks,
+    json: &str,
+) -> Result<String, crate::error::Error> {
     let ctx = deserialize_ctx(json, "PreTurnContext")?;
-    runner.run_pre_turn(&ctx);
-    Ok(())
+    let hook_result = runner.run_pre_turn(&ctx);
+    serde_json::to_string(&hook_result).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Failed to serialize PreTurn result: {e}"),
+    })
 }
 
 fn handle_post_turn(runner: &crate::hooks::Hooks, json: &str) -> Result<(), crate::error::Error> {
@@ -113,15 +118,20 @@ fn handle_on_tool_error(
     agent_id: u64,
     runner: &crate::hooks::Hooks,
     json: &str,
-) -> Result<(), crate::error::Error> {
+) -> Result<String, crate::error::Error> {
     let ctx = deserialize_ctx(json, "OnToolErrorContext")?;
     // Recover the structured error captured during dispatch (see
     // `dispatch_rust_tool`). Taking it clears the slot so it can't leak into a
     // later, unrelated error.
     let captured = super::bridge_state::take_last_tool_error(agent_id);
     let ctx = merge_tool_error_metadata(ctx, captured);
-    runner.run_on_tool_error(&ctx);
-    Ok(())
+    // The transform returns the error representation the model should see, or
+    // `None` to let the harness use its default formatting. Serialize as a JSON
+    // value (`null` or a JSON string) for the Python dispatcher to interpret.
+    let representation = runner.run_on_tool_error(&ctx);
+    serde_json::to_string(&representation).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Failed to serialize OnToolError result: {e}"),
+    })
 }
 
 /// Enrich an [`OnToolErrorContext`](crate::hooks::OnToolErrorContext) with the
@@ -195,12 +205,60 @@ fn handle_on_session_start(
                 message: format!("Failed to deserialize OnSessionStartContext: {e}"),
             }
         })?;
-    // NOTE: Previously this function synced `ctx.session.session_id` into the
-    // agent's `conversation_id` field.  That was incorrect — `session_id` is
-    // the save-directory basename (e.g. "fixed_run_3"), NOT a real conversation
-    // handle.  The conversation_id must be set explicitly by the caller via
-    // `AgentHandle::set_conversation_id` or `AgentConfig::conversation_id`.
+    // This hook is observe-only. It intentionally does NOT store
+    // `ctx.session.session_id` into the agent's `conversation_id`: the
+    // init-time dispatch of `on_session_start` may carry a *fabricated*
+    // fallback id (workspace basename or "default_session"), not the real SDK
+    // trajectory id. The authentic harness-assigned id is synced separately via
+    // [`set_agent_conversation_id`], which the Python `_cascade_id` monkeypatch
+    // calls with the actual `cascade_id` once the harness assigns it.
     hook_runner.run_on_session_start(&ctx);
+    Ok(())
+}
+
+/// Stores the SDK harness-assigned conversation id into the agent's shared
+/// bridge state.
+///
+/// Called from the Python `_cascade_id` monkeypatch when the local harness
+/// assigns (or changes) the trajectory `cascade_id` during a turn. Writing the
+/// shared [`Arc`](std::sync::Arc) makes the id observable through both
+/// [`AgentHandle::conversation_id`](crate::agent::AgentHandle::conversation_id)
+/// and custom-tool [`ToolContext`](crate::tools::ToolContext), keeping the
+/// bridge a faithful mirror of the SDK session.
+///
+/// Runs synchronously on the Python thread (holding the GIL): it only takes a
+/// brief read lock on the bridge-state map plus the inner `conversation_id`
+/// mutex, and never re-enters Python, so it cannot deadlock the event loop.
+#[pyfunction]
+pub(crate) fn set_agent_conversation_id(agent_id: u64, conversation_id: String) -> PyResult<()> {
+    let map = bridge_state().read().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
+    })?;
+    let Some(entry) = map.get(&agent_id) else {
+        // The agent may have been shut down between the harness assigning the
+        // id and this callback; nothing to update.
+        tracing::debug!(agent_id, "set_agent_conversation_id: no bridge state entry");
+        return Ok(());
+    };
+    match entry.conversation_id.lock() {
+        Ok(mut guard) => {
+            if guard.as_deref() != Some(conversation_id.as_str()) {
+                tracing::debug!(
+                    agent_id,
+                    conversation_id = %conversation_id,
+                    "Storing SDK-assigned conversation id"
+                );
+                *guard = Some(conversation_id);
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "conversation_id mutex poisoned — SDK id not stored"
+            );
+        }
+    }
     Ok(())
 }
 

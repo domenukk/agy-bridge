@@ -113,7 +113,14 @@ async fn cleanup_remaining_agents(registry: &AgentRegistry) {
     }
     for (agent_id, (ctx_py, _instance)) in remaining {
         tracing::debug!(agent_id = ?agent_id, "Calling __aexit__ on leftover agent");
-        cleanup_single_agent(agent_id, ctx_py).await;
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(3),
+            cleanup_single_agent(agent_id, ctx_py),
+        )
+        .await
+        {
+            tracing::warn!(agent_id = ?agent_id, error = %e, "Timed out waiting for leftover agent __aexit__");
+        }
     }
 }
 

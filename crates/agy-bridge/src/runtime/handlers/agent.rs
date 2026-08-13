@@ -15,6 +15,7 @@ use crate::error::Error;
 const DISPATCH_RUST_TOOL_ATTR: &str = "dispatch_rust_tool";
 const DISPATCH_RUST_HOOK_ATTR: &str = "dispatch_rust_hook";
 const DISPATCH_RUST_POLICY_CONFIRM_ATTR: &str = "dispatch_rust_policy_confirm";
+const SET_AGENT_CONVERSATION_ID_ATTR: &str = "set_agent_conversation_id";
 
 /// Prepares the `_agy_bridge_globals` module and registers the Rust tool registry.
 fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
@@ -41,6 +42,10 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
 
     let confirm_func = pyo3::wrap_pyfunction!(dispatch_rust_policy_confirm, globals_module)?;
     agy_bridge_globals.setattr(DISPATCH_RUST_POLICY_CONFIRM_ATTR, confirm_func)?;
+
+    let set_conv_id_func =
+        pyo3::wrap_pyfunction!(crate::runtime::set_agent_conversation_id, globals_module)?;
+    agy_bridge_globals.setattr(SET_AGENT_CONVERSATION_ID_ATTR, set_conv_id_func)?;
 
     globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;
     Ok(())
@@ -388,6 +393,11 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
 
     let exit_res = aexit_fut.await;
 
+    // Clean up any per-agent cache entries in Python globals.
+    Python::attach(|py| {
+        purge_python_agent_globals(py, agent_id);
+    });
+
     // Bridge state cleanup handled by AgentHandle::shutdown().
 
     match exit_res {
@@ -402,5 +412,24 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
                 tracing::warn!(agent_id = ?agent_id, error = ?e, "ShutdownAgent reply receiver dropped (aexit error)");
             }
         }
+    }
+}
+
+/// Clean up any per-agent cache entries in Python globals.
+fn purge_python_agent_globals(py: Python<'_>, agent_id: AgentId) {
+    let result = (|| -> PyResult<()> {
+        let sys = py.import("sys")?;
+        let modules = sys.getattr("modules")?;
+        if modules.contains("_agy_bridge_globals")? {
+            let globals_mod = modules.get_item("_agy_bridge_globals")?;
+            if globals_mod.hasattr("LAST_TOOL_METADATA")? {
+                let last_meta = globals_mod.getattr("LAST_TOOL_METADATA")?;
+                last_meta.call_method1("pop", (agent_id.0, py.None()))?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::debug!(agent_id = ?agent_id, error = %e, "Failed to purge agent globals");
     }
 }

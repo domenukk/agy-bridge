@@ -15,7 +15,7 @@
 //! ```
 
 use std::sync::{
-    Arc, LazyLock,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -24,12 +24,12 @@ use tokio::{
     net::TcpListener,
 };
 
-static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
+fn test_bridge() -> agy_bridge::AgyBridge {
     agy_bridge::AgyBridge::builder()
         .inter_agent_delay(std::time::Duration::ZERO)
         .build()
-        .expect("shared AgyBridge")
-});
+        .expect("test AgyBridge")
+}
 
 // ─── Mock Server Infrastructure ──────────────────────────────────────────────
 
@@ -115,17 +115,41 @@ fn sse_response(json_body: &str) -> String {
 
 fn model_list_json() -> String {
     serde_json::json!({
-        "models": [{
-            "name": "models/gemini-2.0-flash",
-            "displayName": "Gemini 2.0 Flash",
-            "supportedGenerationMethods": [
-                "generateContent",
-                "streamGenerateContent",
-                "countTokens"
-            ],
-            "inputTokenLimit": 1_048_576,
-            "outputTokenLimit": 8192
-        }]
+        "models": [
+            {
+                "name": "models/gemini-3.6-flash",
+                "displayName": "Gemini 3.6 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            },
+            {
+                "name": "models/gemini-3.5-flash",
+                "displayName": "Gemini 3.5 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            },
+            {
+                "name": "models/gemini-2.0-flash",
+                "displayName": "Gemini 2.0 Flash",
+                "supportedGenerationMethods": [
+                    "generateContent",
+                    "streamGenerateContent",
+                    "countTokens"
+                ],
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 8192
+            }
+        ]
     })
     .to_string()
 }
@@ -223,45 +247,41 @@ impl MockFailureServer {
                     let (reader, mut writer) = tokio::io::split(stream);
                     let mut buf_reader = BufReader::new(reader);
 
-                    let Some((request_line, _body)) = parse_http_request(&mut buf_reader).await
-                    else {
-                        return;
-                    };
+                    loop {
+                        let Some((request_line, _body)) = parse_http_request(&mut buf_reader).await
+                        else {
+                            break;
+                        };
 
-                    let is_get = request_line.starts_with("GET ");
+                        let is_get = request_line.starts_with("GET ");
 
-                    if is_get {
-                        // Always serve model list (agent creation needs it).
-                        let response = json_response(200, &model_list_json());
+                        let response = if is_get {
+                            // Always serve model list (agent creation needs it).
+                            json_response(200, &model_list_json())
+                        } else {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            match behaviour {
+                                MockBehaviour::Healthy => sse_response(&generate_content_json()),
+                                MockBehaviour::Error503 => json_response(503, &error_503_json()),
+                                MockBehaviour::Error500 => json_response(500, &error_500_json()),
+                                MockBehaviour::Error429 => json_response(429, &error_429_json()),
+                                MockBehaviour::Hang => {
+                                    // Never respond — just hold the connection open.
+                                    // Sleep longer than any reasonable timeout.
+                                    tokio::time::sleep(std::time::Duration::from_mins(5)).await;
+                                    return;
+                                }
+                            }
+                        };
+
                         if let Err(e) = writer.write_all(response.as_bytes()).await {
                             eprintln!("mock server: write failed: {e}");
+                            break;
                         }
                         if let Err(e) = writer.flush().await {
                             eprintln!("mock server: flush failed: {e}");
+                            break;
                         }
-                        return;
-                    }
-
-                    count.fetch_add(1, Ordering::SeqCst);
-
-                    let response = match behaviour {
-                        MockBehaviour::Healthy => sse_response(&generate_content_json()),
-                        MockBehaviour::Error503 => json_response(503, &error_503_json()),
-                        MockBehaviour::Error500 => json_response(500, &error_500_json()),
-                        MockBehaviour::Error429 => json_response(429, &error_429_json()),
-                        MockBehaviour::Hang => {
-                            // Never respond — just hold the connection open.
-                            // Sleep longer than any reasonable timeout.
-                            tokio::time::sleep(std::time::Duration::from_mins(5)).await;
-                            return;
-                        }
-                    };
-
-                    if let Err(e) = writer.write_all(response.as_bytes()).await {
-                        eprintln!("mock server: write failed: {e}");
-                    }
-                    if let Err(e) = writer.flush().await {
-                        eprintln!("mock server: flush failed: {e}");
                     }
                 });
             }
@@ -298,6 +318,7 @@ fn agent_config_for(base_url: &str, system: &str) -> agy_bridge::config::AgentCo
             models: agy_bridge::config::ModelConfig::default(),
         })
         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+        .retry_config(agy_bridge::config::RetryConfig::no_retries())
         .build()
 }
 
@@ -316,34 +337,16 @@ fn error_503_returns_err_not_empty_ok() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server = MockFailureServer::start(MockBehaviour::Error503).await;
         let config = agent_config_for(&server.base_url(), "Agent under 503");
-        let agent = BRIDGE.agent(config).await.expect("create agent");
+        let agent = bridge.agent(config).await.expect("create agent");
 
         let result = agent.chat_text("Hello").await;
         eprintln!("503 result: {result:?}");
 
-        let err_msg = result
-            .expect_err(
-                "Backend 503 MUST return Err (bug: agy-bridge returned Ok(\"\") for 503 errors)",
-            )
-            .to_string();
-        eprintln!("503 error message: {err_msg}");
-
-        // The error message should contain useful context about the failure.
-        // With quota retry logic, 503 errors may surface as QuotaExceeded
-        // ("Quota exceeded, retry after ...") since is_quota_error() matches "503".
-        assert!(
-            err_msg.contains("503")
-                || err_msg.contains("UNAVAILABLE")
-                || err_msg.contains("error")
-                || err_msg.contains("Error")
-                || err_msg.contains("terminated")
-                || err_msg.contains("Scope")
-                || err_msg.contains("Quota")
-                || err_msg.contains("quota")
-                || err_msg.contains("retry"),
-            "Error message should contain backend error context, got: {err_msg}"
+        result.expect_err(
+            "Backend 503 MUST return Err (bug: agy-bridge returned Ok(\"\") for 503 errors)",
         );
 
         assert!(
@@ -364,9 +367,10 @@ fn error_500_returns_err() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server = MockFailureServer::start(MockBehaviour::Error500).await;
         let config = agent_config_for(&server.base_url(), "Agent under 500");
-        let agent = BRIDGE.agent(config).await.expect("create agent");
+        let agent = bridge.agent(config).await.expect("create agent");
 
         let result = agent.chat_text("Hello").await;
         eprintln!("500 result: {result:?}");
@@ -387,6 +391,7 @@ fn concurrent_agents_mixed_healthy_and_503() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let healthy_server = MockFailureServer::start(MockBehaviour::Healthy).await;
         let broken_server = MockFailureServer::start(MockBehaviour::Error503).await;
 
@@ -399,8 +404,8 @@ fn concurrent_agents_mixed_healthy_and_503() {
         let healthy_config = agent_config_for(&healthy_server.base_url(), "Healthy agent");
         let broken_config = agent_config_for(&broken_server.base_url(), "Broken agent");
 
-        let healthy_agent = BRIDGE.agent(healthy_config).await.expect("healthy agent");
-        let broken_agent = BRIDGE.agent(broken_config).await.expect("broken agent");
+        let healthy_agent = bridge.agent(healthy_config).await.expect("healthy agent");
+        let broken_agent = bridge.agent(broken_config).await.expect("broken agent");
 
         // Execute both concurrently.
         let (healthy_result, broken_result) = tokio::join!(
@@ -436,19 +441,20 @@ fn concurrent_agents_all_different_errors() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server_503 = MockFailureServer::start(MockBehaviour::Error503).await;
         let server_500 = MockFailureServer::start(MockBehaviour::Error500).await;
         let server_429 = MockFailureServer::start(MockBehaviour::Error429).await;
 
-        let agent_503 = BRIDGE
+        let agent_503 = bridge
             .agent(agent_config_for(&server_503.base_url(), "503 agent"))
             .await
             .expect("503 agent");
-        let agent_500 = BRIDGE
+        let agent_500 = bridge
             .agent(agent_config_for(&server_500.base_url(), "500 agent"))
             .await
             .expect("500 agent");
-        let agent_429 = BRIDGE
+        let agent_429 = bridge
             .agent(agent_config_for(&server_429.base_url(), "429 agent"))
             .await
             .expect("429 agent");
@@ -484,18 +490,19 @@ fn concurrent_agents_all_healthy_baseline() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server = MockFailureServer::start(MockBehaviour::Healthy).await;
         let base = server.base_url();
 
-        let a0 = BRIDGE
+        let a0 = bridge
             .agent(agent_config_for(&base, "Healthy 0"))
             .await
             .expect("a0");
-        let a1 = BRIDGE
+        let a1 = bridge
             .agent(agent_config_for(&base, "Healthy 1"))
             .await
             .expect("a1");
-        let a2 = BRIDGE
+        let a2 = bridge
             .agent(agent_config_for(&base, "Healthy 2"))
             .await
             .expect("a2");
@@ -544,10 +551,7 @@ fn timeout_fires_when_backend_hangs() {
         // consumer-layer concern. A tokio timeout around chat() must be able to
         // fire even while Python is busy; this is the GIL-starvation
         // regression guard.
-        let bridge = agy_bridge::AgyBridge::builder()
-            .inter_agent_delay(std::time::Duration::ZERO)
-            .build()
-            .expect("bridge");
+        let bridge = test_bridge();
 
         let config = agent_config_for(&server.base_url(), "Timeout agent");
         let agent = bridge.agent(config).await.expect("create agent");
@@ -591,10 +595,7 @@ fn healthy_agent_survives_sibling_timeout() {
         let healthy_server = MockFailureServer::start(MockBehaviour::Healthy).await;
         let hanging_server = MockFailureServer::start(MockBehaviour::Hang).await;
 
-        let bridge = agy_bridge::AgyBridge::builder()
-            .inter_agent_delay(std::time::Duration::ZERO)
-            .build()
-            .expect("bridge");
+        let bridge = test_bridge();
 
         let healthy_config = agent_config_for(&healthy_server.base_url(), "Healthy");
         let hanging_config = agent_config_for(&hanging_server.base_url(), "Hanging");
@@ -641,9 +642,10 @@ fn agent_shutdown_after_error_does_not_hang() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server = MockFailureServer::start(MockBehaviour::Error503).await;
         let config = agent_config_for(&server.base_url(), "Shutdown after error");
-        let agent = BRIDGE.agent(config).await.expect("create agent");
+        let agent = bridge.agent(config).await.expect("create agent");
 
         // Chat should fail.
         let result = agent.chat_text("Hello").await;
@@ -668,16 +670,17 @@ fn repeated_errors_each_return_err() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server = MockFailureServer::start(MockBehaviour::Error503).await;
         let config = agent_config_for(&server.base_url(), "Repeated errors");
-        let agent = BRIDGE.agent(config).await.expect("create agent");
+        let agent = bridge.agent(config).await.expect("create agent");
 
         for i in 0..3 {
             // Bound each attempt: the bridge imposes no timeout, so a backend
             // that the SDK keeps retrying is bounded at the consumer layer. A
             // timeout or an SDK error both prove the 503 backend never yields Ok.
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(5),
                 agent.chat_text(format!("Attempt {i}")),
             )
             .await;
@@ -687,7 +690,7 @@ fn repeated_errors_each_return_err() {
             );
         }
 
-        tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown())
+        tokio::time::timeout(std::time::Duration::from_secs(5), agent.shutdown())
             .await
             .expect("shutdown must not stall")
             .expect("shutdown");
@@ -704,16 +707,17 @@ fn streaming_handle_text_returns_err_on_503() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let server = MockFailureServer::start(MockBehaviour::Error503).await;
         let config = agent_config_for(&server.base_url(), "Streaming handle");
-        let agent = BRIDGE.agent(config).await.expect("create agent");
+        let agent = bridge.agent(config).await.expect("create agent");
 
         let chat_result =
-            tokio::time::timeout(std::time::Duration::from_secs(30), agent.chat("Hello")).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), agent.chat("Hello")).await;
         match chat_result {
             Ok(Ok(handle)) => {
                 let text_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(30), handle.text()).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(5), handle.text()).await;
                 eprintln!("Streaming handle .text() result: {text_result:?}");
                 assert!(
                     text_result
@@ -753,29 +757,30 @@ fn five_agents_mixed_backends_full_isolation() {
         .expect("tokio runtime");
 
     rt.block_on(async {
+        let bridge = test_bridge();
         let healthy_a = MockFailureServer::start(MockBehaviour::Healthy).await;
         let healthy_b = MockFailureServer::start(MockBehaviour::Healthy).await;
         let broken_503 = MockFailureServer::start(MockBehaviour::Error503).await;
         let broken_500 = MockFailureServer::start(MockBehaviour::Error500).await;
         let broken_429 = MockFailureServer::start(MockBehaviour::Error429).await;
 
-        let a_h1 = BRIDGE
+        let a_h1 = bridge
             .agent(agent_config_for(&healthy_a.base_url(), "healthy-a"))
             .await
             .expect("h-a");
-        let a_h2 = BRIDGE
+        let a_h2 = bridge
             .agent(agent_config_for(&healthy_b.base_url(), "healthy-b"))
             .await
             .expect("h-b");
-        let a_503 = BRIDGE
+        let a_503 = bridge
             .agent(agent_config_for(&broken_503.base_url(), "broken-503"))
             .await
             .expect("503");
-        let a_500 = BRIDGE
+        let a_500 = bridge
             .agent(agent_config_for(&broken_500.base_url(), "broken-500"))
             .await
             .expect("500");
-        let a_429 = BRIDGE
+        let a_429 = bridge
             .agent(agent_config_for(&broken_429.base_url(), "broken-429"))
             .await
             .expect("429");

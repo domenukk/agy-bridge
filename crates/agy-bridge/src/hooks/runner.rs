@@ -20,8 +20,12 @@ use super::types::{
 /// use agy_bridge::hooks::{HookResult, Hooks, PreToolCallDecideContext, PreTurnContext};
 ///
 /// let hooks = Hooks::new()
-///     .with_pre_turn("logger", |ctx: &PreTurnContext| {
-///         println!("Turn {} prompt: {}", ctx.turn_number, ctx.prompt);
+///     .with_pre_turn("gate", |ctx: &PreTurnContext| {
+///         if ctx.prompt.contains("forbidden") {
+///             HookResult::deny("blocked prompt")
+///         } else {
+///             HookResult::allow()
+///         }
 ///     })
 ///     .with_pre_tool_call_decide("gate", |ctx: &PreToolCallDecideContext| {
 ///         if ctx.tool_name == "dangerous_tool" {
@@ -31,7 +35,8 @@ use super::types::{
 ///         }
 ///     });
 ///
-/// hooks.run_pre_turn(&PreTurnContext::new("hi", 1));
+/// let turn = hooks.run_pre_turn(&PreTurnContext::new("hi", 1));
+/// assert!(turn.allow);
 /// let result = hooks.run_pre_tool_call_decide(&PreToolCallDecideContext::new(
 ///     "safe_tool",
 ///     serde_json::Value::Null,
@@ -46,6 +51,7 @@ use super::types::{
 /// let mut hooks = Hooks::new();
 /// hooks.on_pre_turn("logger", |ctx| {
 ///     println!("Turn {}", ctx.turn_number);
+///     HookResult::allow()
 /// });
 /// ```
 pub struct Hooks {
@@ -111,13 +117,44 @@ impl Hooks {
     }
 
     /// Run all [`HookPoint::PreTurn`] callbacks in registration order.
-    pub fn run_pre_turn(&self, ctx: &PreTurnContext) {
-        self.run_observer(HookPoint::PreTurn, |name, cb| {
+    ///
+    /// If any callback returns [`HookResult`] with `allow: false`, execution
+    /// short-circuits and that deny result is returned immediately — denying
+    /// the turn before the model runs (SDK `PreTurnHook`, a `DecideHook`).
+    /// Otherwise returns [`HookResult::allow()`].
+    ///
+    /// If a callback panics, the turn is denied as a safe default.
+    pub fn run_pre_turn(&self, ctx: &PreTurnContext) -> HookResult {
+        for (_, name, cb) in self.iter_at(HookPoint::PreTurn) {
             tracing::trace!(hook = %name, turn = ctx.turn_number, "firing pre_turn hook");
             if let HookCallback::PreTurn(f) = cb {
-                f(ctx);
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
+                {
+                    Ok(r) => r,
+                    Err(panic) => {
+                        tracing::error!(
+                            hook = %name,
+                            turn = ctx.turn_number,
+                            panic = ?panic,
+                            "pre_turn hook panicked — denying turn as safe default"
+                        );
+                        return HookResult::deny(format!(
+                            "hook '{name}' panicked — turn denied as safe default"
+                        ));
+                    }
+                };
+                if !result.allow {
+                    tracing::info!(
+                        hook = %name,
+                        turn = ctx.turn_number,
+                        reason = %result.message,
+                        "turn denied by hook"
+                    );
+                    return result;
+                }
             }
-        });
+        }
+        HookResult::allow()
     }
 
     /// Run all [`HookPoint::PostTurn`] callbacks in registration order.
@@ -181,13 +218,39 @@ impl Hooks {
     }
 
     /// Run all [`HookPoint::OnToolError`] callbacks in registration order.
-    pub fn run_on_tool_error(&self, ctx: &OnToolErrorContext) {
-        self.run_observer(HookPoint::OnToolError, |name, cb| {
+    ///
+    /// Returns the error representation the model should see, taken from the
+    /// first callback that returns `Some(..)`. Returns `None` when no callback
+    /// provides one, in which case the harness uses its default error
+    /// formatting (SDK `OnToolErrorHook`, a `TransformHook`).
+    ///
+    /// A panicking callback is logged and skipped (its transform is ignored).
+    pub fn run_on_tool_error(&self, ctx: &OnToolErrorContext) -> Option<String> {
+        for (_, name, cb) in self.iter_at(HookPoint::OnToolError) {
             tracing::trace!(hook = %name, tool = %ctx.tool_name, error = %ctx.error, "firing on_tool_error hook");
             if let HookCallback::OnToolError(f) = cb {
-                f(ctx);
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx))) {
+                    Ok(Some(repr)) => {
+                        tracing::debug!(
+                            hook = %name,
+                            tool = %ctx.tool_name,
+                            "on_tool_error hook provided a custom error representation"
+                        );
+                        return Some(repr);
+                    }
+                    Ok(None) => { /* defer to the next hook / harness default */ }
+                    Err(panic) => {
+                        tracing::error!(
+                            hook = %name,
+                            tool = %ctx.tool_name,
+                            panic = ?panic,
+                            "on_tool_error hook panicked — ignoring its transform"
+                        );
+                    }
+                }
             }
-        });
+        }
+        None
     }
 
     /// Run all [`HookPoint::OnSessionStart`] callbacks in registration order.
@@ -294,10 +357,12 @@ impl Hooks {
     /// Register a [`HookPoint::PreTurn`] callback.
     ///
     /// Convenience wrapper matching the Python SDK's `@on_pre_turn` decorator.
+    /// The callback returns a [`HookResult`] to allow or deny the turn before
+    /// the model runs.
     pub fn on_pre_turn(
         &mut self,
         name: impl Into<String>,
-        f: impl Fn(&PreTurnContext) + Send + Sync + 'static,
+        f: impl Fn(&PreTurnContext) -> HookResult + Send + Sync + 'static,
     ) -> &mut Self {
         self.register(name, HookCallback::PreTurn(Box::new(f)))
     }
@@ -339,10 +404,12 @@ impl Hooks {
     /// Register a [`HookPoint::OnToolError`] callback.
     ///
     /// Convenience wrapper matching the Python SDK's `@on_tool_error` decorator.
+    /// The callback returns `Some(repr)` to give the model a custom error
+    /// representation, or `None` to use the harness's default formatting.
     pub fn on_tool_error(
         &mut self,
         name: impl Into<String>,
-        f: impl Fn(&OnToolErrorContext) + Send + Sync + 'static,
+        f: impl Fn(&OnToolErrorContext) -> Option<String> + Send + Sync + 'static,
     ) -> &mut Self {
         self.register(name, HookCallback::OnToolError(Box::new(f)))
     }
@@ -413,7 +480,7 @@ impl Hooks {
     pub fn with_pre_turn(
         mut self,
         name: impl Into<String>,
-        f: impl Fn(&PreTurnContext) + Send + Sync + 'static,
+        f: impl Fn(&PreTurnContext) -> HookResult + Send + Sync + 'static,
     ) -> Self {
         self.on_pre_turn(name, f);
         self
@@ -471,7 +538,7 @@ impl Hooks {
     pub fn with_tool_error(
         mut self,
         name: impl Into<String>,
-        f: impl Fn(&OnToolErrorContext) + Send + Sync + 'static,
+        f: impl Fn(&OnToolErrorContext) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
         self.on_tool_error(name, f);
         self

@@ -473,7 +473,9 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
 
             // Agent with proxy base_url.
             let proxied_config = agy_bridge::config::AgentConfig::builder()
-                .system_instructions("Reply with exactly: PROXIED_CONCURRENT")
+                .system_instructions(
+                    "Your name is PROXIED_CONCURRENT. Always output PROXIED_CONCURRENT.",
+                )
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .gemini(agy_bridge::config::GeminiConfig {
                     api_key: None,
@@ -484,7 +486,9 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
 
             // Agent with default endpoint (no proxy).
             let direct_config = agy_bridge::config::AgentConfig::builder()
-                .system_instructions("Reply with exactly: DIRECT_CONCURRENT")
+                .system_instructions(
+                    "Your name is DIRECT_CONCURRENT. Always output DIRECT_CONCURRENT.",
+                )
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .build();
 
@@ -493,16 +497,8 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
             let direct_agent = bridge.agent(direct_config).await?;
 
             // Execute chat requests concurrently via tokio::join!
-            let fut_proxy = async {
-                proxied_agent
-                    .chat_text("Who are you? Reply with your exact name.")
-                    .await
-            };
-            let fut_direct = async {
-                direct_agent
-                    .chat_text("Who are you? Reply with your exact name.")
-                    .await
-            };
+            let fut_proxy = async { proxied_agent.chat_text("Say your name.").await };
+            let fut_direct = async { direct_agent.chat_text("Say your name.").await };
 
             let (res_proxy, res_direct) = tokio::join!(fut_proxy, fut_direct);
 
@@ -598,17 +594,17 @@ fn two_bridges_concurrent_proxy_and_direct_agents() {
             let Some(chunk_proxy) = stream_proxy.recv().await else {
                 handle_proxy.text().await?;
                 return Err(agy_bridge::error::Error::Stream(
-                    agy_bridge::streaming::StreamError {
-                        message: "proxy text stream closed before first chunk".to_owned(),
-                    },
+                    agy_bridge::streaming::StreamError::new(
+                        "proxy text stream closed before first chunk",
+                    ),
                 ));
             };
             let Some(chunk_direct) = stream_direct.recv().await else {
                 handle_direct.text().await?;
                 return Err(agy_bridge::error::Error::Stream(
-                    agy_bridge::streaming::StreamError {
-                        message: "direct text stream closed before first chunk".to_owned(),
-                    },
+                    agy_bridge::streaming::StreamError::new(
+                        "direct text stream closed before first chunk",
+                    ),
                 ));
             };
 

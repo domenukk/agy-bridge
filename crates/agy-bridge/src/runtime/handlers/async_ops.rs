@@ -43,15 +43,12 @@ async fn run_py_async_op<T, F, E>(
 {
     // 1. Look up the agent in the registry.
     let Some((_ctx, agent_instance)) = clone_agent_refs(&registry, agent_id) else {
-        if reply
-            .send(Err(Error::BackendError {
-                message: format!("Agent ID {agent_id} not found in registry"),
-            }))
-            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
-            .is_err()
-        {
+        if let Err(e) = reply.send(Err(Error::BackendError {
+            message: format!("Agent ID {agent_id} not found in registry"),
+        })) {
             tracing::warn!(
                 agent_id = ?agent_id,
+                error = ?e,
                 "{} reply receiver dropped (agent not found)",
                 op_label,
             );
@@ -71,9 +68,10 @@ async fn run_py_async_op<T, F, E>(
     let fut = match fut {
         Ok(fut) => fut,
         Err(e) => {
-            if reply.send(Err(e)).is_err() {
+            if let Err(send_err) = reply.send(Err(e)) {
                 tracing::warn!(
                     agent_id = ?agent_id,
+                    error = ?send_err,
                     "{} reply receiver dropped (coro error)",
                     op_label,
                 );
@@ -89,9 +87,10 @@ async fn run_py_async_op<T, F, E>(
     // 4. Map the Python result and send the reply.
     match py_result {
         Ok(obj) => {
-            if reply.send(Ok(extract(obj))).is_err() {
+            if let Err(e) = reply.send(Ok(extract(obj))) {
                 tracing::warn!(
                     agent_id = ?agent_id,
+                    error = ?e,
                     "{} reply receiver dropped",
                     op_label,
                 );
@@ -99,9 +98,10 @@ async fn run_py_async_op<T, F, E>(
         }
         Err(e) => {
             let err: Error = e.into();
-            if reply.send(Err(err)).is_err() {
+            if let Err(send_err) = reply.send(Err(err)) {
                 tracing::warn!(
                     agent_id = ?agent_id,
+                    error = ?send_err,
                     "{} reply receiver dropped (error)",
                     op_label,
                 );
@@ -155,15 +155,12 @@ pub(in crate::runtime) fn handle_clear_history(
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
     let Some((_ctx, agent_instance)) = clone_agent_refs(registry, agent_id) else {
-        if reply
-            .send(Err(Error::BackendError {
-                message: format!("Agent ID {agent_id} not found in registry"),
-            }))
-            // NOLINT: `.is_err()` in `if` — receiver-dropped is logged below
-            .is_err()
-        {
+        if let Err(e) = reply.send(Err(Error::BackendError {
+            message: format!("Agent ID {agent_id} not found in registry"),
+        })) {
             tracing::warn!(
                 agent_id = ?agent_id,
+                error = ?e,
                 "clear_history reply receiver dropped (agent not found)",
             );
         }
@@ -181,8 +178,8 @@ pub(in crate::runtime) fn handle_clear_history(
         Ok(())
     });
 
-    if reply.send(result).is_err() {
-        tracing::warn!(agent_id = ?agent_id, "clear_history reply receiver dropped");
+    if let Err(e) = reply.send(result) {
+        tracing::warn!(agent_id = ?agent_id, error = ?e, "clear_history reply receiver dropped");
     }
 }
 

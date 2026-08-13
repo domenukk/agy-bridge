@@ -340,10 +340,10 @@ fn tool_context_omits_conversation_id_when_unset() {
     );
 }
 
-/// The bridge-state entry shares the *same* `Arc` as the `AgentHandle`, so a
-/// runtime `set_conversation_id` update must be visible to a later dispatch
-/// that reads `entry.conversation_id`. This proves the wiring is a live share,
-/// not a one-time copy taken at agent-creation time.
+/// The bridge-state entry shares the *same* `Arc` as the `AgentHandle`, so
+/// syncing the harness-assigned id via `set_agent_conversation_id` must be
+/// visible to a later dispatch that reads `entry.conversation_id`. This proves
+/// the wiring is a live share, not a one-time copy taken at agent-creation time.
 #[test]
 fn conversation_id_updates_are_visible_through_shared_arc() {
     let shared = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -360,7 +360,7 @@ fn conversation_id_updates_are_visible_through_shared_arc() {
     // Initially unset: a dispatch would build a context without an ID.
     assert_eq!(entry.conversation_id.lock().unwrap().clone(), None);
 
-    // Simulate `AgentHandle::set_conversation_id` mutating the shared Arc.
+    // Simulate `set_agent_conversation_id` mutating the shared Arc.
     *shared.lock().unwrap() = Some("conv-live".to_owned());
 
     let snapshot = entry.conversation_id.lock().unwrap().clone();

@@ -283,6 +283,7 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
     hooks.on_pre_turn("turn_logger", |ctx| {
         println!("[turn {}] {}", ctx.turn_number, ctx.prompt);
+        HookResult::allow()
     });
 
     hooks.on_pre_tool_call_decide("safety_gate", |ctx| {

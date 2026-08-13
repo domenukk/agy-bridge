@@ -122,6 +122,35 @@ pub struct ToolCallEvent {
 pub struct StreamError {
     /// Error message from the Python side.
     pub message: String,
+    /// HTTP status code associated with the failure, when the harness reported
+    /// one on the error step (`0` when unknown, e.g. a Python-level exception).
+    ///
+    /// This is the authoritative classification signal used by
+    /// [`crate::error::Error::is_quota_error`] and
+    /// [`crate::error::Error::is_retryable`]; the message string is only a
+    /// fallback for errors that carry no structured code.
+    #[serde(default)]
+    pub http_code: u16,
+}
+
+impl StreamError {
+    /// Create a stream error with an unknown (`0`) HTTP status code.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            http_code: crate::error::HTTP_CODE_UNKNOWN,
+        }
+    }
+
+    /// Create a stream error carrying the harness-reported HTTP status code.
+    #[must_use]
+    pub fn with_http_code(message: impl Into<String>, http_code: u16) -> Self {
+        Self {
+            message: message.into(),
+            http_code,
+        }
+    }
 }
 
 impl std::fmt::Display for StreamError {

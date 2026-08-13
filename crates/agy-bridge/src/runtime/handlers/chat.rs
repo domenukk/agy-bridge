@@ -55,12 +55,14 @@ fn get_step_iterator(agent_instance: &Py<PyAny>, response_py: &Py<PyAny>) -> PyR
         if !conv.hasattr("receive_steps")? {
             // Try to surface the error message from the response itself.
             match response_bound.getattr("text") {
-                Ok(error_text) => {
-                    // NOLINT: extract failure means text isn't a string; fall through to generic error
-                    if let Ok(desc_str) = error_text.extract::<String>() {
+                Ok(error_text) => match error_text.extract::<String>() {
+                    Ok(desc_str) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(desc_str));
                     }
-                }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Failed to extract response text as string for error description");
+                    }
+                },
                 Err(e) => {
                     tracing::debug!("response has no 'text' attr to surface error: {e}");
                 }
@@ -268,9 +270,9 @@ pub(crate) async fn handle_chat(
             // never silently dropped.
             tracing::error!(agent_id = ?agent_id, error = %e, "Failed to extract response metadata");
             if let Err(send_err) = writer
-                .send_error(crate::streaming::StreamError {
-                    message: format!("response metadata extraction failed: {e}"),
-                })
+                .send_error(crate::streaming::StreamError::new(format!(
+                    "response metadata extraction failed: {e}"
+                )))
                 .await
             {
                 tracing::error!(

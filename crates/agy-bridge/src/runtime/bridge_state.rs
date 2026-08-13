@@ -48,12 +48,16 @@ pub(crate) struct AgentBridgeState {
     /// Shared key-value state persisted across tool calls for this agent.
     pub(crate) tool_state: llm_tool::SharedState,
     /// The agent's conversation ID, sharing the same `Arc` as its
-    /// [`AgentHandle`](crate::agent::AgentHandle) so runtime updates via
-    /// `set_conversation_id` are visible here immediately. Threaded into the
-    /// [`ToolContext`](llm_tool::ToolContext) built for every custom-tool
-    /// dispatch, so tools can identify which conversation they serve. `None`
-    /// until the caller sets one (via `AgentConfig::conversation_id` or
-    /// `AgentHandle::set_conversation_id`).
+    /// [`AgentHandle`](crate::agent::AgentHandle) so updates are visible here
+    /// immediately. Threaded into the [`ToolContext`](llm_tool::ToolContext)
+    /// built for every custom-tool dispatch, so tools can identify which
+    /// conversation they serve.
+    ///
+    /// It faithfully mirrors the SDK session: seeded from
+    /// `AgentConfig::conversation_id` when resuming, then overwritten with the
+    /// harness-assigned id during the first turn (synced from Python via
+    /// `set_agent_conversation_id`). `None` until the harness assigns one for a
+    /// fresh conversation.
     pub(crate) conversation_id: Arc<std::sync::Mutex<Option<String>>>,
     /// Structured payload of the most recent failed tool dispatch, if any.
     ///

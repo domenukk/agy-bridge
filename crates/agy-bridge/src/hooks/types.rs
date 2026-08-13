@@ -481,16 +481,29 @@ impl<const N: usize> From<[HookEntry; N]> for HookSet {
 type TransformToolInputFn =
     dyn Fn(&PreToolCallDecideContext) -> Option<serde_json::Value> + Send + Sync;
 
+/// The boxed closure type behind [`HookCallback::OnToolError`].
+///
+/// Accepts a tool-error context and returns the error representation the model
+/// should see, or `None` to fall back to the harness's default formatting.
+type OnToolErrorFn = dyn Fn(&OnToolErrorContext) -> Option<String> + Send + Sync;
+
 /// A registered hook callback, keyed by hook point.
 ///
 /// Each variant wraps a boxed closure that receives the strongly-typed context
-/// for that hook point.  [`PreToolCallDecide`](Self::PreToolCallDecide) returns
-/// a [`HookResult`] so it can approve or deny tool execution; all other
-/// variants are fire-and-forget observers.
+/// for that hook point. Mirroring the SDK's hook contracts:
+/// [`PreTurn`](Self::PreTurn) and [`PreToolCallDecide`](Self::PreToolCallDecide)
+/// are *deciding* hooks that return a [`HookResult`] to allow or deny the turn /
+/// tool call; [`OnToolError`](Self::OnToolError) is a *transform* hook that
+/// returns the error representation the model should see (`None` = use the
+/// harness's default formatting); all other variants are fire-and-forget
+/// observers.
 #[non_exhaustive]
 pub enum HookCallback {
     /// Callback invoked before each agent turn.
-    PreTurn(Box<dyn Fn(&PreTurnContext) + Send + Sync>),
+    ///
+    /// Returns a [`HookResult`] so it can allow or deny the turn before the
+    /// model runs (SDK `PreTurnHook`, a `DecideHook[Content]`).
+    PreTurn(Box<dyn Fn(&PreTurnContext) -> HookResult + Send + Sync>),
     /// Callback invoked after each agent turn completes.
     PostTurn(Box<dyn Fn(&PostTurnContext) + Send + Sync>),
     /// Callback invoked before deciding whether to execute a tool call.
@@ -498,7 +511,11 @@ pub enum HookCallback {
     /// Callback invoked after a tool call completes.
     PostToolCall(Box<dyn Fn(&PostToolCallContext) + Send + Sync>),
     /// Callback invoked when a tool call produces an error.
-    OnToolError(Box<dyn Fn(&OnToolErrorContext) + Send + Sync>),
+    ///
+    /// Returns the error representation the model should see, or `None` to let
+    /// the harness use its default error formatting (SDK `OnToolErrorHook`, a
+    /// `TransformHook[Exception, Any]`).
+    OnToolError(Box<OnToolErrorFn>),
     /// Callback invoked when a new agent session begins.
     OnSessionStart(Box<dyn Fn(&OnSessionStartContext) + Send + Sync>),
     /// Callback invoked when an agent session ends.

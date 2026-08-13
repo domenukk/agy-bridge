@@ -188,15 +188,19 @@ impl ChatResponseHandle {
     /// Finalize the response handle by pulling usage and structured output
     /// from the shared state. Called after the stream has been fully drained.
     pub fn finalize(&mut self) {
-        // NOLINT: Mutex::lock only fails if poisoned; else branch logs tracing::error!
-        if let Ok(state) = self.shared_state.lock() {
-            self.usage = state.usage.clone();
-            self.structured_output_value = state.structured_output.clone();
-        } else {
-            tracing::error!(
-                "ChatResponseHandle shared_state mutex poisoned during finalize — \
-                 usage and structured_output will be unavailable"
-            );
+        match self.shared_state.lock() {
+            Ok(state) => {
+                self.usage = state.usage.clone();
+                self.structured_output_value = state.structured_output.clone();
+            }
+            Err(poisoned) => {
+                tracing::warn!(
+                    "ChatResponseHandle shared_state mutex was poisoned during finalize, recovering"
+                );
+                let state = poisoned.into_inner();
+                self.usage = state.usage.clone();
+                self.structured_output_value = state.structured_output.clone();
+            }
         }
     }
 

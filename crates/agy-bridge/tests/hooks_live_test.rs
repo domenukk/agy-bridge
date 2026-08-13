@@ -28,6 +28,7 @@ fn test_hooks_lifecycle_live() {
             let e1 = Arc::clone(&events);
             hook_runner.on_pre_turn("log_pre_turn", move |ctx| {
                 e1.lock().unwrap().push(format!("pre_turn: {}", ctx.prompt));
+                HookResult::allow()
             });
 
             let e2 = Arc::clone(&events);
@@ -160,6 +161,7 @@ fn test_on_tool_error_hook_live() {
                 e.lock()
                     .unwrap()
                     .push(format!("tool_error:{}:{}", ctx.tool_name, ctx.error));
+                None
             });
 
             // Also register pre_tool_call_decide to allow all tool calls.

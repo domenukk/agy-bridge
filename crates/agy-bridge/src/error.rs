@@ -6,6 +6,36 @@ use pyo3::prelude::*;
 
 use crate::streaming::StreamError;
 
+/// HTTP status code for `Too Many Requests` (429).
+pub const HTTP_TOO_MANY_REQUESTS: u16 = 429;
+
+/// Start of the HTTP server error 5xx status code range (500).
+pub const HTTP_SERVER_ERROR_MIN: u16 = 500;
+
+/// HTTP status code for `Service Unavailable` (503).
+pub const HTTP_SERVICE_UNAVAILABLE: u16 = 503;
+
+/// End of the HTTP server error 5xx status code range (599).
+pub const HTTP_SERVER_ERROR_MAX: u16 = 599;
+
+/// Unset / unknown HTTP status code (`0`).
+pub const HTTP_CODE_UNKNOWN: u16 = 0;
+
+/// Antigravity SDK connection error exception class name.
+const PY_CLASS_ANTIGRAVITY_CONNECTION_ERROR: &str = "AntigravityConnectionError";
+
+/// Antigravity SDK validation error exception class name.
+const PY_CLASS_ANTIGRAVITY_VALIDATION_ERROR: &str = "AntigravityValidationError";
+
+/// Pydantic validation error exception class name.
+const PY_CLASS_PYDANTIC_VALIDATION_ERROR: &str = "ValidationError";
+
+/// Python traceback module name.
+const PY_MODULE_TRACEBACK: &str = "traceback";
+
+/// Python traceback `format_exception` function name.
+const PY_FN_FORMAT_EXCEPTION: &str = "format_exception";
+
 /// All errors that can occur in the bridge layer.
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
@@ -85,43 +115,63 @@ impl Error {
     /// Currently retryable:
     /// - [`Error::ConnectionError`] — network-level failures
     /// - [`Error::QuotaExceeded`] — rate-limited, retry after backoff
-    /// - Backend errors containing HTTP 503 — server overload
-    ///
-    /// Classification only: the bridge itself is single-shot, so retrying is
-    /// the caller's responsibility (e.g. via `agent_resilience::backoff`).
+    /// - Stream errors carrying a retryable HTTP status (429 or any 5xx)
+    /// - Backend errors reporting `RESOURCE_EXHAUSTED` or HTTP 503
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::ConnectionError { .. } | Self::QuotaExceeded { .. } => true,
-            Self::BackendError { message } => message.contains("503"),
-            Self::Stream(se) => se.message.contains("503") || se.message.contains("429"),
+            Self::Stream(se) if se.http_code != HTTP_CODE_UNKNOWN => {
+                http_code_is_retryable(se.http_code)
+            }
+            Self::BackendError { message } | Self::Stream(StreamError { message, .. }) => {
+                message.contains("RESOURCE_EXHAUSTED")
+                    || message.contains("429")
+                    || message.contains("503")
+            }
             _ => false,
         }
     }
 
     /// Returns `true` if this error indicates a quota / rate-limit condition.
     ///
-    /// Matches the structured [`Error::QuotaExceeded`] variant as well as
-    /// backend errors whose message contains HTTP 429, 503, or
-    /// `RESOURCE_EXHAUSTED` status indicators.
+    /// Matches the structured [`Error::QuotaExceeded`] variant, stream errors
+    /// carrying a quota HTTP status (429 or 503), and backend/stream messages
+    /// reporting `RESOURCE_EXHAUSTED`, HTTP 429, or HTTP 503.
     #[must_use]
     pub fn is_quota_error(&self) -> bool {
         match self {
             Self::QuotaExceeded { .. } => true,
-            Self::BackendError { message } => {
-                message.contains("429")
-                    || message.contains("503")
-                    || message.contains("RESOURCE_EXHAUSTED")
+            Self::Stream(se) if se.http_code != HTTP_CODE_UNKNOWN => {
+                http_code_is_quota(se.http_code)
             }
-            Self::Stream(se) => {
-                se.message.contains("429")
-                    || se.message.contains("503")
-                    || se.message.contains("quota")
-                    || se.message.contains("RESOURCE_EXHAUSTED")
+            Self::BackendError { message } | Self::Stream(StreamError { message, .. }) => {
+                message.contains("RESOURCE_EXHAUSTED")
+                    || message.contains("429")
+                    || message.contains("503")
             }
             _ => false,
         }
     }
+}
+
+/// Whether an HTTP status code denotes a quota / rate-limit condition.
+///
+/// `429 Too Many Requests` (`RESOURCE_EXHAUSTED`) and `503 Service Unavailable`
+/// (model overload / "high demand") both warrant quota-style backoff, matching
+/// the harness's own retry guidance.
+#[must_use]
+pub const fn http_code_is_quota(code: u16) -> bool {
+    matches!(code, HTTP_TOO_MANY_REQUESTS | HTTP_SERVICE_UNAVAILABLE)
+}
+
+/// Whether an HTTP status code denotes a transiently retryable failure.
+///
+/// Rate limits (`429`) and any server-side `5xx` are transient: the harness
+/// logs a warning and continues iterating, so a higher-level retry may succeed.
+#[must_use]
+pub const fn http_code_is_retryable(code: u16) -> bool {
+    code == HTTP_TOO_MANY_REQUESTS || matches!(code, HTTP_SERVER_ERROR_MIN..=HTTP_SERVER_ERROR_MAX)
 }
 
 /// Converts a Python exception into the most specific [`Error`] variant.
@@ -183,92 +233,61 @@ pub(crate) fn classify_py_error(py: Python<'_>, err: &PyErr) -> Error {
 }
 
 fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    match crate::runtime::py_scripts::import_serialized(py, "google.antigravity.types") {
-        Ok(types_mod) => {
-            // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
-            if let Ok(conn_err_cls) = types_mod.getattr("AntigravityConnectionError")
-                && err.is_instance(py, &conn_err_cls)
-            {
+    match err.get_type(py).name() {
+        Ok(name) => {
+            if name == PY_CLASS_ANTIGRAVITY_CONNECTION_ERROR {
                 return Some(Error::ConnectionError {
                     message: err.to_string(),
                 });
             }
-            // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
-            if let Ok(val_err_cls) = types_mod.getattr("AntigravityValidationError")
-                && err.is_instance(py, &val_err_cls)
-            {
+            if name == PY_CLASS_ANTIGRAVITY_VALIDATION_ERROR {
                 return Some(Error::BackendError {
                     message: err.to_string(),
                 });
             }
         }
-        Err(import_err) => {
-            tracing::debug!(
-                error = %import_err,
-                "antigravity.types not available, skipping AntigravityError classification"
-            );
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to get exception type name for antigravity check");
         }
     }
     None
 }
 
 fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    match crate::runtime::py_scripts::import_serialized(py, "pydantic") {
-        Ok(pydantic) => {
-            // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
-            if let Ok(validation_err_cls) = pydantic.getattr("ValidationError")
-                && err.is_instance(py, &validation_err_cls)
-            {
-                return Some(Error::BackendError {
-                    message: err.to_string(),
-                });
-            }
-        }
-        Err(import_err) => {
-            tracing::debug!(
-                error = %import_err,
-                "pydantic not available, skipping ValidationError classification"
-            );
+    match err.get_type(py).name() {
+        Ok(name) if name == PY_CLASS_PYDANTIC_VALIDATION_ERROR => Some(Error::BackendError {
+            message: err.to_string(),
+        }),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to get exception type name for pydantic check");
+            None
         }
     }
-    None
 }
 
 fn check_builtin_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
-    // NOLINT: intentional fallthrough — if import fails, we skip the builtins check (logged in else)
-    if let Ok(builtins) = py.import("builtins") {
-        // NOLINT: intentional fallthrough — if getattr fails, the type isn't available and we skip this check
-        if let Ok(import_err_cls) = builtins.getattr("ImportError")
-            && err.is_instance(py, &import_err_cls)
-        {
-            return Some(Error::BackendError {
-                message: err.to_string(),
-            });
-        }
-    } else {
-        tracing::warn!("Failed to import Python builtins module, skipping ImportError check");
+    if err.is_instance_of::<pyo3::exceptions::PyImportError>(py) {
+        return Some(Error::BackendError {
+            message: err.to_string(),
+        });
     }
     None
 }
 
 /// Format a backend exception into a human-readable string including traceback.
 fn format_backend_error(py: Python<'_>, err: &PyErr) -> String {
-    // Try to get the full traceback via traceback.format_exception.
+    // Try to get the full traceback via traceback.format_exception(exc).
     let formatted = py
-        .import("traceback")
-        .and_then(|tb_mod| {
-            tb_mod.call_method1(
-                "format_exception",
-                (err.get_type(py), err.value(py), err.traceback(py)),
-            )
-        })
+        .import(PY_MODULE_TRACEBACK)
+        .and_then(|tb_mod| tb_mod.call_method1(PY_FN_FORMAT_EXCEPTION, (err.value(py),)))
         .and_then(|lines| lines.extract::<Vec<String>>());
 
     match formatted {
         Ok(lines) => lines.join(""),
         Err(fmt_err) => {
             tracing::warn!(error = %fmt_err, "Failed to format backend traceback, using fallback");
-            // Fall back to the inline traceback format that map_py_error used.
+            // Fall back to the inline traceback format.
             let traceback = err.traceback(py);
             traceback.as_ref().map_or_else(
                 || err.to_string(),
@@ -278,7 +297,7 @@ fn format_backend_error(py: Python<'_>, err: &PyErr) -> String {
                             tracing::warn!(error = %tb_fmt_err, "Failed to format Python traceback");
                             err.to_string()
                         },
-                        |tb_str| format!("{}\nTraceback:\n{}", err.value(py), tb_str),
+                        |tb_str| format!("{err}\nTraceback:\n{tb_str}"),
                     )
                 },
             )
@@ -314,27 +333,21 @@ mod tests {
     fn test_stream_error_conversion() {
         // All StreamErrors should pass through as Error::Stream — the bridge
         // does not interpret or reclassify stream error messages.
-        let safety_err = StreamError {
-            message: "Step error (status=ERROR): Candidate blocked by safety".to_string(),
-        };
+        let safety_err = StreamError::new("Step error (status=ERROR): Candidate blocked by safety");
         let mapped_safety = Error::from(safety_err);
         assert!(
             matches!(mapped_safety, Error::Stream(_)),
             "StreamError with 'safety' should pass through as Error::Stream"
         );
 
-        let max_tokens_err = StreamError {
-            message: "Step error (status=ERROR): Max tokens reached".to_string(),
-        };
+        let max_tokens_err = StreamError::new("Step error (status=ERROR): Max tokens reached");
         let mapped_max_tokens = Error::from(max_tokens_err);
         assert!(
             matches!(mapped_max_tokens, Error::Stream(_)),
             "StreamError with 'max tokens' should pass through as Error::Stream"
         );
 
-        let other_err = StreamError {
-            message: "Some other connection issue".to_string(),
-        };
+        let other_err = StreamError::new("Some other connection issue");
         let mapped_other = Error::from(other_err);
         match mapped_other {
             Error::Stream(e) => {
@@ -453,9 +466,7 @@ mod tests {
 
     #[test]
     fn test_stream_error_from_conversion() {
-        let stream_err = StreamError {
-            message: "connection reset".to_string(),
-        };
+        let stream_err = StreamError::new("connection reset");
         let bridge_err = Error::from(stream_err);
         match &bridge_err {
             Error::Stream(inner) => {
@@ -467,9 +478,7 @@ mod tests {
 
     #[test]
     fn test_stream_error_display_through_bridge() {
-        let stream_err = StreamError {
-            message: "quota exceeded".to_string(),
-        };
+        let stream_err = StreamError::new("quota exceeded");
         let bridge_err = Error::from(stream_err);
         let display = format!("{bridge_err}");
         assert!(
@@ -521,9 +530,7 @@ mod tests {
 
     #[test]
     fn test_is_not_retryable_stream() {
-        let err = Error::Stream(StreamError {
-            message: "stream failed".to_string(),
-        });
+        let err = Error::Stream(StreamError::new("stream failed"));
         assert!(!err.is_retryable());
     }
 
@@ -582,5 +589,63 @@ mod tests {
                 .to_string(),
         };
         assert!(err.is_quota_error());
+    }
+
+    #[test]
+    fn test_stream_http_code_429_is_quota_and_retryable() {
+        // A structured 429 classifies as quota + retryable regardless of the
+        // (deliberately unhelpful) message text.
+        let err = Error::Stream(StreamError::with_http_code("rate limited", 429));
+        assert!(err.is_quota_error());
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn test_stream_http_code_503_is_quota_and_retryable() {
+        let err = Error::Stream(StreamError::with_http_code("service unavailable", 503));
+        assert!(err.is_quota_error());
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn test_stream_http_code_500_is_retryable_not_quota() {
+        // Generic 5xx is transiently retryable but is not a quota condition.
+        let err = Error::Stream(StreamError::with_http_code("internal error", 500));
+        assert!(err.is_retryable());
+        assert!(!err.is_quota_error());
+    }
+
+    #[test]
+    fn test_stream_http_code_400_is_neither() {
+        // Client errors (e.g. bad request) are terminal: not retryable, not quota.
+        let err = Error::Stream(StreamError::with_http_code("bad request", 400));
+        assert!(!err.is_retryable());
+        assert!(!err.is_quota_error());
+    }
+
+    #[test]
+    fn test_stream_http_code_is_authoritative_over_message() {
+        // The structured code wins even when the message would substring-match
+        // a quota indicator: a real 400 carrying the text "429" is still a
+        // terminal client error, not a rate limit.
+        let err = Error::Stream(StreamError::with_http_code(
+            "error 429 mentioned in prose",
+            400,
+        ));
+        assert!(!err.is_quota_error());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_stream_unknown_http_code_falls_back_to_message() {
+        // http_code == 0 (unknown, e.g. a Python-level exception) falls back to
+        // substring classification so no signal is lost.
+        let quota = Error::Stream(StreamError::new("HTTP 429 Too Many Requests"));
+        assert!(quota.is_quota_error());
+        assert!(quota.is_retryable());
+
+        let plain = Error::Stream(StreamError::new("some unrelated failure"));
+        assert!(!plain.is_quota_error());
+        assert!(!plain.is_retryable());
     }
 }

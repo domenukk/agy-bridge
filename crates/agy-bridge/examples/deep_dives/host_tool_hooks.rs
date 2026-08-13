@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     hooks.on_pre_turn("log_pre_turn", |ctx| {
         println!("[Hook] Pre-turn — user prompt: {:?}", ctx.prompt);
+        HookResult::allow()
     });
 
     hooks.on_post_turn("log_post_turn", |ctx| {
@@ -77,6 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     hooks.on_tool_error("log_tool_error", |ctx| {
         println!("[Hook] Tool error — {}", ctx.error);
+        // Observe only — let the harness use its default error formatting.
+        None
     });
 
     // No manual HookEntry construction needed — the AgentBuilder

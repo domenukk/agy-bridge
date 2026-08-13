@@ -493,7 +493,20 @@ impl AgentBuilder<'_> {
         self
     }
 
-    /// Set a pre-existing conversation ID to resume.
+    /// Resume an existing conversation by its SDK id.
+    ///
+    /// Set this to an id previously returned by
+    /// [`AgentHandle::conversation_id`](agent::AgentHandle::conversation_id) to
+    /// resume that conversation. The local harness uses it as the trajectory
+    /// `cascade_id` to reload, so it **must** reference a conversation already
+    /// persisted under the agent's `save_dir`; an unknown id fails agent
+    /// creation with "conversation not found".
+    ///
+    /// Leave this unset to start a fresh conversation — the harness assigns a
+    /// new id, observable afterwards via
+    /// [`AgentHandle::conversation_id`](agent::AgentHandle::conversation_id) and
+    /// custom-tool [`ToolContext::conversation_id`](tools::ToolContext). To
+    /// resume later, persist that id together with the same `save_dir`.
     #[must_use]
     pub fn conversation_id(mut self, id: impl Into<String>) -> Self {
         self.config.conversation_id = Some(id.into());

@@ -16,9 +16,9 @@ pub use mcp_json::*;
 pub use models::*;
 
 /// Default primary model name.
-pub const DEFAULT_MODEL: &str = "gemini-3.5-flash";
+pub const DEFAULT_MODEL: &str = "gemini-3.6-flash";
 /// Default image generation model name.
-pub const DEFAULT_IMAGE_GENERATION_MODEL: &str = "gemini-3.1-flash-image-preview";
+pub const DEFAULT_IMAGE_GENERATION_MODEL: &str = "gemini-3.1-flash-lite-image";
 
 const DEFAULT_MCP_TIMEOUT_SECS: f64 = 30.0;
 const DEFAULT_MCP_SSE_READ_TIMEOUT_SECS: f64 = 300.0;

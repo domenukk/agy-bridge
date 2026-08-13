@@ -18,7 +18,6 @@ sys.path.insert(
 
 import agent_init  # noqa: E402
 
-
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
 
@@ -321,11 +320,15 @@ def test_serialize_generic_fallback_str():
 # ── _munge_config_model ──────────────────────────────────────────────────────
 
 
-def test_munge_config_model_drops_model_when_gemini_present():
-    cfg = {"model": "gemini-pro", "gemini_config": {"models": {"default": "x"}}}
+def test_munge_config_model_promotes_gemini_config_to_toplevel():
+    cfg = {
+        "model": "gemini-pro",
+        "gemini_config": {"models": {"default": "x"}, "api_key": "secret"},
+    }
     agent_init._munge_config_model(cfg)
-    assert "model" not in cfg
-    assert "gemini_config" in cfg
+    assert cfg["model"] == "x"
+    assert cfg["api_key"] == "secret"
+    assert "gemini_config" not in cfg
 
 
 def test_munge_config_model_keeps_model_when_no_gemini():
