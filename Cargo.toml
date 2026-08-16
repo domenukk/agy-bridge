@@ -4,8 +4,8 @@ resolver = "3"
 
 [workspace.dependencies]
 # workspace crates
-agy-bridge = { path = "crates/agy-bridge", version = "0.9.4" }
-agy-bridge-test-support = { path = "crates/agy-bridge-test-support" }
+agy-bridge = { path = "crates/agy-bridge", version = "0.10.0", default-features = false }
+agy-bridge-test-support = { path = "crates/agy-bridge-test-support", default-features = false }
 llm-tool = { version = "0.9.4" }
 llm-tool-macros = { version = "0.9.4" }
 
@@ -49,6 +49,18 @@ fast_rands = "0.16"
 tempfile = "3"
 trybuild = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# native backend & proto
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3.2"
+pbjson = "0.9"
+pbjson-build = "0.9"
+pbjson-types = "0.9"
+tokio-tungstenite = "0.30"
+ureq = { version = "3", features = ["json"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

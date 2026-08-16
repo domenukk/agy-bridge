@@ -4,9 +4,11 @@
 //! / ``policy.workspace_only()`` calls.
 
 pub mod path;
+#[cfg(feature = "python")]
 pub(crate) mod pyhook;
 mod rules;
 
 pub use path::*;
+#[cfg(feature = "python")]
 pub(crate) use pyhook::*;
 pub use rules::*;

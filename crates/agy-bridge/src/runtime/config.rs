@@ -69,6 +69,9 @@ pub struct RuntimeConfig {
     /// `None` uses the built-in default (256). Each chat call creates
     /// ~7 channels of this size.
     pub streaming_channel_buffer: Option<usize>,
+    /// Explicit path to the local harness binary (direct backend only).
+    /// If `None`, standard discovery search is performed.
+    pub harness_binary_path: Option<std::path::PathBuf>,
 }
 
 impl Default for RuntimeConfig {
@@ -81,6 +84,7 @@ impl Default for RuntimeConfig {
             max_consecutive_model_errors: None,
             max_consecutive_empty_steps: None,
             streaming_channel_buffer: None,
+            harness_binary_path: None,
         }
     }
 }

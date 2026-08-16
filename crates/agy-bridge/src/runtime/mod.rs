@@ -38,29 +38,51 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(feature = "python")]
 use crate::error::Error;
 
+#[cfg(feature = "native")]
+pub mod native;
+#[cfg(feature = "native")]
+pub use native::NativeRuntime;
+
 pub(crate) mod bridge_state;
-pub(crate) mod command_loop;
 mod config;
+
+#[cfg(feature = "python")]
+pub(crate) mod command_loop;
+#[cfg(feature = "python")]
 pub(crate) mod ffi_dispatch;
+#[cfg(feature = "python")]
 mod handlers;
+#[cfg(feature = "python")]
 pub(crate) mod py_scripts;
+#[cfg(feature = "python")]
 pub(crate) mod streaming;
+#[cfg(feature = "python")]
 pub(crate) mod venv;
 
 #[cfg(test)]
+#[cfg(feature = "python")]
 mod tests;
 
 // Re-export items used by sibling modules and external crate consumers.
-pub(crate) use bridge_state::{AgentBridgeState, AgentId, bridge_state, next_agent_id};
+#[cfg(feature = "python")]
+pub(crate) use bridge_state::AgentId;
+#[cfg(test)]
+pub(crate) use bridge_state::set_agent_conversation_id;
+pub(crate) use bridge_state::{
+    AgentBridgeState, bridge_state, initializing_hook_runners, next_agent_id,
+};
 pub use config::{BackendLogLevel, RuntimeConfig};
+#[cfg(feature = "python")]
 pub(crate) use ffi_dispatch::{
     dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool,
-    initializing_hook_runners, set_agent_conversation_id,
 };
 
 /// Default delay between successive chat commands to prevent burst requests.
@@ -76,6 +98,7 @@ const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Each variant is constructed in `impl Runtime for PythonRuntime` and
 /// dispatched in `command_loop::run_async_command_loop`.
+#[cfg(feature = "python")]
 pub(crate) enum PyCommand {
     /// Create a new agent with the given configuration dict as JSON.
     ///
@@ -199,12 +222,14 @@ pub(crate) enum PyCommand {
 ///
 /// All Python/SDK interactions go through the command channel. This isolates
 /// GIL acquisition to the Python thread and keeps the tokio runtime responsive.
+#[cfg(feature = "python")]
 pub struct PythonRuntime {
     cmd_tx: Option<mpsc::Sender<PyCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
     config: RuntimeConfig,
 }
 
+#[cfg(feature = "python")]
 impl std::fmt::Debug for PythonRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PythonRuntime")
@@ -217,6 +242,7 @@ impl std::fmt::Debug for PythonRuntime {
     }
 }
 
+#[cfg(feature = "python")]
 impl PythonRuntime {
     /// Spawn a new Python runtime on a dedicated thread.
     ///
@@ -366,17 +392,19 @@ impl PythonRuntime {
     }
 }
 
+#[cfg(feature = "python")]
 impl Drop for PythonRuntime {
     fn drop(&mut self) {
         // If `shutdown()` was already called it took the thread handle, so
         // there is nothing left to clean up.
+        let Some(tx) = self.cmd_tx.take() else {
+            return;
+        };
         let Some(thread) = self.thread.take() else {
             return;
         };
 
-        // Prompt the command loop to stop and close the channel immediately.
-        let tx = self.cmd_tx.take();
-        if let Some(ref tx) = tx
+        if !thread.is_finished()
             && let Err(e) = tx.try_send(PyCommand::Shutdown)
         {
             tracing::debug!(
@@ -388,10 +416,6 @@ impl Drop for PythonRuntime {
         // Explicitly drop sender so the receiver encounters EOF immediately.
         drop(tx);
 
-        // Wait — bounded by the configured shutdown timeout — for the Python
-        // thread to finish releasing resources. This keeps teardown
-        // deterministic (no leaked Python objects) without risking an
-        // unbounded block if the thread misbehaves.
         let deadline = std::time::Instant::now() + self.config.shutdown_timeout;
         while !thread.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -404,9 +428,6 @@ impl Drop for PythonRuntime {
                 tracing::debug!("Python runtime thread joined cleanly on drop");
             }
         } else {
-            // Dropping `cmd_tx` (right after this returns) closes the channel,
-            // so the loop still exits and cleans up; we simply stop blocking
-            // the dropping thread past the timeout.
             tracing::warn!(
                 "Python runtime thread still running after shutdown timeout during drop — \
                  detaching; agent cleanup will complete asynchronously"
@@ -416,6 +437,7 @@ impl Drop for PythonRuntime {
 }
 
 /// Entry point for the dedicated Python thread.
+#[cfg(feature = "python")]
 fn python_thread_main(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) {
     Python::initialize();
 
@@ -442,6 +464,7 @@ fn python_thread_main(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig)
 
 /// Live SDK thread: creates an asyncio event loop and dispatches commands
 /// to the real Antigravity SDK via `pyo3_async_runtimes`.
+#[cfg(feature = "python")]
 fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) -> Result<(), Error> {
     Python::attach(|py| {
         let asyncio = py.import("asyncio").map_err(|e| Error::BackendError {
@@ -551,6 +574,7 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 /// isolated. This map is the per-runtime successor to the legacy `EVENT_LOOP`
 /// attribute and is read by the fallback path in `agent_init.py`, which runs on
 /// this same runtime thread (so the idents match).
+#[cfg(feature = "python")]
 fn register_thread_event_loop(
     py: Python<'_>,
     globals_mod: &Bound<'_, PyAny>,
@@ -593,8 +617,7 @@ fn register_thread_event_loop(
     Ok(())
 }
 
-/// Unregister the current thread's event loop from the process-global
-/// `_agy_bridge_globals.EVENT_LOOPS` map on runtime thread teardown.
+#[cfg(feature = "python")]
 fn unregister_thread_event_loop(py: Python<'_>, globals_mod: &Bound<'_, PyAny>) {
     let unregister_res = (|| -> PyResult<()> {
         let threading = py.import("threading")?;
@@ -617,6 +640,7 @@ fn unregister_thread_event_loop(py: Python<'_>, globals_mod: &Bound<'_, PyAny>) 
 /// - `enabled_tools: Some(list)` → only those tools are active.
 /// - `disabled_tools: Some(list)` → all tools minus the disabled ones.
 /// - Neither set → all builtin tools are active.
+#[cfg(feature = "python")]
 fn compute_active_builtins(
     config: &crate::config::AgentConfig,
 ) -> Vec<crate::config::BuiltinTools> {
@@ -635,7 +659,7 @@ fn compute_active_builtins(
         return crate::config::BuiltinTools::all_tools()
             .iter()
             .filter(|t| !disabled.contains(t))
-            .cloned()
+            .copied()
             .collect();
     }
 
@@ -643,6 +667,7 @@ fn compute_active_builtins(
     crate::config::BuiltinTools::all_tools().to_vec()
 }
 
+#[cfg(feature = "python")]
 impl crate::agent::Runtime for PythonRuntime {
     async fn create_agent(
         &self,

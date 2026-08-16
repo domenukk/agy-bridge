@@ -43,8 +43,10 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
     let confirm_func = pyo3::wrap_pyfunction!(dispatch_rust_policy_confirm, globals_module)?;
     agy_bridge_globals.setattr(DISPATCH_RUST_POLICY_CONFIRM_ATTR, confirm_func)?;
 
-    let set_conv_id_func =
-        pyo3::wrap_pyfunction!(crate::runtime::set_agent_conversation_id, globals_module)?;
+    let set_conv_id_func = pyo3::wrap_pyfunction!(
+        crate::runtime::ffi_dispatch::set_agent_conversation_id,
+        globals_module
+    )?;
     agy_bridge_globals.setattr(SET_AGENT_CONVERSATION_ID_ATTR, set_conv_id_func)?;
 
     globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;

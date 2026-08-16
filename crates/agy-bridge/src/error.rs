@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 use crate::streaming::StreamError;
@@ -21,18 +22,23 @@ pub const HTTP_SERVER_ERROR_MAX: u16 = 599;
 /// Unset / unknown HTTP status code (`0`).
 pub const HTTP_CODE_UNKNOWN: u16 = 0;
 
+#[cfg(feature = "python")]
 /// Antigravity SDK connection error exception class name.
 const PY_CLASS_ANTIGRAVITY_CONNECTION_ERROR: &str = "AntigravityConnectionError";
 
+#[cfg(feature = "python")]
 /// Antigravity SDK validation error exception class name.
 const PY_CLASS_ANTIGRAVITY_VALIDATION_ERROR: &str = "AntigravityValidationError";
 
+#[cfg(feature = "python")]
 /// Pydantic validation error exception class name.
 const PY_CLASS_PYDANTIC_VALIDATION_ERROR: &str = "ValidationError";
 
+#[cfg(feature = "python")]
 /// Python traceback module name.
 const PY_MODULE_TRACEBACK: &str = "traceback";
 
+#[cfg(feature = "python")]
 /// Python traceback `format_exception` function name.
 const PY_FN_FORMAT_EXCEPTION: &str = "format_exception";
 
@@ -198,6 +204,7 @@ impl From<StreamError> for Error {
     }
 }
 
+#[cfg(feature = "python")]
 #[doc(hidden)]
 impl From<PyErr> for Error {
     fn from(err: PyErr) -> Self {
@@ -205,6 +212,7 @@ impl From<PyErr> for Error {
     }
 }
 
+#[cfg(feature = "python")]
 #[doc(hidden)]
 impl From<Error> for PyErr {
     fn from(err: Error) -> Self {
@@ -212,6 +220,7 @@ impl From<Error> for PyErr {
     }
 }
 
+#[cfg(feature = "python")]
 /// Classify a Python exception into the most specific [`Error`] variant.
 ///
 /// This is the single source of truth for mapping `PyErr` → [`Error`].
@@ -232,6 +241,7 @@ pub(crate) fn classify_py_error(py: Python<'_>, err: &PyErr) -> Error {
     Error::BackendError { message }
 }
 
+#[cfg(feature = "python")]
 fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     match err.get_type(py).name() {
         Ok(name) => {
@@ -253,6 +263,7 @@ fn check_antigravity_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     None
 }
 
+#[cfg(feature = "python")]
 fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     match err.get_type(py).name() {
         Ok(name) if name == PY_CLASS_PYDANTIC_VALIDATION_ERROR => Some(Error::BackendError {
@@ -266,6 +277,7 @@ fn check_pydantic_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     }
 }
 
+#[cfg(feature = "python")]
 fn check_builtin_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     if err.is_instance_of::<pyo3::exceptions::PyImportError>(py) {
         return Some(Error::BackendError {
@@ -275,6 +287,7 @@ fn check_builtin_error(py: Python<'_>, err: &PyErr) -> Option<Error> {
     None
 }
 
+#[cfg(feature = "python")]
 /// Format a backend exception into a human-readable string including traceback.
 fn format_backend_error(py: Python<'_>, err: &PyErr) -> String {
     // Try to get the full traceback via traceback.format_exception(exc).
@@ -358,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "python")]
     fn test_backend_error_from_pyerr() {
         Python::initialize();
         let err = Python::attach(|py| {

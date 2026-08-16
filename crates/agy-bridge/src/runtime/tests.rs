@@ -16,6 +16,7 @@ fn test_config() -> RuntimeConfig {
         max_consecutive_model_errors: None,
         max_consecutive_empty_steps: None,
         streaming_channel_buffer: None,
+        harness_binary_path: None,
     }
 }
 

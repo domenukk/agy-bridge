@@ -427,6 +427,7 @@ impl Step {
     }
 }
 
+#[cfg(feature = "python")]
 macro_rules! impl_from_py_object {
     ($($t:ty),+) => {
         $(
@@ -448,6 +449,7 @@ macro_rules! impl_from_py_object {
     };
 }
 
+#[cfg(feature = "python")]
 impl_from_py_object!(
     StepType,
     StepSource,
@@ -1089,6 +1091,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[cfg(feature = "python")]
     fn test_pyo3_extract_roundtrip() {
         use pyo3::{prelude::*, types::PyDictMethods};
         pyo3::Python::initialize();

@@ -82,6 +82,7 @@ async fn conversation_id_tracking() {
 }
 
 #[tokio::test]
+#[cfg(feature = "python")]
 async fn ffi_session_start_does_not_inject_session_id_as_conversation_id() {
     let rt = Arc::new(ToolAwareMockRuntime::new());
     let agent = AgentHandle::new(rt, test_config(), None, None, None)

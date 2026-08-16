@@ -10,28 +10,8 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 
 use super::bridge_state::bridge_state;
-
 /// Per-agent hook runners installed *during* `create_agent`, before the
-/// permanent [`bridge_state()`] entry exists.
-///
-/// Hooks such as `on_session_start` can fire from the SDK while the agent's
-/// `__aenter__` runs — i.e. before `setup_bridge_state` has registered the
-/// permanent entry. This registry provides the hook runner in that window.
-///
-/// Keyed by (process-globally-unique) agent ID so that concurrent creates —
-/// on the same *or* different bridges — never block on a shared lock or
-/// clobber each other's runner. Entries are inserted before `create_agent`
-/// and removed once the permanent bridge state is registered.
-static INITIALIZING_HOOK_RUNNERS: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>>,
-> = std::sync::OnceLock::new();
-
-/// Access the per-agent initializing hook-runner registry.
-pub(crate) fn initializing_hook_runners()
--> &'static std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>> {
-    INITIALIZING_HOOK_RUNNERS
-        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
-}
+pub(crate) use super::bridge_state::initializing_hook_runners;
 
 /// Execute a hook by name, deserializing the context JSON and calling the
 /// appropriate method on the runner. Returns the serialized result (empty
@@ -231,34 +211,7 @@ fn handle_on_session_start(
 /// mutex, and never re-enters Python, so it cannot deadlock the event loop.
 #[pyfunction]
 pub(crate) fn set_agent_conversation_id(agent_id: u64, conversation_id: String) -> PyResult<()> {
-    let map = bridge_state().read().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
-    })?;
-    let Some(entry) = map.get(&agent_id) else {
-        // The agent may have been shut down between the harness assigning the
-        // id and this callback; nothing to update.
-        tracing::debug!(agent_id, "set_agent_conversation_id: no bridge state entry");
-        return Ok(());
-    };
-    match entry.conversation_id.lock() {
-        Ok(mut guard) => {
-            if guard.as_deref() != Some(conversation_id.as_str()) {
-                tracing::debug!(
-                    agent_id,
-                    conversation_id = %conversation_id,
-                    "Storing SDK-assigned conversation id"
-                );
-                *guard = Some(conversation_id);
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                agent_id,
-                error = %e,
-                "conversation_id mutex poisoned — SDK id not stored"
-            );
-        }
-    }
+    super::bridge_state::set_agent_conversation_id(agent_id, conversation_id)?;
     Ok(())
 }
 

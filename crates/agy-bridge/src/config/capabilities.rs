@@ -6,7 +6,7 @@ use typed_builder::TypedBuilder;
 use super::DEFAULT_IMAGE_GENERATION_MODEL;
 
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BuiltinTools {
     /// List files and subdirectories.
     #[serde(rename = "list_directory")]
@@ -270,6 +270,7 @@ impl Default for CapabilitiesConfig {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "python")]
     use pyo3::types::PyAnyMethods;
 
     use super::*;
@@ -515,6 +516,7 @@ mod tests {
 
     /// Verify our `BuiltinTools` enum exactly matches the Python SDK's tool names.
     #[test]
+    #[cfg(feature = "python")]
     fn builtin_tools_match_python_sdk() {
         pyo3::Python::initialize();
         pyo3::Python::attach(|py| {

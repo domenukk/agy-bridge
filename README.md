@@ -12,11 +12,13 @@ via [PyO3](https://pyo3.rs).
 
 ## Installation
 
+### Option 1: Python Backend (Default)
+
 Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.9"
+agy-bridge = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -25,6 +27,19 @@ Install the Python SDK:
 ```bash
 pip install google-antigravity watchfiles
 ```
+
+### Option 2: Native Backend (Pure Rust)
+
+For environments without Python, use the standalone native backend powered
+by the `localharness` binary:
+
+```toml
+[dependencies]
+agy-bridge = { version = "0.10", default-features = false, features = ["native"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### API Key Setup
 
 Set your API key (or put it in a `.env` file):
 

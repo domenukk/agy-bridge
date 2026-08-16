@@ -9,10 +9,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(feature = "python")]
 /// Opaque agent identifier returned by the runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct AgentId(pub(crate) u64);
 
+#[cfg(feature = "python")]
 impl std::fmt::Display for AgentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "agent-{}", self.0)
@@ -41,6 +43,7 @@ pub(crate) struct AgentBridgeState {
     pub(crate) registry: Option<Arc<crate::tools::ToolRegistry>>,
     /// Lifecycle hooks for pre/post turn, tool-call gating, etc.
     pub(crate) hook_runner: Option<Arc<crate::hooks::Hooks>>,
+    #[cfg(feature = "python")]
     /// Policy rules governing tool-call permissions.
     pub(crate) policies: crate::policies::PolicySet,
     /// Interactive confirmation handler for `NeedsConfirmation` policies.
@@ -176,6 +179,58 @@ static BRIDGE_STATE: std::sync::OnceLock<
 pub(crate) fn bridge_state()
 -> &'static std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>> {
     BRIDGE_STATE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Per-agent hook runners registered *before* the agent handle is fully
+/// constructed, so that `on_session_start` hooks can fire during initialization.
+static INITIALIZING_HOOK_RUNNERS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>>,
+> = std::sync::OnceLock::new();
+
+/// Access the per-agent initializing hook-runner registry.
+pub(crate) fn initializing_hook_runners()
+-> &'static std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>> {
+    INITIALIZING_HOOK_RUNNERS
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Store a conversation ID assigned to an agent.
+pub(crate) fn set_agent_conversation_id(
+    agent_id: u64,
+    conversation_id: String,
+) -> Result<(), crate::error::Error> {
+    let map = bridge_state()
+        .read()
+        .map_err(|e| crate::error::Error::BackendError {
+            message: format!("Failed to read BRIDGE_STATE: {e}"),
+        })?;
+    let Some(entry) = map.get(&agent_id) else {
+        tracing::debug!(agent_id, "set_agent_conversation_id: no bridge state entry");
+        return Ok(());
+    };
+    match entry.conversation_id.lock() {
+        Ok(mut guard) => {
+            if guard.as_deref() != Some(conversation_id.as_str()) {
+                tracing::debug!(
+                    agent_id,
+                    conversation_id = %conversation_id,
+                    "Storing conversation id"
+                );
+                *guard = Some(conversation_id);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "conversation_id mutex poisoned — conversation id not stored"
+            );
+            Err(crate::error::Error::BackendError {
+                message: "conversation_id mutex poisoned".to_string(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

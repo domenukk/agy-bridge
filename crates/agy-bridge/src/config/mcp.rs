@@ -208,13 +208,14 @@ impl McpStreamableHttpServer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "python")]
     use pyo3::types::PyAnyMethods;
 
-    use super::{
-        super::{DEFAULT_MCP_SSE_READ_TIMEOUT_SECS, DEFAULT_MCP_TIMEOUT_SECS},
-        *,
-    };
+    #[cfg(feature = "python")]
+    use super::super::{DEFAULT_MCP_SSE_READ_TIMEOUT_SECS, DEFAULT_MCP_TIMEOUT_SECS};
+    use super::*;
 
+    #[cfg(feature = "python")]
     fn py_pydantic_field_default(module: &str, class: &str, field: &str) -> f64 {
         pyo3::Python::initialize();
         pyo3::Python::attach(|py| {
@@ -337,6 +338,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "python")]
     fn mcp_timeout_matches_python_sdk() {
         let py_val = py_pydantic_field_default(
             "google.antigravity.types",
@@ -350,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "python")]
     fn mcp_sse_read_timeout_matches_python_sdk() {
         let py_val = py_pydantic_field_default(
             "google.antigravity.types",

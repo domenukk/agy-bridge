@@ -1,9 +1,9 @@
 [package]
 name = "agy-bridge"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Rust bridge for the Google Antigravity SDK (Python) via PyO3"
+description = "Async Rust bridge and native runtime for the Google Antigravity SDK"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/domenukk/agy-bridge"
 readme = "README.md"
@@ -20,8 +20,6 @@ exclude = [
 [dependencies]
 llm-tool-macros.workspace = true
 llm-tool.workspace = true
-pyo3.workspace = true
-pyo3-async-runtimes.workspace = true
 tokio.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -32,7 +30,26 @@ base64.workspace = true
 typed-builder.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
-pythonize.workspace = true
+
+# python backend
+pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
+pythonize = { workspace = true, optional = true }
+
+# native backend
+prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
+pbjson = { workspace = true, optional = true }
+pbjson-types = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+
+[build-dependencies]
+prost-build = { workspace = true, optional = true }
+protoc-bin-vendored = { workspace = true, optional = true }
+pbjson-build = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+serde_json.workspace = true
 
 [dev-dependencies]
 agy-bridge-test-support.workspace = true
@@ -45,6 +62,20 @@ tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 workspace = true
 
 [features]
+default = ["python"]
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:pythonize"]
+native = [
+  "dep:prost",
+  "dep:prost-types",
+  "dep:pbjson",
+  "dep:pbjson-types",
+  "dep:tokio-tungstenite",
+  "dep:prost-build",
+  "dep:protoc-bin-vendored",
+  "dep:pbjson-build",
+  "dep:ureq",
+  "dep:zip",
+]
 md-tmpl = ["llm-tool/md-tmpl"]
 
 [[example]]

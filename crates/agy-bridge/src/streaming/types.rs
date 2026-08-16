@@ -12,7 +12,7 @@ use crate::types::{Step, UsageMetadata};
 /// Carries the full response text alongside optional metadata (token usage,
 /// structured output). Dereferences to `&str` for ergonomic use:
 ///
-/// ```rust
+/// ```rust,no_run
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), agy_bridge::error::Error> {
 /// # agy_bridge::load_dotenv();

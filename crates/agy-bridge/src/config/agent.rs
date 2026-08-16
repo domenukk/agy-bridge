@@ -379,11 +379,13 @@ fn default_policies() -> Vec<PolicyRule> {
 // NOLINT: tests must exercise the deprecated constructors until they are removed.
 #[allow(deprecated)]
 mod tests {
+    #[cfg(feature = "python")]
     use pyo3::types::PyAnyMethods;
 
+    #[cfg(feature = "python")]
+    use super::super::DEFAULT_IMAGE_GENERATION_MODEL;
     use super::{
         super::{
-            DEFAULT_IMAGE_GENERATION_MODEL,
             capabilities::BuiltinTools,
             models::{
                 GenerationConfig, ModelConfig, ModelEntry, ThinkingLevel, default_image_model_entry,
@@ -824,6 +826,7 @@ mod tests {
     // require `pyo3::Python::initialize()` and a venv with the
     // SDK installed.
 
+    #[cfg(feature = "python")]
     /// Helper: extract a Python module-level attribute as a `String`.
     fn py_str_attr(module: &str, attr: &str) -> String {
         pyo3::Python::initialize();
@@ -840,6 +843,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "python")]
     fn default_model_matches_python_sdk() {
         let py_val = py_str_attr("google.antigravity.models", "DEFAULT_MODEL");
         assert_eq!(
@@ -849,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "python")]
     fn default_image_model_matches_python_sdk() {
         let py_val = py_str_attr(
             "google.antigravity.models",

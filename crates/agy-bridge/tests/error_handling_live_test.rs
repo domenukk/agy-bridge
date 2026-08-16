@@ -74,7 +74,9 @@ fn live_error_recovery_force_python_error() {
                 let err_str = format!("{:?}", result.err().unwrap());
                 eprintln!("Clean Rust error from Python on init: {err_str}");
                 assert!(
-                    err_str.contains("Python") || err_str.contains("Error"),
+                    err_str.contains("Python")
+                        || err_str.contains("Error")
+                        || err_str.contains("InvalidConfig"),
                     "Should have an error message indicating failure"
                 );
             }

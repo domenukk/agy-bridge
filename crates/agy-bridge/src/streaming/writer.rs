@@ -108,12 +108,26 @@ impl ChatResponseWriter {
         item: T,
         channel: &'static str,
     ) {
-        if !subscribed.load(Ordering::Acquire) {
-            return;
-        }
-        if let Err(e) = tx.send(item).await {
-            subscribed.store(false, Ordering::Release);
-            tracing::debug!(channel, error = %e, "fan-out receiver dropped; unsubscribing view");
+        if subscribed.load(Ordering::Acquire) {
+            if let Err(e) = tx.send(item).await {
+                subscribed.store(false, Ordering::Release);
+                tracing::debug!(channel, error = %e, "fan-out receiver dropped; unsubscribing view");
+            }
+        } else {
+            // Not explicitly subscribed yet: attempt non-blocking send so initial tokens
+            // are buffered before the caller attaches, but never block if the view is unused.
+            match tx.try_send(item) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::trace!(
+                        channel,
+                        "view buffer full without subscriber; skipping item"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(channel, "fan-out receiver closed before subscription");
+                }
+            }
         }
     }
 

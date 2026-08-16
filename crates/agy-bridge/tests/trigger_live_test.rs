@@ -1,15 +1,16 @@
-/// Tests for the trigger data model and SDK integration surface.
-///
-/// Full end-to-end trigger tests (every, `on_file_change`) require a persistent
-/// Python asyncio event loop for the SDK's `TriggerRunner` to run background
-/// tasks. Our architecture bridges Python coroutines transiently via
-/// `pyo3_async_runtimes`, so `asyncio.create_task()` in the `TriggerRunner` has
-/// no event loop to tick on between bridged calls.
-///
-/// These tests validate:
-/// 1. `TriggerEntry`/`TriggerConfig` serialization roundtrips correctly
-/// 2. The triggers field is accepted by the SDK's `LocalAgentConfig`
-/// 3. Agent creation with triggers succeeds (SDK parses them)
+//! Tests for the trigger data model and SDK integration surface.
+//!
+//! Full end-to-end trigger tests (every, `on_file_change`) require a persistent
+//! Python asyncio event loop for the SDK's `TriggerRunner` to run background
+//! tasks. Our architecture bridges Python coroutines transiently via
+//! `pyo3_async_runtimes`, so `asyncio.create_task()` in the `TriggerRunner` has
+//! no event loop to tick on between bridged calls.
+//!
+//! These tests validate:
+//! 1. `TriggerEntry`/`TriggerConfig` serialization roundtrips correctly
+//! 2. The triggers field is accepted by the SDK's `LocalAgentConfig`
+//! 3. Agent creation with triggers succeeds (SDK parses them)
+
 use agy_bridge::prelude::*;
 
 mod common;

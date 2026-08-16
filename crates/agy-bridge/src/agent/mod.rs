@@ -26,11 +26,6 @@ pub type AgentId = u64;
 ///
 /// This allows unit tests to inject a mock runtime without requiring a live
 /// Python interpreter. The real implementation will call through to `PyO3`.
-// NOLINT: async_fn_in_trait is intentional — Runtime is not object-safe by design
-#[expect(
-    async_fn_in_trait,
-    reason = "Runtime is not object-safe by design; callers always know the concrete type"
-)]
 pub trait Runtime: Send + Sync {
     /// Create an agent from the given config, returning its ID and the list
     /// of all available tools (custom, MCP, and builtin) with metadata.
@@ -38,89 +33,140 @@ pub trait Runtime: Send + Sync {
     /// `agent_id` is a process-globally-unique identifier allocated by the
     /// caller *before* creation, so per-agent initialization state can be
     /// registered under it without any cross-agent locking.
-    async fn create_agent(
+    fn create_agent(
         &self,
         agent_id: u64,
         config: AgentConfig,
-    ) -> Result<(AgentId, Vec<crate::tools::AvailableTool>), Error>;
+    ) -> impl std::future::Future<
+        Output = Result<(AgentId, Vec<crate::tools::AvailableTool>), Error>,
+    > + Send;
 
     /// Send a chat message to the agent, returning a streaming response handle.
     ///
     /// The `content` parameter accepts any [`Content`] variant: plain text,
     /// images, documents, audio, video, or a multi-part list.
-    async fn chat(&self, agent_id: AgentId, content: &Content)
-    -> Result<ChatResponseHandle, Error>;
+    fn chat(
+        &self,
+        agent_id: AgentId,
+        content: &Content,
+    ) -> impl std::future::Future<Output = Result<ChatResponseHandle, Error>> + Send;
 
     /// Gracefully shut down the agent.
-    async fn shutdown_agent(&self, agent_id: AgentId) -> Result<(), Error>;
+    fn shutdown_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Interrupt any active prompt/chat run.
-    async fn cancel(&self, agent_id: AgentId) -> Result<(), Error>;
+    fn cancel(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Wait for the active run or conversational loop to stabilize.
-    async fn wait_for_idle(&self, agent_id: AgentId) -> Result<(), Error>;
+    fn wait_for_idle(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Send a message without waiting for completion.
-    async fn send(&self, agent_id: AgentId, content: &Content) -> Result<(), Error>;
+    fn send(
+        &self,
+        agent_id: AgentId,
+        content: &Content,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Signal that the agent is idle.
-    async fn signal_idle(&self, agent_id: AgentId) -> Result<(), Error>;
+    fn signal_idle(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Wait for the agent to wake up. Returns true if woken, false if timed out.
-    async fn wait_for_wakeup(
+    fn wait_for_wakeup(
         &self,
         agent_id: AgentId,
         timeout: std::time::Duration,
-    ) -> Result<bool, Error>;
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send;
 
     /// Retrieve the conversation's message history.
-    async fn history(&self, agent_id: AgentId) -> Result<Vec<ConversationMessage>, Error>;
+    fn history(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Vec<ConversationMessage>, Error>> + Send;
 
     /// Return the number of completed turns in the conversation.
-    async fn turn_count(&self, agent_id: AgentId) -> Result<u32, Error>;
+    fn turn_count(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<u32, Error>> + Send;
 
     /// Return cumulative token usage across all turns.
-    async fn total_usage(&self, agent_id: AgentId) -> Result<UsageMetadata, Error>;
+    fn total_usage(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<UsageMetadata, Error>> + Send;
 
     /// Return token usage from the most recent turn only.
-    async fn last_turn_usage(&self, agent_id: AgentId) -> Result<UsageMetadata, Error>;
+    fn last_turn_usage(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<UsageMetadata, Error>> + Send;
 
     /// Clear the conversation history and reset state.
-    async fn clear_history(&self, agent_id: AgentId) -> Result<(), Error>;
+    fn clear_history(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Return the text of the last model response, if any.
     ///
     /// Default implementation returns `Ok(None)`.
-    async fn last_response(&self, _agent_id: AgentId) -> Result<Option<String>, Error> {
-        Ok(None)
+    fn last_response(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Option<String>, Error>> + Send {
+        async move { Ok(None) }
     }
 
     /// Return the step indices at which compaction occurred.
     ///
     /// Default implementation returns an empty list.
-    async fn compaction_indices(&self, _agent_id: AgentId) -> Result<Vec<u32>, Error> {
-        Ok(Vec::new())
+    fn compaction_indices(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, Error>> + Send {
+        async move { Ok(Vec::new()) }
     }
 
     /// Delete the conversation and all associated state.
     ///
     /// Default implementation is a no-op that returns `Ok(())`.
-    async fn delete(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn delete(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        async move { Ok(()) }
     }
 
     /// Disconnect from the agent without deleting state.
     ///
     /// Default implementation is a no-op that returns `Ok(())`.
-    async fn disconnect(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn disconnect(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        async move { Ok(()) }
     }
 
     /// Check whether the agent is currently idle (not running a turn).
     ///
     /// Default implementation returns `Ok(true)`.
-    async fn is_idle(&self, _agent_id: AgentId) -> Result<bool, Error> {
-        Ok(true)
+    fn is_idle(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Ok(true) }
     }
 
     /// Best-effort synchronous shutdown signal, called from [`Drop`].
@@ -242,23 +288,35 @@ impl<R: Runtime> AgentHandle<R> {
         }
         let _init_guard = InitializingHookGuard(agent_id_u64);
 
-        let (agent_id, available_tools) =
-            runtime.create_agent(agent_id_u64, config.clone()).await?;
+        let conversation_id = Self::setup_bridge_state(
+            agent_id_u64,
+            &config,
+            registry.as_ref(),
+            effective_hook_runner,
+            policy_handler.as_ref(),
+        )?;
+
+        let create_result = runtime.create_agent(agent_id_u64, config.clone()).await;
+        let (agent_id, available_tools) = match create_result {
+            Ok(res) => res,
+            Err(e) => {
+                match crate::runtime::bridge_state().write() {
+                    Ok(mut map) => {
+                        map.remove(&agent_id_u64);
+                    }
+                    Err(lock_err) => {
+                        tracing::warn!(error = %lock_err, "Poisoned bridge_state lock during agent creation error cleanup");
+                    }
+                }
+                return Err(e);
+            }
+        };
+
         debug_assert_eq!(
             agent_id, agent_id_u64,
             "runtime must echo the caller-provided agent ID"
         );
         tracing::info!(agent_id, "Agent created successfully");
-
-        let conversation_id = Self::setup_bridge_state(
-            &runtime,
-            agent_id,
-            &config,
-            registry.as_ref(),
-            effective_hook_runner,
-            policy_handler.as_ref(),
-        )
-        .await?;
 
         Ok(Self {
             id: agent_id,
@@ -274,19 +332,20 @@ impl<R: Runtime> AgentHandle<R> {
         })
     }
 
-    async fn setup_bridge_state(
-        runtime: &Arc<R>,
+    fn setup_bridge_state(
         id: AgentId,
         config: &AgentConfig,
         registry: Option<&Arc<crate::tools::ToolRegistry>>,
         effective_hook_runner: Arc<crate::hooks::Hooks>,
         policy_handler: Option<&Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Arc<Mutex<Option<String>>>, Error> {
+        #[cfg(feature = "python")]
         let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
         let conversation_id = Arc::new(Mutex::new(config.conversation_id.clone()));
         let bridge_entry = crate::runtime::AgentBridgeState {
             registry: registry.map(Arc::clone),
             hook_runner: Some(effective_hook_runner),
+            #[cfg(feature = "python")]
             policies: policies_set,
             policy_handler: policy_handler.map(Arc::clone),
             tool_state: llm_tool::SharedState::new(),
@@ -308,13 +367,6 @@ impl<R: Runtime> AgentHandle<R> {
             }
         };
         if bridge_insert_failed {
-            if let Err(shutdown_err) = runtime.shutdown_agent(id).await {
-                tracing::error!(
-                    agent_id = id,
-                    error = ?shutdown_err,
-                    "Failed to shut down agent after BRIDGE_STATE lock failure"
-                );
-            }
             return Err(Error::BackendError {
                 message: "BRIDGE_STATE RwLock poisoned during agent creation".to_string(),
             });

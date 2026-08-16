@@ -31,9 +31,11 @@ fmt-just:
 # Lint all code (Rust clippy, Rust fmt, TOML, Markdown, Justfile, hygiene)
 lint: lint-rust lint-rust-fmt lint-toml lint-markdown lint-just lint-hygiene
 
-# Lint Rust with clippy
+# Lint Rust with clippy across all feature combinations
 lint-rust:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --all-targets --no-default-features --features native -- -D warnings
+    cargo clippy --all-targets --no-default-features --features python -- -D warnings
 
 # Lint Rust formatting
 lint-rust-fmt:
@@ -58,11 +60,15 @@ lint-hygiene:
 # ── Test ──────────────────────────────────────────────────────────────
 
 # Run all tests (Rust + Python)
-test: test-rust test-python
+test: test-rust test-native test-python
 
-# Run Rust tests (lib + doctests)
+# Run Rust tests for python backend
 test-rust:
-    cargo test
+    cargo test --no-default-features --features python
+
+# Run Rust tests for native pure-Rust backend
+test-native:
+    cargo test --no-default-features --features native
 
 # Run Python tests for the embedded agent_init helpers
 test-python:
