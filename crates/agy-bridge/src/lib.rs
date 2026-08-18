@@ -45,8 +45,9 @@ pub mod types;
 // without diving into sub-modules.
 
 pub use config::{
-    AgentConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig, LocalAgentConfig, McpConfigError,
-    McpConfigFile, McpServer, McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer,
+    AgentBehavior, AgentConfig, BudgetConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig,
+    LocalAgentConfig, McpConfigError, McpConfigFile, McpServer, McpServerSpec, McpSseServer,
+    McpStdioServer, McpStreamableHttpServer, SubagentCapabilities, SubagentConfig,
     SystemInstructions,
 };
 pub use content::{Audio, Content, ContentPrimitive, Document, Image, Video};
@@ -63,7 +64,9 @@ pub use tools::{
     ToolSource,
 };
 pub use triggers::{TriggerConfig, TriggerEntry};
-pub use types::{ConversationMessage, MessageRole, Step, UsageMetadata};
+pub use types::{
+    ConversationMessage, MessageRole, Modality, ModalityTokenCount, Step, StopReason, UsageMetadata,
+};
 
 /// Convenience prelude — pull in everything you need with a single glob import.
 ///
@@ -79,9 +82,10 @@ pub mod prelude {
     pub use crate::{
         Agent, AgyBridge,
         config::{
-            AgentConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig, LocalAgentConfig,
-            McpConfigError, McpConfigFile, McpServer, McpServerSpec, McpSseServer, McpStdioServer,
-            McpStreamableHttpServer, SystemInstructions,
+            AgentBehavior, AgentConfig, BudgetConfig, BuiltinTools, CapabilitiesConfig,
+            GeminiConfig, LocalAgentConfig, McpConfigError, McpConfigFile, McpServer,
+            McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer,
+            SubagentCapabilities, SubagentConfig, SystemInstructions,
         },
         content::{Audio, Content, ContentPrimitive, Document, Image, Video},
         error::Error,
@@ -94,7 +98,10 @@ pub mod prelude {
             ToolRegistry, ToolSource,
         },
         triggers::{TriggerConfig, TriggerEntry},
-        types::{ConversationMessage, MessageRole, Step, UsageMetadata},
+        types::{
+            ConversationMessage, MessageRole, Modality, ModalityTokenCount, Step, StopReason,
+            UsageMetadata,
+        },
     };
 }
 
@@ -209,11 +216,11 @@ pub(crate) fn parse_dotenv_line(line: &str) -> Option<(&str, &str)> {
     Some((k, v))
 }
 
-#[cfg(feature = "python")]
-pub type DefaultRuntime = runtime::PythonRuntime;
-
-#[cfg(all(not(feature = "python"), feature = "native"))]
+#[cfg(feature = "native")]
 pub type DefaultRuntime = runtime::NativeRuntime;
+
+#[cfg(all(not(feature = "native"), feature = "python"))]
+pub type DefaultRuntime = runtime::PythonRuntime;
 
 #[cfg(feature = "python")]
 pub type PythonAgent = agent::AgentHandle<runtime::PythonRuntime>;
@@ -353,13 +360,13 @@ impl AgyBridgeBuilder {
     ///
     /// Returns an error if the underlying runtime fails to initialize.
     pub fn build(self) -> Result<AgyBridge<DefaultRuntime>, error::Error> {
-        #[cfg(feature = "python")]
-        {
-            self.build_python()
-        }
-        #[cfg(all(not(feature = "python"), feature = "native"))]
+        #[cfg(feature = "native")]
         {
             self.build_native()
+        }
+        #[cfg(all(not(feature = "native"), feature = "python"))]
+        {
+            self.build_python()
         }
     }
 }
@@ -398,6 +405,14 @@ impl<R: agent::Runtime + 'static> AgyBridge<R> {
 
 #[cfg(feature = "python")]
 impl AgyBridge<runtime::PythonRuntime> {
+    /// Create a new builder for configuring and constructing a Python [`AgyBridge`].
+    #[must_use]
+    pub fn python_builder() -> AgyBridgeBuilder {
+        AgyBridgeBuilder {
+            config: runtime::RuntimeConfig::default(),
+        }
+    }
+
     /// Return the number of agents currently live on this bridge.
     ///
     /// # Errors

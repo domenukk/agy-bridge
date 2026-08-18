@@ -227,6 +227,7 @@ mod tests {
             candidates_token_count: Some(50),
             thoughts_token_count: Some(20),
             total_token_count: Some(170),
+            ..Default::default()
         });
         drop(writer);
         handle.finalize();
@@ -538,6 +539,7 @@ mod tests {
                     is_complete_response: Some(true),
                     structured_output: None,
                     usage_metadata: None,
+                    ..Default::default()
                 })
                 .await
                 .expect("send");
@@ -743,6 +745,7 @@ mod tests {
                 candidates_token_count: Some(1),
                 thoughts_token_count: None,
                 total_token_count: Some(6),
+                ..Default::default()
             });
             writer.set_structured_output(serde_json::json!({"key": "value"}));
         });

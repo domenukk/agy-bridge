@@ -79,7 +79,9 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
         let sp_str = site_packages.to_string_lossy().to_string();
         let site_mod = py.import("site")?;
         site_mod.call_method1("addsitedir", (sp_str.as_str(),))?;
-        tracing::debug!(path = %sp_str, "Added venv site-packages via site.addsitedir()");
+        let sys_path = sys.getattr("path")?;
+        sys_path.call_method1("insert", (0, sp_str.as_str()))?;
+        tracing::debug!(path = %sp_str, "Added venv site-packages via site.addsitedir() and sys.path.insert(0)");
     }
 
     Ok(())

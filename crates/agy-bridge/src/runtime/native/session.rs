@@ -29,5 +29,12 @@ pub(crate) struct NativeAgentSession {
     pub(crate) active_writer: Arc<tokio::sync::Mutex<Option<ChatResponseWriter>>>,
     pub(crate) last_error: Arc<Mutex<Option<crate::streaming::StreamError>>>,
     pub(crate) produced_output: Arc<AtomicBool>,
+    /// Set whenever the harness emits any activity (a step or tool call) during
+    /// the current turn. Used to detect abnormal empty completions where a
+    /// failed trajectory silently returns to idle without output or error.
+    pub(crate) turn_activity: Arc<AtomicBool>,
+    /// `false` once the harness WebSocket has closed. A disconnected session
+    /// can no longer run turns; `chat` rejects new turns instead of hanging.
+    pub(crate) connected: Arc<AtomicBool>,
     pub(crate) process: tokio::sync::Mutex<Option<HarnessProcess>>,
 }

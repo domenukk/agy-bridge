@@ -223,3 +223,11 @@ impl HarnessProcess {
         })
     }
 }
+
+impl Drop for HarnessProcess {
+    fn drop(&mut self) {
+        if let Err(e) = self.child.start_kill() {
+            tracing::debug!(error = %e, "Process already killed or failed to kill in drop");
+        }
+    }
+}

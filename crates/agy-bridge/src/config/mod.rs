@@ -4,19 +4,23 @@
 //! model selection, tool capabilities, MCP server setup, and agent parameters.
 
 pub mod agent;
+pub mod budget;
 pub mod capabilities;
 pub mod mcp;
 pub mod mcp_json;
 pub mod models;
+pub mod subagents;
 
 pub use agent::*;
+pub use budget::*;
 pub use capabilities::*;
 pub use mcp::*;
 pub use mcp_json::*;
 pub use models::*;
+pub use subagents::*;
 
 /// Default primary model name.
-pub const DEFAULT_MODEL: &str = "gemini-3.6-flash";
+pub const DEFAULT_MODEL: &str = "gemini-3.7-flash";
 /// Default image generation model name.
 pub const DEFAULT_IMAGE_GENERATION_MODEL: &str = "gemini-3.1-flash-lite-image";
 

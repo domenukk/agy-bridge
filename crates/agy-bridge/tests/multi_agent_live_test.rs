@@ -69,28 +69,18 @@ fn live_subagent_spawn() {
             let agent = bridge.agent(config).await?;
 
             let prompt = "Ask your subagent what 5+5 is, and return the answer. Use the start_subagent tool.";
-            let result = agent.chat_text(prompt).await;
-
-            match result {
-                Ok(text) => {
-                    eprintln!("Parent response: {text}");
-                    assert!(
-                        text.contains("10"),
-                        "Expected parent to return 10 from subagent, got: {text}"
-                    );
-                }
-                Err(e) => {
-                    // Subagent tool execution may fail if the Python runtime
-                    // doesn't fully support it — but only specific error types
-                    // are acceptable (tool dispatch or backend errors).
-                    let err_str = e.to_string();
-                    assert!(
-                        err_str.contains("subagent") || err_str.contains("tool") || err_str.contains("Backend") || err_str.contains("timeout") || err_str.contains("Timeout") || err_str.contains("429"),
-                        "Unexpected error type from subagent test: {e}"
-                    );
-                    eprintln!("Subagent prompt returned expected error: {e}");
-                }
-            }
+            // Propagate errors to the live-test harness (`run_live_test`) rather
+            // than swallowing them: transient/backend errors (429, 503, stream
+            // drops) are retryable and will be retried within the retry budget,
+            // while a genuine terminal error is ranked as a real failure. This
+            // keeps the test an honest end-to-end check of subagent spawning
+            // instead of a false green when the model is briefly unavailable.
+            let text = agent.chat_text(prompt).await?;
+            eprintln!("Parent response: {text}");
+            assert!(
+                text.contains("10"),
+                "Expected parent to return 10 from subagent, got: {text}"
+            );
 
             agent.shutdown().await?;
             Ok(())

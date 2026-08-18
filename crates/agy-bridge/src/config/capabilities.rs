@@ -164,6 +164,28 @@ impl std::fmt::Display for BuiltinTools {
     }
 }
 
+/// Behavioral mode of the agent, mirroring the SDK's `AgentBehavior`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentBehavior {
+    /// Autonomous execution (the default).
+    #[default]
+    #[serde(alias = "AUTONOMOUS", alias = "autonomous")]
+    Autonomous,
+    /// Interactive execution requiring step confirmations.
+    #[serde(alias = "INTERACTIVE", alias = "interactive")]
+    Interactive,
+}
+
+impl std::fmt::Display for AgentBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Autonomous => f.write_str("autonomous"),
+            Self::Interactive => f.write_str("interactive"),
+        }
+    }
+}
+
 /// Agent capability toggles: tool allowlists, subagent support, and compaction.
 ///
 /// Construct with the named constructors ([`with_tools`](Self::with_tools),
@@ -187,6 +209,22 @@ pub struct CapabilitiesConfig {
     #[serde(default = "super::default_true")]
     #[builder(default = true)]
     pub enable_subagents: bool,
+    /// Behavioral mode of the agent (autonomous vs interactive).
+    #[serde(default)]
+    #[builder(default)]
+    pub agent_behavior: AgentBehavior,
+    /// Maximum depth of nested subagent spawns (e.g. 3 levels).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub max_subagent_depth: Option<usize>,
+    /// Whitelist of subagent names allowed to be spawned by this agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub allowed_subagents: Option<Vec<String>>,
+    /// Optional execution timeout (in milliseconds) for `run_command` tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub command_timeout_ms: Option<u64>,
     /// If set, only these built-in tools are available (allowlist).
     #[serde(default)]
     #[builder(default, setter(strip_option))]
@@ -584,5 +622,48 @@ mod tests {
             ..CapabilitiesConfig::default()
         };
         assert!(caps.validate().is_err());
+    }
+
+    #[test]
+    fn test_agent_behavior_roundtrip_and_display() {
+        assert_eq!(AgentBehavior::Autonomous.to_string(), "autonomous");
+        assert_eq!(AgentBehavior::Interactive.to_string(), "interactive");
+
+        let json = serde_json::to_string(&AgentBehavior::Autonomous).unwrap();
+        assert_eq!(json, "\"autonomous\"");
+        let parsed: AgentBehavior = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, AgentBehavior::Autonomous);
+
+        // Case insensitivity & uppercase alias
+        let parsed_upper: AgentBehavior = serde_json::from_str("\"AUTONOMOUS\"").unwrap();
+        assert_eq!(parsed_upper, AgentBehavior::Autonomous);
+    }
+
+    #[test]
+    fn test_capabilities_new_fields_builder_and_serde() {
+        let caps = CapabilitiesConfig::builder()
+            .agent_behavior(AgentBehavior::Interactive)
+            .max_subagent_depth(3)
+            .allowed_subagents(vec!["sub1".to_string(), "sub2".to_string()])
+            .command_timeout_ms(60_000)
+            .build();
+
+        assert_eq!(caps.agent_behavior, AgentBehavior::Interactive);
+        assert_eq!(caps.max_subagent_depth, Some(3));
+        assert_eq!(
+            caps.allowed_subagents,
+            Some(vec!["sub1".to_string(), "sub2".to_string()])
+        );
+        assert_eq!(caps.command_timeout_ms, Some(60_000));
+
+        let json = serde_json::to_string(&caps).unwrap();
+        let parsed: CapabilitiesConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent_behavior, AgentBehavior::Interactive);
+        assert_eq!(parsed.max_subagent_depth, Some(3));
+        assert_eq!(
+            parsed.allowed_subagents,
+            Some(vec!["sub1".to_string(), "sub2".to_string()])
+        );
+        assert_eq!(parsed.command_timeout_ms, Some(60_000));
     }
 }

@@ -39,15 +39,21 @@ fn create_mock_harness_binary(port: u16, prefix: &str) -> String {
     frame.extend_from_slice(&out_bytes);
 
     let mock_bin_path = format!("/tmp/mock_localharness_{prefix}_{port}");
-    let hex_bytes: Vec<String> = frame.iter().map(|b| format!("\\x{b:02x}")).collect();
-    let script_content = format!(
-        "#!/bin/sh\nprintf '{}'\nexec sleep 30\n",
-        hex_bytes.join("")
-    );
+    let payload_path = format!("{mock_bin_path}.dat");
+    fs::write(&payload_path, &frame).expect("write mock payload");
+
+    let script_content = format!("#!/bin/sh\ncat '{payload_path}'\nexec sleep 30\n");
 
     fs::write(&mock_bin_path, script_content).expect("write mock binary");
     fs::set_permissions(&mock_bin_path, Permissions::from_mode(0o755)).expect("set executable");
     mock_bin_path
+}
+
+fn cleanup_mock_binary(mock_bin_path: &str) {
+    // NOLINT: cleanup in test may fail if mock binary was already cleaned up
+    let _ = fs::remove_file(mock_bin_path);
+    // NOLINT: cleanup in test may fail if mock payload was already cleaned up
+    let _ = fs::remove_file(format!("{mock_bin_path}.dat"));
 }
 
 struct MockPolicyHandler;
@@ -213,8 +219,7 @@ async fn test_native_backend_mock_harness_e2e() {
     agent.shutdown().await.expect("shutdown agent");
     server_task.await.expect("server task completed");
 
-    // NOLINT: cleanup in test may fail if mock binary was already cleaned up
-    let _ = fs::remove_file(&mock_bin_path);
+    cleanup_mock_binary(&mock_bin_path);
 }
 
 async fn run_mock_tool_session(listener: TcpListener) {
@@ -340,8 +345,7 @@ async fn test_native_backend_custom_tool_dispatch_e2e() {
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");
 
-    // NOLINT: cleanup in test may fail if mock binary was already cleaned up
-    let _ = fs::remove_file(&mock_bin_path);
+    cleanup_mock_binary(&mock_bin_path);
 }
 
 async fn handle_mock_hook_exchange(
@@ -539,6 +543,153 @@ async fn test_native_backend_hooks_and_policy_e2e() {
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");
 
-    // NOLINT: cleanup in test may fail if mock binary was already cleaned up
-    let _ = fs::remove_file(&mock_bin_path);
+    cleanup_mock_binary(&mock_bin_path);
+}
+
+async fn run_mock_budget_and_subagents_session(listener: TcpListener) {
+    let (stream, _) = listener.accept().await.expect("accept connection");
+    let mut ws = accept_async(stream).await.expect("ws handshake");
+
+    let init_msg = ws.next().await.expect("first message").expect("valid msg");
+    let init_text = init_msg.to_text().expect("text msg");
+    let init_event: proto::localharness::InitializeConversationEvent =
+        serde_json::from_str(init_text).expect("parse init event");
+
+    let config = init_event.config.expect("config present");
+    assert!(config.budget_config.is_some(), "expected budget_config");
+    let budget = config.budget_config.unwrap();
+    assert_eq!(budget.max_model_calls, 10);
+    assert_eq!(budget.max_total_tokens, 50_000);
+    assert_eq!(config.agent_behavior, 1); // AUTONOMOUS
+    assert_eq!(config.custom_subagents.len(), 1);
+    assert_eq!(config.custom_subagents[0].name, "researcher");
+
+    let init_resp = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::InitializeConversationResponse(
+                proto::localharness::InitializeConversationResponse {
+                    cascade_id: "native-cascade-budget".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&init_resp).unwrap().into(),
+    ))
+    .await
+    .expect("send init resp");
+
+    let user_msg = ws.next().await.expect("user msg").expect("valid msg");
+    let user_text = user_msg.to_text().expect("text msg");
+    let _input_event: proto::localharness::InputEvent =
+        serde_json::from_str(user_text).expect("parse input event");
+
+    let step_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::StepUpdate(
+            proto::localharness::StepUpdate {
+                text_delta: "Budget-constrained answer".to_string(),
+                text: "Budget-constrained answer".to_string(),
+                parent_trajectory_id: "native-cascade-budget".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&step_event).unwrap().into(),
+    ))
+    .await
+    .expect("send step update");
+
+    let usage_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::UsageUpdate(
+            proto::localharness::UsageUpdate {
+                total: Some(proto::localharness::UsageMetadata {
+                    prompt_token_count: 100,
+                    candidates_token_count: 50,
+                    total_token_count: 150,
+                    prompt_tokens_details: vec![proto::localharness::ModalityTokenCount {
+                        modality: 1, // TEXT
+                        token_count: 100,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&usage_event).unwrap().into(),
+    ))
+    .await
+    .expect("send usage update");
+
+    let state_event = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::TrajectoryStateUpdate(
+                proto::localharness::TrajectoryStateUpdate {
+                    state: 3,
+                    stop_reason: 1, // MAX_MODEL_CALLS_EXCEEDED
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&state_event).unwrap().into(),
+    ))
+    .await
+    .expect("send state update");
+}
+
+#[tokio::test]
+async fn test_native_backend_budget_and_subagents_e2e() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let server_task = tokio::spawn(run_mock_budget_and_subagents_session(listener));
+
+    let mock_bin_path = create_mock_harness_binary(port, "bs");
+
+    let bridge = AgyBridge::native_builder()
+        .harness_path(&mock_bin_path)
+        .build_native()
+        .expect("build bridge");
+
+    let config = AgentConfig::builder()
+        .budget_config(
+            agy_bridge::config::BudgetConfig::builder()
+                .max_model_calls(10)
+                .max_total_tokens(50_000)
+                .build(),
+        )
+        .capabilities(
+            agy_bridge::config::CapabilitiesConfig::builder()
+                .agent_behavior(agy_bridge::config::AgentBehavior::Autonomous)
+                .max_subagent_depth(2)
+                .allowed_subagents(vec!["researcher".to_string()])
+                .build(),
+        )
+        .subagents(vec![
+            agy_bridge::config::SubagentConfig::builder()
+                .name("researcher")
+                .description("Research subagent")
+                .build(),
+        ])
+        .build();
+
+    let agent = bridge.agent(config).await.expect("create agent");
+
+    let reply = agent.chat_text("Perform budget task").await.expect("chat");
+    assert_eq!(reply, "Budget-constrained answer");
+
+    agent.shutdown().await.expect("shutdown");
+    server_task.await.expect("server task completed");
+
+    cleanup_mock_binary(&mock_bin_path);
 }

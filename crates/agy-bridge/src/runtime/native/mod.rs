@@ -85,7 +85,7 @@ impl NativeRuntime {
     ///
     /// Returns an error if the internal session lock is poisoned.
     // NOLINT: async is required for interface compatibility with Python backend
-    #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn active_agent_count(&self) -> Result<usize, Error> {
         let sessions = self.sessions.read().map_err(|e| Error::BackendError {
             message: format!("Poisoned NATIVE_SESSIONS lock: {e}"),
@@ -238,6 +238,8 @@ fn spawn_ws_reader_task(
     let event_tx_clone = session.event_tx.clone();
     let last_error_clone = session.last_error.clone();
     let produced_output_clone = session.produced_output.clone();
+    let turn_activity_clone = session.turn_activity.clone();
+    let connected_clone = session.connected.clone();
     let history_clone = session.history.clone();
 
     tokio::spawn(async move {
@@ -270,6 +272,7 @@ fn spawn_ws_reader_task(
                             &last_response_text_clone,
                             &last_error_clone,
                             &produced_output_clone,
+                            &turn_activity_clone,
                         )
                         .await;
                     }
@@ -279,6 +282,7 @@ fn spawn_ws_reader_task(
                             tool_call,
                             &active_writer_clone,
                             &event_tx_clone,
+                            &turn_activity_clone,
                         )
                         .await;
                     }
@@ -308,6 +312,7 @@ fn spawn_ws_reader_task(
                             active_writer: &active_writer_clone,
                             last_error: &last_error_clone,
                             produced_output: &produced_output_clone,
+                            turn_activity: &turn_activity_clone,
                             history: &history_clone,
                             last_response_text: &last_response_text_clone,
                         };
@@ -317,7 +322,45 @@ fn spawn_ws_reader_task(
                 }
             }
         }
+
+        handle_ws_reader_exit(
+            &connected_clone,
+            &is_idle_clone,
+            &idle_notify_clone,
+            &active_writer_clone,
+        )
+        .await;
     });
+}
+
+/// Clean up session state after the harness WebSocket reader loop terminates.
+///
+/// Marks the session disconnected and, if a turn was still active, surfaces a
+/// disconnect error to its writer so the consumer observes a failure rather
+/// than a misleading empty `Ok` response.
+async fn handle_ws_reader_exit(
+    connected: &Arc<AtomicBool>,
+    is_idle: &Arc<AtomicBool>,
+    idle_notify: &Arc<Notify>,
+    active_writer: &Arc<tokio::sync::Mutex<Option<crate::streaming::ChatResponseWriter>>>,
+) {
+    connected.store(false, Ordering::SeqCst);
+    is_idle.store(true, Ordering::SeqCst);
+    idle_notify.notify_waiters();
+    let mut writer_guard = active_writer.lock().await;
+    if let Some(writer) = writer_guard.take() {
+        // The socket closed while a turn was still active. Report it as an
+        // error so the consumer sees a failure rather than an empty `Ok`.
+        if let Err(e) = writer
+            .send_error(crate::streaming::StreamError::new(
+                "Harness WebSocket closed before the turn completed; \
+                 the agent session has terminated",
+            ))
+            .await
+        {
+            tracing::debug!(error = %e, "Failed to send disconnect error to active writer");
+        }
+    }
 }
 
 fn spawn_session_io_tasks(
@@ -443,6 +486,8 @@ impl Runtime for NativeRuntime {
                 active_writer: Arc::new(tokio::sync::Mutex::new(None)),
                 last_error: Arc::new(Mutex::new(None)),
                 produced_output: Arc::new(AtomicBool::new(false)),
+                turn_activity: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(true)),
                 process: tokio::sync::Mutex::new(Some(process)),
             });
 
@@ -476,8 +521,16 @@ impl Runtime for NativeRuntime {
                     .ok_or(Error::AgentNotStarted)?
             };
 
+            if !session.connected.load(Ordering::SeqCst) {
+                return Err(Error::BackendError {
+                    message: "Agent session is disconnected: the harness                               WebSocket has closed and cannot accept new turns"
+                        .to_string(),
+                });
+            }
+
             session.is_idle.store(false, Ordering::SeqCst);
             session.produced_output.store(false, Ordering::SeqCst);
+            session.turn_activity.store(false, Ordering::SeqCst);
             match session.last_error.lock() {
                 Ok(mut err_lock) => {
                     *err_lock = None;
@@ -551,10 +604,13 @@ impl Runtime for NativeRuntime {
                 }
 
                 let mut proc_opt = s.process.lock().await;
-                if let Some(mut proc) = proc_opt.take()
-                    && let Err(e) = proc.child.kill().await
-                {
-                    tracing::debug!(error = %e, "Process already terminated on shutdown");
+                if let Some(mut proc) = proc_opt.take() {
+                    if let Err(e) = proc.child.kill().await {
+                        tracing::debug!(error = %e, "Process already terminated on shutdown");
+                    }
+                    if let Err(e) = proc.child.wait().await {
+                        tracing::debug!(error = %e, "Error waiting for process on shutdown");
+                    }
                 }
 
                 let (hr_opt, conv_id) = extract_hook_runner_and_conv_id(agent_id);
@@ -589,10 +645,27 @@ impl Runtime for NativeRuntime {
 
                     match s.process.try_lock() {
                         Ok(mut proc_opt) => {
-                            if let Some(mut proc) = proc_opt.take()
-                                && let Err(e) = proc.child.start_kill()
-                            {
-                                tracing::debug!(error = %e, "Process already killed on try_shutdown");
+                            if let Some(mut proc) = proc_opt.take() {
+                                if let Err(e) = proc.child.start_kill() {
+                                    tracing::debug!(error = %e, "Process already killed on try_shutdown");
+                                }
+                                match tokio::runtime::Handle::try_current() {
+                                    Ok(handle) => {
+                                        handle.spawn(async move {
+                                            match proc.child.wait().await {
+                                                Ok(status) => {
+                                                    tracing::debug!(?status, "Child process reaped in try_shutdown");
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!(error = %e, "Error reaping child process in try_shutdown");
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, "No active tokio runtime to spawn child reap task");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

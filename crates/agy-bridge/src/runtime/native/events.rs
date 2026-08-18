@@ -23,6 +23,32 @@ use crate::{
     },
 };
 
+/// `TrajectoryStateUpdate.State::STATE_FULLY_IDLE` protobuf wire value.
+const TRAJECTORY_STATE_FULLY_IDLE: i32 = 2;
+
+fn to_domain_modality(m: i32) -> crate::types::Modality {
+    match m {
+        1 => crate::types::Modality::Text,
+        2 => crate::types::Modality::Image,
+        3 => crate::types::Modality::Video,
+        4 => crate::types::Modality::Audio,
+        5 => crate::types::Modality::Document,
+        _ => crate::types::Modality::Unspecified,
+    }
+}
+
+fn to_domain_modality_counts(
+    counts: &[proto::localharness::ModalityTokenCount],
+) -> Vec<crate::types::ModalityTokenCount> {
+    counts
+        .iter()
+        .map(|c| crate::types::ModalityTokenCount {
+            modality: to_domain_modality(c.modality),
+            token_count: c.token_count,
+        })
+        .collect()
+}
+
 pub(crate) fn to_usage_metadata(u: &proto::localharness::UsageMetadata) -> UsageMetadata {
     UsageMetadata {
         prompt_token_count: Some(u.prompt_token_count),
@@ -30,6 +56,12 @@ pub(crate) fn to_usage_metadata(u: &proto::localharness::UsageMetadata) -> Usage
         total_token_count: Some(u.total_token_count),
         cached_content_token_count: Some(u.cached_content_token_count),
         thoughts_token_count: Some(u.thoughts_token_count),
+        prompt_tokens_details: to_domain_modality_counts(&u.prompt_tokens_details),
+        cache_tokens_details: to_domain_modality_counts(&u.cache_tokens_details),
+        candidates_tokens_details: to_domain_modality_counts(&u.candidates_tokens_details),
+        tool_use_prompt_tokens_details: to_domain_modality_counts(
+            &u.tool_use_prompt_tokens_details,
+        ),
     }
 }
 
@@ -75,6 +107,7 @@ pub(crate) fn to_domain_step(update: &proto::localharness::StepUpdate) -> Step {
         .step_index(update.step_index)
         .cascade_id(update.cascade_id.clone())
         .trajectory_id(update.trajectory_id.clone())
+        .parent_trajectory_id(update.parent_trajectory_id.clone())
         .step_type(step_type)
         .status(status)
         .source(source)
@@ -242,7 +275,11 @@ pub(crate) async fn handle_step_update(
     last_response_text_clone: &Arc<Mutex<Option<String>>>,
     last_error_clone: &Arc<Mutex<Option<crate::streaming::StreamError>>>,
     produced_output_clone: &Arc<AtomicBool>,
+    turn_activity_clone: &Arc<AtomicBool>,
 ) {
+    // The harness emitted a step for this turn: record activity so an abnormal
+    // empty completion can be distinguished from a silent failed trajectory.
+    turn_activity_clone.store(true, Ordering::SeqCst);
     let is_model_source = step_update.source == 3 || step_update.source == 0;
     if is_model_source && !step_update.text_delta.is_empty() {
         produced_output_clone.store(true, Ordering::SeqCst);
@@ -438,7 +475,9 @@ pub(crate) async fn handle_tool_call(
     tool_call: proto::localharness::ToolCall,
     active_writer_clone: &Arc<tokio::sync::Mutex<Option<ChatResponseWriter>>>,
     event_tx: &mpsc::Sender<proto::localharness::InputEvent>,
+    turn_activity_clone: &Arc<AtomicBool>,
 ) {
+    turn_activity_clone.store(true, Ordering::SeqCst);
     let tool_name = tool_call.name.clone();
     let call_id = tool_call.id.clone();
     let args_json = tool_call.arguments_json.clone();
@@ -716,6 +755,7 @@ pub(crate) struct TrajectoryStateContext<'a> {
     pub(crate) active_writer: &'a Arc<tokio::sync::Mutex<Option<ChatResponseWriter>>>,
     pub(crate) last_error: &'a Arc<Mutex<Option<crate::streaming::StreamError>>>,
     pub(crate) produced_output: &'a Arc<AtomicBool>,
+    pub(crate) turn_activity: &'a Arc<AtomicBool>,
     pub(crate) history: &'a Arc<Mutex<Vec<ConversationMessage>>>,
     pub(crate) last_response_text: &'a Arc<Mutex<Option<String>>>,
 }
@@ -764,6 +804,14 @@ pub(crate) async fn handle_trajectory_state_update(
             }
         };
 
+        // A turn that returns FULLY_IDLE without producing any output, any
+        // captured error, or any harness activity indicates a silently failed
+        // trajectory (e.g. a prior backend error left the executor terminal).
+        // Surface it as an error instead of a misleading empty `Ok("")`.
+        let empty_completion_is_failure = state_update.state == TRAJECTORY_STATE_FULLY_IDLE
+            && !ctx.produced_output.load(Ordering::SeqCst)
+            && !ctx.turn_activity.load(Ordering::SeqCst);
+
         let mut guard = ctx.active_writer.lock().await;
         if let Some(writer) = guard.take() {
             if !state_update.error.is_empty() {
@@ -773,10 +821,18 @@ pub(crate) async fn handle_trajectory_state_update(
                 {
                     tracing::debug!(error = %e, "Failed to send trajectory error to writer");
                 }
-            } else if let Some(err) = err_opt
-                && let Err(e) = writer.send_error(err).await
-            {
-                tracing::debug!(error = %e, "Failed to send error to writer");
+            } else if let Some(err) = err_opt {
+                if let Err(e) = writer.send_error(err).await {
+                    tracing::debug!(error = %e, "Failed to send error to writer");
+                }
+            } else if empty_completion_is_failure {
+                let err = crate::streaming::StreamError::new(
+                    "Harness turn completed without any output, tool activity, or error; \
+                     the trajectory is likely in a failed state and cannot continue",
+                );
+                if let Err(e) = writer.send_error(err).await {
+                    tracing::debug!(error = %e, "Failed to send synthesized empty-completion error");
+                }
             }
         }
     }
@@ -951,6 +1007,7 @@ mod tests {
         let active_writer = Arc::new(tokio::sync::Mutex::new(None));
         let last_error = Arc::new(Mutex::new(None));
         let produced_output = Arc::new(AtomicBool::new(true));
+        let turn_activity = Arc::new(AtomicBool::new(true));
         let history = Arc::new(Mutex::new(Vec::new()));
         let last_response_text = Arc::new(Mutex::new(Some("Final reply".to_string())));
 
@@ -961,6 +1018,7 @@ mod tests {
             active_writer: &active_writer,
             last_error: &last_error,
             produced_output: &produced_output,
+            turn_activity: &turn_activity,
             history: &history,
             last_response_text: &last_response_text,
         };
@@ -969,6 +1027,7 @@ mod tests {
             state: 2, // Terminal/Idle state
             error: String::new(),
             trajectory_id: "traj-1".to_string(),
+            ..Default::default()
         };
 
         handle_trajectory_state_update(state_update, &ctx).await;
@@ -979,5 +1038,96 @@ mod tests {
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].content, "Final reply");
         assert_eq!(hist[0].role, MessageRole::Model);
+    }
+
+    #[tokio::test]
+    async fn test_empty_completion_without_activity_yields_error() {
+        use crate::streaming::channel_with_buffer;
+
+        // A turn that completes FULLY_IDLE with no output, no captured error,
+        // and no harness activity must surface an error to the consumer rather
+        // than silently closing the stream (which would read as `Ok("")`).
+        let (writer, handle) = channel_with_buffer(16);
+        let turn_count = Arc::new(AtomicU32::new(0));
+        let is_idle = Arc::new(AtomicBool::new(false));
+        let idle_notify = Arc::new(Notify::new());
+        let active_writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+        let last_error = Arc::new(Mutex::new(None));
+        let produced_output = Arc::new(AtomicBool::new(false));
+        let turn_activity = Arc::new(AtomicBool::new(false));
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let last_response_text = Arc::new(Mutex::new(None));
+
+        let ctx = TrajectoryStateContext {
+            turn_count: &turn_count,
+            is_idle: &is_idle,
+            idle_notify: &idle_notify,
+            active_writer: &active_writer,
+            last_error: &last_error,
+            produced_output: &produced_output,
+            turn_activity: &turn_activity,
+            history: &history,
+            last_response_text: &last_response_text,
+        };
+
+        let state_update = proto::localharness::TrajectoryStateUpdate {
+            state: TRAJECTORY_STATE_FULLY_IDLE,
+            error: String::new(),
+            trajectory_id: "traj-empty".to_string(),
+            ..Default::default()
+        };
+
+        handle_trajectory_state_update(state_update, &ctx).await;
+
+        handle
+            .text()
+            .await
+            .expect_err("Empty completion with no activity must be an error");
+    }
+
+    #[tokio::test]
+    async fn test_empty_completion_with_activity_is_ok() {
+        use crate::streaming::channel_with_buffer;
+
+        // If the harness produced activity during the turn (e.g. a tool-only or
+        // structured-output turn) an empty text completion is legitimate and
+        // must NOT be turned into an error.
+        let (writer, handle) = channel_with_buffer(16);
+        let turn_count = Arc::new(AtomicU32::new(0));
+        let is_idle = Arc::new(AtomicBool::new(false));
+        let idle_notify = Arc::new(Notify::new());
+        let active_writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+        let last_error = Arc::new(Mutex::new(None));
+        let produced_output = Arc::new(AtomicBool::new(false));
+        let turn_activity = Arc::new(AtomicBool::new(true));
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let last_response_text = Arc::new(Mutex::new(None));
+
+        let ctx = TrajectoryStateContext {
+            turn_count: &turn_count,
+            is_idle: &is_idle,
+            idle_notify: &idle_notify,
+            active_writer: &active_writer,
+            last_error: &last_error,
+            produced_output: &produced_output,
+            turn_activity: &turn_activity,
+            history: &history,
+            last_response_text: &last_response_text,
+        };
+
+        let state_update = proto::localharness::TrajectoryStateUpdate {
+            state: TRAJECTORY_STATE_FULLY_IDLE,
+            error: String::new(),
+            trajectory_id: "traj-active".to_string(),
+            ..Default::default()
+        };
+
+        handle_trajectory_state_update(state_update, &ctx).await;
+
+        let result = handle
+            .text()
+            .await
+            .expect("Empty completion with harness activity must be Ok");
+        assert_eq!(result.into_string(), "");
     }
 }

@@ -48,6 +48,14 @@ pub(crate) fn build_harness_config(
         .unwrap_or_default();
     let policy_config = Some(build_policy_config(policy_set));
     let retry_config = config.retry_config.as_ref().map(to_proto_retry_config);
+    let budget_config = config.budget_config.as_ref().map(to_proto_budget_config);
+    let agent_behavior = config
+        .capabilities
+        .as_ref()
+        .map_or(proto::localharness::AgentBehavior::Autonomous as i32, |c| {
+            to_proto_agent_behavior(c.agent_behavior)
+        });
+    let custom_subagents = to_proto_custom_agents(&config.subagents);
     let skills_paths = config
         .skills
         .iter()
@@ -69,11 +77,129 @@ pub(crate) fn build_harness_config(
         mcp_servers,
         models,
         enabled_hooks,
-        custom_subagents: Vec::new(),
+        custom_subagents,
         tool_output_truncation: None,
         retry_config,
         policy_config,
+        agent_behavior,
+        budget_config,
     }
+}
+
+fn optional_u32_to_proto_i32(val: Option<u32>) -> i32 {
+    match val {
+        Some(n) => match i32::try_from(n) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, value = n, "u32 exceeds i32 range in proto conversion");
+                i32::MAX
+            }
+        },
+        None => 0,
+    }
+}
+
+fn optional_usize_to_proto_i32(val: Option<usize>) -> i32 {
+    match val {
+        Some(n) => match i32::try_from(n) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, value = n, "usize exceeds i32 range in proto conversion");
+                i32::MAX
+            }
+        },
+        None => 0,
+    }
+}
+
+fn optional_u64_to_proto_i64(val: Option<u64>) -> i64 {
+    match val {
+        Some(n) => match i64::try_from(n) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, value = n, "u64 exceeds i64 range in proto conversion");
+                i64::MAX
+            }
+        },
+        None => 0,
+    }
+}
+
+fn optional_u64_to_proto_u32(val: Option<u64>) -> u32 {
+    match val {
+        Some(n) => match u32::try_from(n) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, value = n, "u64 exceeds u32 range in proto conversion");
+                u32::MAX
+            }
+        },
+        None => 0,
+    }
+}
+
+fn to_proto_budget_config(
+    budget: &crate::config::BudgetConfig,
+) -> proto::localharness::BudgetConfig {
+    proto::localharness::BudgetConfig {
+        max_model_calls: optional_u32_to_proto_i32(budget.max_model_calls),
+        max_tool_calls: optional_u32_to_proto_i32(budget.max_tool_calls),
+        max_input_tokens: optional_u64_to_proto_i64(budget.max_input_tokens),
+        max_output_tokens: optional_u64_to_proto_i64(budget.max_output_tokens),
+        max_total_tokens: optional_u64_to_proto_i64(budget.max_total_tokens),
+    }
+}
+
+fn to_proto_agent_behavior(behavior: crate::config::AgentBehavior) -> i32 {
+    match behavior {
+        crate::config::AgentBehavior::Autonomous => {
+            proto::localharness::AgentBehavior::Autonomous as i32
+        }
+        crate::config::AgentBehavior::Interactive => {
+            proto::localharness::AgentBehavior::Interactive as i32
+        }
+    }
+}
+
+fn to_proto_custom_agents(
+    subagents: &[crate::config::SubagentConfig],
+) -> Vec<proto::localharness::CustomAgent> {
+    subagents
+        .iter()
+        .map(|sub| {
+            let system_instructions = sub
+                .system_instructions
+                .as_ref()
+                .map(to_proto_system_instructions);
+            let agent_behavior = sub
+                .capabilities
+                .as_ref()
+                .map_or(proto::localharness::AgentBehavior::Autonomous as i32, |c| {
+                    to_proto_agent_behavior(c.agent_behavior)
+                });
+            let tools = sub
+                .tools
+                .iter()
+                .map(|tool_name| proto::localharness::Tool {
+                    name: tool_name.clone(),
+                    description: String::new(),
+                    parameters_json_schema: String::new(),
+                    response_json_schema: String::new(),
+                    defer_loading: false,
+                })
+                .collect();
+
+            proto::localharness::CustomAgent {
+                name: sub.name.clone(),
+                description: sub.description.clone(),
+                system_instructions,
+                harness_side_tools: None,
+                tools,
+                skills_config: None,
+                agent_behavior,
+            }
+        })
+        .collect()
 }
 
 fn build_tool_protos(
@@ -225,10 +351,18 @@ fn to_proto_harness_side_tools(
 
     let subagents_enabled = caps.is_none_or(|c| c.enable_subagents)
         && enabled_tools.contains(&BuiltinTools::StartSubagent);
+    let max_nesting_depth = optional_usize_to_proto_i32(caps.and_then(|c| c.max_subagent_depth));
+    let allowed_subagents = caps
+        .and_then(|c| c.allowed_subagents.clone())
+        // NOLINT: empty vector default for allowed_subagents in proto
+        .unwrap_or_default();
+    let max_timeout_ms = optional_u64_to_proto_u32(caps.and_then(|c| c.command_timeout_ms));
 
     proto::localharness::HarnessSideTools {
         subagents: Some(proto::localharness::SubagentsConfig {
             enabled: subagents_enabled,
+            max_nesting_depth,
+            allowed_subagents,
         }),
         find: Some(proto::localharness::FindToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::FindFile),
@@ -238,6 +372,7 @@ fn to_proto_harness_side_tools(
         }),
         run_command: Some(proto::localharness::RunCommandToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::RunCommand),
+            max_timeout_ms,
         }),
         file_edit: Some(proto::localharness::FileEditToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::EditFile),

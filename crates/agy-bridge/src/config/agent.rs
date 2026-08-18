@@ -35,7 +35,7 @@ fn default_model_name() -> String {
 /// Uses internal tagging via `#[serde(untagged)]` so each variant is
 /// distinguishable by its `"mode"` field in JSON (e.g. `{"mode": "Custom", "text": "..."}`).
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SystemInstructions {
     /// Completely replace the default system instructions (advanced usage).
@@ -255,6 +255,14 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub retry_config: Option<RetryConfig>,
+    /// Optional execution budget limits (model calls, token ceilings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub budget_config: Option<super::budget::BudgetConfig>,
+    /// Custom subagent definitions available to this agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<super::subagents::SubagentConfig>>| v.into_iter().map(Into::into).collect()))]
+    pub subagents: Vec<super::subagents::SubagentConfig>,
 }
 
 /// Configuration for API retry behavior with exponential backoff.
@@ -965,5 +973,37 @@ mod tests {
         assert_eq!(parsed.initial_history[0].content, "Hello");
         assert_eq!(parsed.initial_history[1].role, MessageRole::Model);
         assert_eq!(parsed.initial_history[1].content, "Hi there!");
+    }
+
+    #[test]
+    fn test_agent_config_with_budget_and_subagents() {
+        let config = AgentConfig::builder()
+            .budget_config(
+                crate::config::BudgetConfig::builder()
+                    .max_model_calls(15)
+                    .max_total_tokens(80_000)
+                    .build(),
+            )
+            .subagents(vec![
+                crate::config::SubagentConfig::builder()
+                    .name("worker")
+                    .description("Worker subagent")
+                    .build(),
+            ])
+            .build();
+
+        assert!(config.budget_config.is_some());
+        assert_eq!(config.budget_config.unwrap().max_model_calls, Some(15));
+        assert_eq!(config.subagents.len(), 1);
+        assert_eq!(config.subagents[0].name, "worker");
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("budget_config"));
+        assert!(json.contains("subagents"));
+
+        let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.subagents.len(), 1);
+        assert_eq!(parsed.subagents[0].name, "worker");
+        assert_eq!(parsed.budget_config.unwrap().max_total_tokens, Some(80_000));
     }
 }

@@ -897,6 +897,84 @@ def _wire_tool_proxies(local_config, agent_id_u64):
         del local_config["capabilities"]
 
 
+def _normalize_capabilities(local_config):
+    """Normalize capabilities fields (agent_behavior, allowed_subagents, etc.)."""
+    if "capabilities" in local_config and local_config["capabilities"]:
+        caps = local_config["capabilities"]
+        if isinstance(caps, dict):
+            if "agent_behavior" in caps and isinstance(caps["agent_behavior"], str):
+                try:
+                    from google.antigravity.types import AgentBehavior
+
+                    caps["agent_behavior"] = AgentBehavior(
+                        caps["agent_behavior"].lower()
+                    )
+                except Exception:
+                    pass
+
+
+def _wire_subagents(local_config):
+    """Translate serialized subagent specs into SDK SubagentConfig objects."""
+    if "subagents" in local_config and local_config["subagents"]:
+        try:
+            from google.antigravity.types import (
+                AgentBehavior,
+                SubagentCapabilities,
+                SubagentConfig,
+            )
+
+            if hasattr(SubagentCapabilities, "model_rebuild"):
+                SubagentCapabilities.model_rebuild()
+            if hasattr(SubagentConfig, "model_rebuild"):
+                SubagentConfig.model_rebuild()
+        except Exception:
+            return
+
+        parsed_subagents = []
+        for s in local_config["subagents"]:
+            if isinstance(s, dict):
+                caps = None
+                if "capabilities" in s and s["capabilities"]:
+                    c_dict = s["capabilities"]
+                    beh = c_dict.get("agent_behavior", "autonomous")
+                    if isinstance(beh, str):
+                        try:
+                            beh = AgentBehavior(beh.lower())
+                        except (ValueError, KeyError):
+                            beh = AgentBehavior.AUTONOMOUS
+                    caps = SubagentCapabilities(
+                        agent_behavior=beh,
+                        allowed_subagents=c_dict.get("allowed_subagents"),
+                        enabled_tools=c_dict.get("enabled_tools"),
+                        disabled_tools=c_dict.get("disabled_tools"),
+                    )
+                parsed_subagents.append(
+                    SubagentConfig(
+                        name=s["name"],
+                        description=s.get("description", ""),
+                        system_instructions=s.get("system_instructions"),
+                        capabilities=caps,
+                        tools=s.get("tools", []),
+                    )
+                )
+            else:
+                parsed_subagents.append(s)
+        local_config["subagents"] = parsed_subagents
+
+
+def _wire_budget_config(local_config):
+    """Translate serialized budget config into SDK BudgetConfig object."""
+    if "budget_config" in local_config and local_config["budget_config"]:
+        try:
+            from google.antigravity.types import BudgetConfig
+        except ImportError:
+            return
+        if isinstance(local_config["budget_config"], dict):
+            local_config["budget_config"] = BudgetConfig(
+                **local_config["budget_config"]
+            )
+
+
 def _wire_policies(local_config, agent_id_u64):
     """Translate serialized policy specs into SDK policy objects."""
     import logging
@@ -1575,6 +1653,9 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     local_config = json.loads(config_json)
 
     _wire_tool_proxies(local_config, agent_id_u64)
+    _normalize_capabilities(local_config)
+    _wire_subagents(local_config)
+    _wire_budget_config(local_config)
     _wire_policies(local_config, agent_id_u64)
     _wire_hooks(local_config, agent_id_u64)
     sdk_triggers = _wire_triggers(local_config)

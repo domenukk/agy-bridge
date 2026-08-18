@@ -126,6 +126,7 @@ impl agy_bridge::agent::Runtime for MockRuntime {
             candidates_token_count: Some(200),
             thoughts_token_count: Some(100),
             total_token_count: Some(800),
+            ..Default::default()
         })
     }
 
@@ -139,6 +140,7 @@ impl agy_bridge::agent::Runtime for MockRuntime {
             candidates_token_count: Some(50),
             thoughts_token_count: Some(20),
             total_token_count: Some(170),
+            ..Default::default()
         })
     }
 

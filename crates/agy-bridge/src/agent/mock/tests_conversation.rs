@@ -186,6 +186,7 @@ async fn get_last_usage_after_chat() {
             candidates_token_count: Some(25),
             thoughts_token_count: None,
             total_token_count: Some(75),
+            ..Default::default()
         });
     }
 
