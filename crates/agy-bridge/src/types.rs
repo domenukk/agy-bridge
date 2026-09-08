@@ -253,6 +253,54 @@ pub struct ModalityTokenCount {
     pub token_count: u64,
 }
 
+/// Service tier for model API requests and usage reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    /// Standard tier.
+    Standard,
+    /// Priority tier with prioritized latency and higher throughput.
+    Priority,
+    /// Flex tier with variable latency.
+    Flex,
+    /// Fallback for unknown tiers.
+    #[default]
+    Unknown,
+}
+
+impl ServiceTier {
+    /// Returns the string representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Priority => "priority",
+            Self::Flex => "flex",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for ServiceTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ServiceTier {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "standard" => Ok(Self::Standard),
+            "priority" => Ok(Self::Priority),
+            "flex" => Ok(Self::Flex),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!("Unrecognized ServiceTier: {other}")),
+        }
+    }
+}
+
 /// A tool call from the model, mirroring the Python SDK's `ToolCall`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallInfo {
@@ -315,6 +363,9 @@ pub struct UsageMetadata {
     /// Detailed tool use prompt tokens by modality.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_use_prompt_tokens_details: Vec<ModalityTokenCount>,
+    /// Service tier that processed the model request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
 }
 
 /// The role of a message author in the conversation.

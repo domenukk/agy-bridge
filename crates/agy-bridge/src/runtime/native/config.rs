@@ -55,7 +55,7 @@ pub(crate) fn build_harness_config(
         .map_or(proto::localharness::AgentBehavior::Autonomous as i32, |c| {
             to_proto_agent_behavior(c.agent_behavior)
         });
-    let custom_subagents = to_proto_custom_agents(&config.subagents);
+    let custom_subagents = to_proto_custom_agents(&config.subagents, &tools);
     let skills_paths = config
         .skills
         .iter()
@@ -64,7 +64,10 @@ pub(crate) fn build_harness_config(
 
     proto::localharness::HarnessConfig {
         cascade_id,
-        session_continuation_mode: 0,
+        session_continuation_mode: config.session_continuation_mode.map_or(
+            0,
+            crate::config::agent::SessionContinuationMode::to_proto_i32,
+        ),
         system_instructions,
         tools,
         harness_side_tools,
@@ -163,6 +166,7 @@ fn to_proto_agent_behavior(behavior: crate::config::AgentBehavior) -> i32 {
 
 fn to_proto_custom_agents(
     subagents: &[crate::config::SubagentConfig],
+    available_tools: &[proto::localharness::Tool],
 ) -> Vec<proto::localharness::CustomAgent> {
     subagents
         .iter()
@@ -180,12 +184,18 @@ fn to_proto_custom_agents(
             let tools = sub
                 .tools
                 .iter()
-                .map(|tool_name| proto::localharness::Tool {
-                    name: tool_name.clone(),
-                    description: String::new(),
-                    parameters_json_schema: String::new(),
-                    response_json_schema: String::new(),
-                    defer_loading: false,
+                .map(|tool_name| {
+                    if let Some(existing) = available_tools.iter().find(|t| t.name == *tool_name) {
+                        existing.clone()
+                    } else {
+                        proto::localharness::Tool {
+                            name: tool_name.clone(),
+                            description: String::new(),
+                            parameters_json_schema: String::new(),
+                            response_json_schema: String::new(),
+                            defer_loading: false,
+                        }
+                    }
                 })
                 .collect();
 
@@ -329,6 +339,22 @@ fn templated_system_instructions(
     }
 }
 
+fn timeout_seconds_to_ms(s: f64) -> Option<u64> {
+    match std::time::Duration::try_from_secs_f64(s) {
+        Ok(d) => match u64::try_from(d.as_millis()) {
+            Ok(ms) => Some(ms),
+            Err(err) => {
+                tracing::warn!(error = %err, seconds = s, "timeout_seconds exceeds u64 milliseconds");
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, seconds = s, "invalid timeout_seconds float value");
+            None
+        }
+    }
+}
+
 fn to_proto_harness_side_tools(
     caps: Option<&CapabilitiesConfig>,
 ) -> proto::localharness::HarnessSideTools {
@@ -356,7 +382,13 @@ fn to_proto_harness_side_tools(
         .and_then(|c| c.allowed_subagents.clone())
         // NOLINT: empty vector default for allowed_subagents in proto
         .unwrap_or_default();
-    let max_timeout_ms = optional_u64_to_proto_u32(caps.and_then(|c| c.command_timeout_ms));
+    let max_timeout_ms = optional_u64_to_proto_u32(caps.and_then(|c| {
+        c.run_command_config
+            .as_ref()
+            .and_then(|rc| rc.timeout_seconds)
+            .and_then(timeout_seconds_to_ms)
+            .or(c.command_timeout_ms)
+    }));
 
     proto::localharness::HarnessSideTools {
         subagents: Some(proto::localharness::SubagentsConfig {
@@ -438,19 +470,14 @@ fn build_models_proto(config: &AgentConfig) -> Vec<proto::localharness::ModelCon
         crate::config::DEFAULT_MODEL.to_string()
     };
 
-    let api_key = config
-        .api_key
-        .clone()
-        .or_else(|| config.gemini.as_ref().and_then(|g| g.api_key.clone()))
-        // NOLINT: environment variable is optional
-        .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-        // NOLINT: empty string default for api_key in proto
-        .unwrap_or_default();
     let base_url = config
-        .gemini
-        .as_ref()
-        .and_then(|g| g.base_url.clone())
+        .effective_base_url()
         // NOLINT: empty string default for base_url in proto
+        .unwrap_or_default();
+    let api_key = config
+        .effective_api_key()
+        .or_else(|| (!base_url.is_empty()).then(|| crate::config::PROXY_AUTH_SENTINEL.to_string()))
+        // NOLINT: empty string default for api_key in proto
         .unwrap_or_default();
 
     let text_model = build_model_config(
@@ -559,6 +586,12 @@ fn get_enabled_hooks(hook_runner: Option<&Arc<Hooks>>) -> Vec<i32> {
                 }
                 crate::hooks::HookPoint::OnToolError => {
                     Some(proto::localharness::LifecycleHook::OnToolError as i32)
+                }
+                crate::hooks::HookPoint::OnCompaction => {
+                    Some(proto::localharness::LifecycleHook::OnCompaction as i32)
+                }
+                crate::hooks::HookPoint::Stop => {
+                    Some(proto::localharness::LifecycleHook::Stop as i32)
                 }
                 _ => None,
             };

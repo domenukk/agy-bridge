@@ -43,7 +43,6 @@ pub(crate) struct AgentBridgeState {
     pub(crate) registry: Option<Arc<crate::tools::ToolRegistry>>,
     /// Lifecycle hooks for pre/post turn, tool-call gating, etc.
     pub(crate) hook_runner: Option<Arc<crate::hooks::Hooks>>,
-    #[cfg(feature = "python")]
     /// Policy rules governing tool-call permissions.
     pub(crate) policies: crate::policies::PolicySet,
     /// Interactive confirmation handler for `NeedsConfirmation` policies.
@@ -231,6 +230,70 @@ pub(crate) fn set_agent_conversation_id(
             })
         }
     }
+}
+
+/// Look up the current conversation ID for an agent, if set.
+#[cfg(feature = "native")]
+pub(crate) fn get_agent_conversation_id(agent_id: u64) -> Option<String> {
+    let map = match bridge_state().read() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(agent_id, error = %e, "get_agent_conversation_id: bridge_state lock poisoned");
+            return None;
+        }
+    };
+    let entry = map.get(&agent_id)?;
+    match entry.conversation_id.lock() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            tracing::warn!(agent_id, error = %e, "get_agent_conversation_id: conversation_id mutex poisoned");
+            None
+        }
+    }
+}
+
+/// Evaluates policies and registered handlers to check if a tool execution is allowed.
+pub(crate) fn check_tool_execution_allowed(
+    agent_id: u64,
+    name: &str,
+    args_json: &str,
+) -> Result<bool, crate::error::Error> {
+    let map = bridge_state()
+        .read()
+        .map_err(|e| crate::error::Error::BackendError {
+            message: format!("Failed to read BRIDGE_STATE: {e}"),
+        })?;
+
+    let Some(state) = map.get(&agent_id) else {
+        return Err(crate::error::Error::BackendError {
+            message: format!(
+                "Agent {agent_id} not found in bridge state — it may have been shut down"
+            ),
+        });
+    };
+
+    let (is_allowed, needs_confirm) = match state.policies.evaluate(name) {
+        crate::policies::PolicyDecision::Allow => (true, false),
+        crate::policies::PolicyDecision::Deny => (false, false),
+        crate::policies::PolicyDecision::NeedsConfirmation { .. } => (false, true),
+    };
+
+    if is_allowed {
+        return Ok(true);
+    }
+
+    if needs_confirm && let Some(ref handler) = state.policy_handler {
+        let handler = std::sync::Arc::clone(handler);
+        // Drop the lock before calling the handler (it may block).
+        drop(map);
+        let args_val: serde_json::Value =
+            serde_json::from_str(args_json).map_err(|e| crate::error::Error::BackendError {
+                message: format!("Failed to parse policy args JSON: {e}"),
+            })?;
+        return Ok(handler.confirm(name, &args_val));
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]

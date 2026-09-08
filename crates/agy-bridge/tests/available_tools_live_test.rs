@@ -50,7 +50,7 @@ impl RustTool for Multiply {
 // =============================================================================
 
 #[test]
-fn available_tools_custom_tools_only() {
+fn available_tools_custom_tools_only_live() {
     run_live_test("available_tools_custom_tools_only", || {
         let _api_key = api_key();
         let rt = test_runtime();
@@ -114,7 +114,7 @@ fn available_tools_custom_tools_only() {
 // =============================================================================
 
 #[test]
-fn available_tools_includes_builtins() {
+fn available_tools_includes_builtins_live() {
     run_live_test("available_tools_includes_builtins", || {
         let _api_key = api_key();
         let rt = test_runtime();
@@ -183,7 +183,7 @@ fn available_tools_includes_builtins() {
 // =============================================================================
 
 #[test]
-fn available_tools_mixed_custom_and_builtin() {
+fn available_tools_mixed_custom_and_builtin_live() {
     run_live_test("available_tools_mixed_custom_and_builtin", || {
         let _api_key = api_key();
         let rt = test_runtime();

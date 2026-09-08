@@ -5,6 +5,8 @@
 # functions and inside `init_agent`), so they can be unit-tested with plain
 # pytest.
 
+import os
+
 # Hook points whose callbacks must return a `HookResult` (allow/deny gate).
 RESULT_HOOK_POINTS = ("pre_turn", "pre_tool_call_decide", "on_interaction")
 
@@ -230,6 +232,30 @@ def _serialize_pre_turn_ctx(ctx):
     )
 
 
+def _serialize_stop_args(ctx):
+    """Serialize a `stop` hook StopArgs context to a JSON string."""
+    import json
+
+    if ctx is None:
+        return "{}"
+    stop_reason_val = getattr(ctx, "stop_reason", None)
+    if stop_reason_val is not None and hasattr(stop_reason_val, "value"):
+        stop_reason_str = str(stop_reason_val.value)
+    elif stop_reason_val is not None:
+        stop_reason_str = str(stop_reason_val)
+    else:
+        stop_reason_str = "UNSPECIFIED"
+
+    payload = {
+        "response_text": getattr(ctx, "response_text", "") or "",
+        "trajectory_id": getattr(ctx, "trajectory_id", "") or "",
+        "continuation_count": int(getattr(ctx, "continuation_count", 0) or 0),
+        "stop_reason": stop_reason_str,
+        "error_message": getattr(ctx, "error_message", "") or "",
+    }
+    return json.dumps(payload)
+
+
 def _serialize_generic_ctx(ctx):
     """Serialize an arbitrary hook context to a JSON string.
 
@@ -290,7 +316,7 @@ def _extract_initial_history(local_config):
 # This patch is pinned to the EXACT version we verified. Newer SDK releases are
 # expected to carry the upstream fix (pass ``max_size`` themselves), so we
 # deliberately leave any other version untouched to avoid masking a real change.
-_WS_MAXSIZE_PATCH_SDK_VERSION = "0.1.0"
+_WS_MAXSIZE_PATCH_SDK_VERSION = "0.1.10"
 
 # Generous but BOUNDED inbound frame cap (128 MiB). This comfortably covers even
 # ~1M-token contexts (harness response ~2x input) while still guarding against a
@@ -344,7 +370,7 @@ def _get_monkeypatch_lock():
 
 
 def _patch_websockets_max_size(logger, sdk_version=None):
-    """Raise the default websockets frame limit from 1 MiB to 16 MiB for SDK 0.1.10.
+    """Raise the default websockets frame limit from 1 MiB to 128 MiB for SDK 0.1.10.
 
     Scoped strictly to the one SDK release that suffers from the issue,
     ``_WS_MAXSIZE_PATCH_SDK_VERSION``; any other version is left untouched on the
@@ -433,7 +459,7 @@ def _apply_sdk_monkeypatches(logger):
                 return
 
             # Check SDK version if available, for diagnostic logging and min version enforcement.
-            MIN_SUPPORTED_SDK_VERSION = "0.1.10"
+            MIN_SUPPORTED_SDK_VERSION = "0.1.16"
             try:
                 import importlib.metadata as _meta
 
@@ -898,7 +924,7 @@ def _wire_tool_proxies(local_config, agent_id_u64):
 
 
 def _normalize_capabilities(local_config):
-    """Normalize capabilities fields (agent_behavior, allowed_subagents, etc.)."""
+    """Normalize capabilities fields (agent_behavior, allowed_subagents, run_command_config, etc.)."""
     if "capabilities" in local_config and local_config["capabilities"]:
         caps = local_config["capabilities"]
         if isinstance(caps, dict):
@@ -911,6 +937,17 @@ def _normalize_capabilities(local_config):
                     )
                 except Exception:
                     pass
+            if "run_command_config" in caps and isinstance(
+                caps["run_command_config"], dict
+            ):
+                try:
+                    from google.antigravity.types import RunCommandConfig
+
+                    caps["run_command_config"] = RunCommandConfig(
+                        **caps["run_command_config"]
+                    )
+                except Exception:
+                    pass
 
 
 def _wire_subagents(local_config):
@@ -919,6 +956,7 @@ def _wire_subagents(local_config):
         try:
             from google.antigravity.types import (
                 AgentBehavior,
+                RunCommandConfig,
                 SubagentCapabilities,
                 SubagentConfig,
             )
@@ -942,11 +980,20 @@ def _wire_subagents(local_config):
                             beh = AgentBehavior(beh.lower())
                         except (ValueError, KeyError):
                             beh = AgentBehavior.AUTONOMOUS
+                    rc_cfg = None
+                    if "run_command_config" in c_dict and isinstance(
+                        c_dict["run_command_config"], dict
+                    ):
+                        try:
+                            rc_cfg = RunCommandConfig(**c_dict["run_command_config"])
+                        except Exception:
+                            pass
                     caps = SubagentCapabilities(
                         agent_behavior=beh,
                         allowed_subagents=c_dict.get("allowed_subagents"),
                         enabled_tools=c_dict.get("enabled_tools"),
                         disabled_tools=c_dict.get("disabled_tools"),
+                        run_command_config=rc_cfg,
                     )
                 parsed_subagents.append(
                     SubagentConfig(
@@ -999,7 +1046,7 @@ def _wire_policies(local_config, agent_id_u64):
             elif isinstance(p, dict) and "AskUser" in p:
 
                 async def _rust_confirm_handler(tc):
-                    import sys, json, inspect
+                    import sys, json, inspect, asyncio
 
                     globals_mod = sys.modules.get("_agy_bridge_globals")
                     if not globals_mod or not hasattr(
@@ -1011,11 +1058,11 @@ def _wire_policies(local_config, agent_id_u64):
                         print(
                             f"\nAgent requested to run tool '{tc.name}' with args {dict(tc.args)}"
                         )
-                        return input("Allow? [Y/n]: ").strip().lower() in (
-                            "",
-                            "y",
-                            "yes",
-                        )
+                        try:
+                            ans = await asyncio.to_thread(input, "Allow? [Y/n]: ")
+                            return ans.strip().lower() in ("", "y", "yes")
+                        except (EOFError, OSError):
+                            return False
 
                     tc_args_json = json.dumps(dict(tc.args))
                     res = globals_mod.dispatch_rust_policy_confirm(
@@ -1128,6 +1175,8 @@ def _wire_hooks(local_config, agent_id_u64):
                                     ctx_json = _serialize_on_tool_error_ctx(
                                         ctx, current_tool_call, hook_logger
                                     )
+                                elif point_label == "stop":
+                                    ctx_json = _serialize_stop_args(ctx)
                                 elif ctx is None:
                                     ctx_json = "{}"
                                 elif point_label == "post_turn":
@@ -1142,6 +1191,10 @@ def _wire_hooks(local_config, agent_id_u64):
                                     name,
                                     e,
                                 )
+                                if point_label == "stop":
+                                    from google.antigravity import types as sdk_types
+
+                                    return sdk_types.StopHookResult()
                                 if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False,
@@ -1161,11 +1214,41 @@ def _wire_hooks(local_config, agent_id_u64):
                                 hook_logger.error(
                                     "dispatch_rust_hook failed for %r: %s", name, e
                                 )
+                                if point_label == "stop":
+                                    from google.antigravity import types as sdk_types
+
+                                    return sdk_types.StopHookResult()
                                 if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False, message=str(e)
                                     )
                                 return
+
+                            # stop is a TransformHook returning types.StopHookResult.
+                            if point_label == "stop":
+                                from google.antigravity import types as sdk_types
+
+                                if not result_json:
+                                    return sdk_types.StopHookResult()
+                                try:
+                                    res_dict = json.loads(result_json)
+                                    dec_str = res_dict.get("decision", "ALLOW_STOP")
+                                    decision = (
+                                        sdk_types.StopDecision.CONTINUE
+                                        if dec_str == "CONTINUE"
+                                        else sdk_types.StopDecision.ALLOW_STOP
+                                    )
+                                    return sdk_types.StopHookResult(
+                                        decision=decision,
+                                        reason=res_dict.get("reason", "") or "",
+                                    )
+                                except Exception as e:
+                                    hook_logger.error(
+                                        "Failed to decode stop result JSON %r: %s",
+                                        result_json,
+                                        e,
+                                    )
+                                    return sdk_types.StopHookResult()
 
                             # on_tool_error is a TransformHook: the Rust side
                             # returns the model-facing error representation as a
@@ -1368,18 +1451,21 @@ def _setup_base_url_routing(local_config):
     custom_base_url = None
     if "gemini_config" in local_config and local_config["gemini_config"]:
         custom_base_url = local_config["gemini_config"].pop("base_url", None)
+    if not custom_base_url:
+        custom_base_url = os.environ.get("GEMINI_API_BASE_URL")
 
     if custom_base_url:
         # When routing through a proxy/gateway that handles auth (e.g. via
         # mTLS or bearer tokens), no API key is needed. Set a sentinel so the
         # SDK's API key validation passes.
-        if "gemini_config" in local_config and local_config["gemini_config"]:
-            if not local_config["gemini_config"].get("api_key"):
-                # FRAGILE: this sentinel bypasses the SDK's API key validation
-                # when routing through a proxy/gateway that handles auth. It is
-                # cleared in _build_harness_config before the actual RPC. If the
-                # SDK changes its API key validation, this will need updating.
-                local_config["gemini_config"]["api_key"] = _PROXY_AUTH_SENTINEL
+        if "gemini_config" not in local_config or not local_config["gemini_config"]:
+            local_config["gemini_config"] = {}
+        if not local_config["gemini_config"].get("api_key"):
+            # FRAGILE: this sentinel bypasses the SDK's API key validation
+            # when routing through a proxy/gateway that handles auth. It is
+            # cleared in _build_harness_config before the actual RPC. If the
+            # SDK changes its API key validation, this will need updating.
+            local_config["gemini_config"]["api_key"] = _PROXY_AUTH_SENTINEL
 
         try:
             from google.antigravity.connections.local.local_connection import (
@@ -1424,39 +1510,20 @@ def _setup_base_url_routing(local_config):
                     try:
                         if config.HasField("gemini_config"):
                             config.gemini_config.base_url = url
-                            if config.gemini_config.api_key == _PROXY_AUTH_SENTINEL:
-                                config.gemini_config.ClearField("api_key")
-                                logger.info(
-                                    "Injected base_url=%s into harness config (auth sentinel cleared)",
-                                    url,
-                                )
-                            else:
-                                logger.info(
-                                    "Injected base_url=%s into harness config (real api_key kept)",
-                                    url,
-                                )
+                            logger.info("Injected base_url=%s into harness config", url)
                     except (AttributeError, ValueError):
                         pass
                     if hasattr(config, "models"):
                         for m in config.models:
                             if m.HasField("gemini_api_endpoint"):
                                 m.gemini_api_endpoint.base_url = url
-                                if (
-                                    m.gemini_api_endpoint.api_key
-                                    == _PROXY_AUTH_SENTINEL
-                                ):
-                                    m.gemini_api_endpoint.ClearField("api_key")
-                                    logger.info(
-                                        "Injected base_url=%s into model %s (auth sentinel cleared)",
-                                        url,
-                                        m.name,
-                                    )
-                                else:
-                                    logger.info(
-                                        "Injected base_url=%s into model %s (real api_key kept)",
-                                        url,
-                                        m.name,
-                                    )
+                                if not m.gemini_api_endpoint.api_key:
+                                    m.gemini_api_endpoint.api_key = _PROXY_AUTH_SENTINEL
+                                logger.info(
+                                    "Injected base_url=%s into model %s",
+                                    url,
+                                    m.name,
+                                )
                 return config
 
             LocalConnectionStrategy._build_harness_config = _patched_build
@@ -1666,6 +1733,18 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
     # Strip null gemini_config so the SDK uses its defaults.
     if "gemini_config" in local_config and local_config["gemini_config"] is None:
         local_config.pop("gemini_config")
+
+    if "session_continuation_mode" in local_config:
+        scm = local_config["session_continuation_mode"]
+        if scm is None:
+            local_config.pop("session_continuation_mode")
+        elif isinstance(scm, str):
+            from google.antigravity.types import SessionContinuationMode
+
+            try:
+                local_config["session_continuation_mode"] = SessionContinuationMode(scm)
+            except ValueError:
+                pass
 
     custom_base_url = _setup_base_url_routing(local_config)
 

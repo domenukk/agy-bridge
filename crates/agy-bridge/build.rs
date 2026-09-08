@@ -14,12 +14,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.16";
+
 // NOLINT: main returns Result for feature-conditional compilation
 #[allow(clippy::unnecessary_wraps)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/content.proto");
     println!("cargo:rerun-if-changed=proto/localharness.proto");
     println!("cargo:rerun-if-env-changed=ANTIGRAVITY_HARNESS_PATH");
+    println!("cargo:rustc-env=TARGET_ANTIGRAVITY_SDK_VERSION={TARGET_ANTIGRAVITY_SDK_VERSION}");
 
     #[cfg(feature = "native")]
     {
@@ -65,6 +68,60 @@ fn compile_protos() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "native")]
+const VERSION_STAMP_FILE: &str = "localharness.version";
+
+#[cfg(feature = "native")]
+fn is_cached_binary_valid(out_dir: &Path, bin_path: &Path) -> bool {
+    if !bin_path.is_file() {
+        return false;
+    }
+    let version_path = out_dir.join(VERSION_STAMP_FILE);
+    // NOLINT: version stamp file is absent on clean build before extraction
+    if let Ok(content) = std::fs::read_to_string(&version_path) {
+        content.trim() == TARGET_ANTIGRAVITY_SDK_VERSION
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "native")]
+fn write_version_stamp(out_dir: &Path) -> io::Result<()> {
+    let version_path = out_dir.join(VERSION_STAMP_FILE);
+    std::fs::write(version_path, TARGET_ANTIGRAVITY_SDK_VERSION)
+}
+
+#[cfg(feature = "native")]
+fn find_venv_candidate(bin_name: &str) -> Option<PathBuf> {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from)?;
+    let mut current = manifest_dir;
+    loop {
+        let venv = current.join(".venv");
+        if venv.is_dir() {
+            let lib_dir = venv.join("lib");
+            // NOLINT: lib directory may not exist or may be unreadable
+            if let Ok(entries) = std::fs::read_dir(&lib_dir) {
+                for entry in entries.flatten() {
+                    let candidate = entry
+                        .path()
+                        .join("site-packages")
+                        .join("google")
+                        .join("antigravity")
+                        .join("bin")
+                        .join(bin_name);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(feature = "native")]
 fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     const ENV_HARNESS_PATH: &str = "ANTIGRAVITY_HARNESS_PATH";
     const ENV_HOME: &str = "HOME";
@@ -81,8 +138,8 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     };
     let target_bin_path = out_dir.join(bin_name);
 
-    // 1. Check if already extracted in OUT_DIR
-    if target_bin_path.is_file() {
+    // 1. Check if already extracted in OUT_DIR with matching version stamp
+    if is_cached_binary_valid(&out_dir, &target_bin_path) {
         println!(
             "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
             target_bin_path.display()
@@ -90,7 +147,12 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 2. Check ANTIGRAVITY_HARNESS_PATH env var
+    if target_bin_path.exists() {
+        // NOLINT: removing stale binary is best-effort before re-extracting
+        let _ = std::fs::remove_file(&target_bin_path);
+    }
+
+    // 2. Check ANTIGRAVITY_HARNESS_PATH env var override
     // NOLINT: environment variable is optional
     if let Ok(custom_path) = env::var(ENV_HARNESS_PATH) {
         let p = PathBuf::from(custom_path);
@@ -100,36 +162,48 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. Check ~/.gemini/antigravity/bin cache
+    // 3. Check workspace .venv
+    if let Some(venv_bin) = find_venv_candidate(bin_name)
+        && std::fs::copy(&venv_bin, &target_bin_path).is_ok()
+    {
+        #[cfg(unix)]
+        set_executable_permission(&target_bin_path)?;
+        write_version_stamp(&out_dir)?;
+        println!(
+            "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
+            target_bin_path.display()
+        );
+        return Ok(());
+    }
+
+    // 4. Check ~/.gemini/antigravity/bin cache
     if let Some(home) = env::var_os(ENV_HOME).map(PathBuf::from) {
         let candidate = home
             .join(GEMINI_CACHE_DIR)
             .join(ANTIGRAVITY_DIR)
             .join(BIN_DIR)
             .join(bin_name);
-        if candidate.is_file() {
-            if let Err(e) = std::fs::copy(&candidate, &target_bin_path) {
-                eprintln!("Failed to copy binary from {}: {}", candidate.display(), e);
-            } else {
-                #[cfg(unix)]
-                set_executable_permission(&target_bin_path)?;
-                println!(
-                    "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
-                    target_bin_path.display()
-                );
-                return Ok(());
-            }
+        if candidate.is_file() && std::fs::copy(&candidate, &target_bin_path).is_ok() {
+            #[cfg(unix)]
+            set_executable_permission(&target_bin_path)?;
+            write_version_stamp(&out_dir)?;
+            println!(
+                "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
+                target_bin_path.display()
+            );
+            return Ok(());
         }
     }
 
-    // 4. Download from PyPI wheel
+    // 5. Download from PyPI wheel
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
 
     println!(
-        "cargo:warning=Downloading local proxy binary from PyPI for {target_os}-{target_arch}..."
+        "cargo:warning=Downloading local proxy binary from PyPI for {target_os}-{target_arch} v{TARGET_ANTIGRAVITY_SDK_VERSION}..."
     );
     download_and_extract_wheel(&target_os, &target_arch, &target_bin_path)?;
+    write_version_stamp(&out_dir)?;
 
     println!(
         "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
@@ -156,26 +230,16 @@ fn download_and_extract_wheel(
         }
     };
 
-    // Query PyPI JSON API for google-antigravity
-    let pypi_url = "https://pypi.org/pypi/google-antigravity/json";
-    let pypi_resp = ureq::get(pypi_url).call()?;
+    // Query PyPI JSON API specifically for TARGET_ANTIGRAVITY_SDK_VERSION
+    let pypi_url =
+        format!("https://pypi.org/pypi/google-antigravity/{TARGET_ANTIGRAVITY_SDK_VERSION}/json");
+    let pypi_resp = ureq::get(&pypi_url).call()?;
     let json_body: serde_json::Value = pypi_resp.into_body().read_json()?;
 
-    let releases = json_body
-        .get("releases")
-        .and_then(|r| r.as_object())
-        .ok_or("Invalid PyPI response: missing releases")?;
-
-    let version = json_body
-        .get("info")
-        .and_then(|i| i.get("version"))
-        .and_then(|v| v.as_str())
-        .ok_or("Invalid PyPI response: missing version")?;
-
-    let files = releases
-        .get(version)
+    let files = json_body
+        .get("urls")
         .and_then(|f| f.as_array())
-        .ok_or_else(|| format!("No files found for version {version}"))?;
+        .ok_or_else(|| format!("No files found for version {TARGET_ANTIGRAVITY_SDK_VERSION}"))?;
 
     let wheel_file = files
         .iter()
@@ -187,7 +251,9 @@ fn download_and_extract_wheel(
                 && filename.contains(platform_tag)
         })
         .ok_or_else(|| {
-            format!("No wheel found matching platform tag '{platform_tag}' for version {version}")
+            format!(
+                "No wheel found matching platform tag '{platform_tag}' for version {TARGET_ANTIGRAVITY_SDK_VERSION}"
+            )
         })?;
 
     let download_url = wheel_file

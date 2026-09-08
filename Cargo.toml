@@ -4,10 +4,10 @@ resolver = "3"
 
 [workspace.dependencies]
 # workspace crates
-agy-bridge = { path = "crates/agy-bridge", version = "0.11.0", default-features = false }
+agy-bridge = { path = "crates/agy-bridge", version = "0.16.0", default-features = false }
 agy-bridge-test-support = { path = "crates/agy-bridge-test-support", default-features = false }
-llm-tool = { version = "0.9.4" }
-llm-tool-macros = { version = "0.9.4" }
+llm-tool = { version = "0.10.0" }
+llm-tool-macros = { version = "0.10.0" }
 
 # runtime
 tokio = { version = "1", features = [

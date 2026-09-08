@@ -137,6 +137,8 @@ async fn send_handshake_config(
 async fn read_handshake_response(
     stdout: &mut ChildStdout,
 ) -> Result<proto::localharness::OutputConfig, Error> {
+    const MAX_HANDSHAKE_BYTES: usize = 10 * 1024 * 1024;
+
     let mut len_buf = [0u8; 4];
     stdout
         .read_exact(&mut len_buf)
@@ -145,6 +147,13 @@ async fn read_handshake_response(
             message: format!("Failed to read OutputConfig length from harness stdout: {e}"),
         })?;
     let resp_len = u32::from_le_bytes(len_buf) as usize;
+    if resp_len > MAX_HANDSHAKE_BYTES {
+        return Err(Error::BackendError {
+            message: format!(
+                "Handshake OutputConfig payload size ({resp_len} bytes) exceeds 10 MiB limit"
+            ),
+        });
+    }
     let mut resp_buf = vec![0u8; resp_len];
     stdout
         .read_exact(&mut resp_buf)
@@ -184,7 +193,11 @@ impl HarnessProcess {
             });
         }
 
-        let mut child = Command::new(&binary_path)
+        let mut cmd = Command::new(&binary_path);
+        for (k, v) in crate::load_dotenv() {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

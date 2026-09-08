@@ -1,6 +1,6 @@
 [package]
 name = "agy-bridge"
-version = "0.11.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Async Rust bridge and native runtime for the Google Antigravity SDK"

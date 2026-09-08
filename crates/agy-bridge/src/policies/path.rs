@@ -2,8 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
-
 /// Normalize a path by logically resolving `.` and `..` components.
 ///
 /// This function does **not** access the filesystem, so it works for paths
@@ -110,31 +108,43 @@ pub fn canonicalize_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
 ///     &ws
 /// ));
 /// ```
+fn resolve_path_preserving_symlinks(path: &Path) -> PathBuf {
+    match canonicalize_path(path) {
+        Ok(p) => return p,
+        Err(e) => {
+            tracing::trace!(path = %path.display(), error = %e, "resolve_path_preserving_symlinks: canonicalize failed; falling back to best-effort resolution");
+        }
+    }
+    let normalized = normalize_path(path);
+    let mut existing = normalized.as_path();
+    let mut remainder = Vec::new();
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            remainder.push(name.to_os_string());
+        }
+        match existing.parent() {
+            Some(parent) if parent != existing => existing = parent,
+            _ => break,
+        }
+    }
+    if existing.exists()
+        && let Ok(mut canonical_base) = canonicalize_path(existing)
+    {
+        for component in remainder.into_iter().rev() {
+            canonical_base.push(component);
+        }
+        return normalize_path(&canonical_base);
+    }
+    normalized
+}
+
 #[must_use]
 pub fn is_path_in_workspace(candidate: impl AsRef<Path>, workspaces: &[PathBuf]) -> bool {
     let candidate_path = candidate.as_ref();
-    let resolved_candidate = match canonicalize_path(candidate_path) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "canonicalize failed for candidate {candidate_path:?}, \
-                 falling back to logical normalization: {e}"
-            );
-            normalize_path(candidate_path)
-        }
-    };
+    let resolved_candidate = resolve_path_preserving_symlinks(candidate_path);
 
     workspaces.iter().any(|ws| {
-        let resolved_ws = match canonicalize_path(ws) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    "canonicalize failed for workspace {ws:?}, \
-                     falling back to logical normalization: {e}"
-                );
-                normalize_path(ws)
-            }
-        };
+        let resolved_ws = resolve_path_preserving_symlinks(ws);
         resolved_candidate.starts_with(&resolved_ws)
     })
 }
@@ -220,5 +230,24 @@ mod tests {
     fn normalize_path_preserves_absolute_simple_path() {
         let result = normalize_path(Path::new("/usr/local/bin"));
         assert_eq!(result, PathBuf::from("/usr/local/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_traversal_blocked_even_for_non_existent_target_file() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        let symlink_in_ws = workspace_dir.path().join("escaped_dir");
+        std::os::unix::fs::symlink(outside_dir.path(), &symlink_in_ws).unwrap();
+
+        // Non-existent target file inside the symlinked outside directory
+        let candidate = symlink_in_ws.join("new_file.txt");
+        let workspaces = vec![workspace_dir.path().to_path_buf()];
+
+        assert!(
+            !is_path_in_workspace(&candidate, &workspaces),
+            "symlink inside workspace pointing outside must not allow creating new files outside workspace"
+        );
     }
 }

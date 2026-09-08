@@ -47,25 +47,30 @@ pub mod types;
 pub use config::{
     AgentBehavior, AgentConfig, BudgetConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig,
     LocalAgentConfig, McpConfigError, McpConfigFile, McpServer, McpServerSpec, McpSseServer,
-    McpStdioServer, McpStreamableHttpServer, SubagentCapabilities, SubagentConfig,
-    SystemInstructions,
+    McpStdioServer, McpStreamableHttpServer, RunCommandConfig, SessionContinuationMode,
+    SubagentCapabilities, SubagentConfig, SystemInstructions,
 };
 pub use content::{Audio, Content, ContentPrimitive, Document, Image, Video};
 pub use error::Error;
-pub use hooks::{HookCallback, HookEntry, HookPoint, HookResult, HookSet, Hooks};
-/// Re-export the `#[llm_tool]` proc-macro so users only need `agy_bridge` in
-/// their dependency list.
-pub use llm_tool_macros::llm_tool;
+pub use hooks::{
+    HookCallback, HookEntry, HookPoint, HookResult, HookSet, Hooks, StopArgs, StopDecision,
+    StopHookResult,
+};
+/// Re-export the `#[llm_tool]`, `#[llm_prompt]`, and `#[llm_resource]` proc-macros
+/// so users only need `agy_bridge` in their dependency list.
+pub use llm_tool_macros::{llm_prompt, llm_resource, llm_tool};
 pub use policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet};
 pub use runtime::{BackendLogLevel, RuntimeConfig};
 pub use streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk};
 pub use tools::{
-    AvailableTool, RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry,
-    ToolSource,
+    AvailableTool, PromptDefinition, PromptRegistry, ResourceDefinition, ResourceRegistry,
+    RustPrompt, RustResource, RustTool, SharedState, ToolContext, ToolDefinition, ToolError,
+    ToolOutput, ToolRegistry, ToolSource,
 };
 pub use triggers::{TriggerConfig, TriggerEntry};
 pub use types::{
-    ConversationMessage, MessageRole, Modality, ModalityTokenCount, Step, StopReason, UsageMetadata,
+    ConversationMessage, MessageRole, Modality, ModalityTokenCount, ServiceTier, Step, StopReason,
+    UsageMetadata,
 };
 
 /// Convenience prelude — pull in everything you need with a single glob import.
@@ -77,19 +82,19 @@ pub use types::{
 /// This re-exports the most commonly used types, traits, and macros from the
 /// crate so you can get started quickly without hunting for individual paths.
 pub mod prelude {
-    pub use llm_tool_macros::llm_tool;
+    pub use llm_tool_macros::{llm_prompt, llm_resource, llm_tool};
 
     pub use crate::{
         Agent, AgyBridge,
         config::{
             AgentBehavior, AgentConfig, BudgetConfig, BuiltinTools, CapabilitiesConfig,
             GeminiConfig, LocalAgentConfig, McpConfigError, McpConfigFile, McpServer,
-            McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer,
-            SubagentCapabilities, SubagentConfig, SystemInstructions,
+            McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer, RunCommandConfig,
+            SessionContinuationMode, SubagentCapabilities, SubagentConfig, SystemInstructions,
         },
         content::{Audio, Content, ContentPrimitive, Document, Image, Video},
         error::Error,
-        hooks::{HookPoint, HookResult, Hooks},
+        hooks::{HookPoint, HookResult, Hooks, StopArgs, StopDecision, StopHookResult},
         policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet},
         runtime::BackendLogLevel,
         streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk},
@@ -99,8 +104,8 @@ pub mod prelude {
         },
         triggers::{TriggerConfig, TriggerEntry},
         types::{
-            ConversationMessage, MessageRole, Modality, ModalityTokenCount, Step, StopReason,
-            UsageMetadata,
+            ConversationMessage, MessageRole, Modality, ModalityTokenCount, ServiceTier, Step,
+            StopReason, UsageMetadata,
         },
     };
 }
@@ -164,13 +169,6 @@ pub fn load_dotenv() -> &'static std::collections::HashMap<String, String> {
                             if let Some((k, v)) = parse_dotenv_line(line)
                                 && std::env::var_os(k).is_none()
                             {
-                                // SAFETY: Called inside the OnceLock closure during
-                                // single-threaded initialization, before any threads
-                                // are spawned. set_var is not thread-safe, but here
-                                // we are the only thread.
-                                unsafe {
-                                    std::env::set_var(k, v);
-                                }
                                 env_map.insert(k.to_owned(), v.to_owned());
                             }
                         }
@@ -187,6 +185,19 @@ pub fn load_dotenv() -> &'static std::collections::HashMap<String, String> {
             }
         }
     })
+}
+
+/// Look up an environment variable, checking the process environment first and
+/// falling back to the cached `.env` values loaded by [`load_dotenv`].
+#[must_use]
+pub fn env_var(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(val) => Some(val),
+        Err(e) => {
+            tracing::trace!(key, error = %e, "env_var: not set in environment, checking cached .env");
+            load_dotenv().get(key).cloned()
+        }
+    }
 }
 
 /// Parse a single line from a `.env` file.

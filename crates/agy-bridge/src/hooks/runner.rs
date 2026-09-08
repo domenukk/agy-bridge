@@ -3,7 +3,8 @@
 use super::types::{
     HookCallback, HookPoint, HookResult, OnCompactionContext, OnInteractionContext,
     OnSessionEndContext, OnSessionStartContext, OnToolErrorContext, PostToolCallContext,
-    PostTurnContext, PreToolCallDecideContext, PreTurnContext,
+    PostTurnContext, PreToolCallDecideContext, PreTurnContext, StopArgs, StopDecision,
+    StopHookResult,
 };
 
 // ── Hook runner ─────────────────────────────────────────────────────────────
@@ -311,6 +312,41 @@ impl Hooks {
         HookResult::allow()
     }
 
+    /// Run all [`HookPoint::Stop`] callbacks in registration order.
+    ///
+    /// If any callback returns `StopDecision::Continue` with a non-empty reason,
+    /// execution resumes with that reason injected as feedback. Otherwise,
+    /// returns `StopHookResult::allow()`.
+    pub fn run_stop(&self, args: &StopArgs) -> StopHookResult {
+        for (_, name, cb) in self.iter_at(HookPoint::Stop) {
+            tracing::trace!(hook = %name, trajectory_id = %args.trajectory_id, "firing stop hook");
+            if let HookCallback::Stop(f) = cb {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(args))) {
+                    Ok(result) => {
+                        if result.decision == StopDecision::Continue
+                            && !result.reason.trim().is_empty()
+                        {
+                            tracing::info!(
+                                hook = %name,
+                                reason = %result.reason,
+                                "stop hook requested continuation"
+                            );
+                            return result;
+                        }
+                    }
+                    Err(panic) => {
+                        tracing::error!(
+                            hook = %name,
+                            panic = ?panic,
+                            "stop hook panicked — falling back to allow stop"
+                        );
+                    }
+                }
+            }
+        }
+        StopHookResult::allow()
+    }
+
     /// Run all [`TransformToolInput`](HookCallback::TransformToolInput)
     /// callbacks in registration order, threading the (possibly modified)
     /// tool arguments through each transform.
@@ -458,6 +494,19 @@ impl Hooks {
         self.register(name, HookCallback::OnSessionEnd(Box::new(f)))
     }
 
+    /// Register a [`HookPoint::Stop`] callback.
+    ///
+    /// Convenience wrapper matching the Python SDK's `@hooks.stop` decorator.
+    /// Invoked when the root trajectory reaches fully idle to decide whether to
+    /// stop or continue.
+    pub fn on_stop(
+        &mut self,
+        name: impl Into<String>,
+        f: impl Fn(&StopArgs) -> StopHookResult + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.register(name, HookCallback::Stop(Box::new(f)))
+    }
+
     /// Register a [`TransformToolInput`](HookCallback::TransformToolInput) callback.
     ///
     /// The closure receives the pre-tool-call context and may return
@@ -601,6 +650,19 @@ impl Hooks {
         f: impl Fn(&OnSessionEndContext) + Send + Sync + 'static,
     ) -> Self {
         self.on_session_end(name, f);
+        self
+    }
+
+    /// Register a [`HookPoint::Stop`] callback, returning `self` for chaining.
+    ///
+    /// This is the owned-self variant of [`on_stop`](Self::on_stop).
+    #[must_use]
+    pub fn with_stop(
+        mut self,
+        name: impl Into<String>,
+        f: impl Fn(&StopArgs) -> StopHookResult + Send + Sync + 'static,
+    ) -> Self {
+        self.on_stop(name, f);
         self
     }
 

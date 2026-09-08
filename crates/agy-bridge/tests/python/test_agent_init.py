@@ -493,3 +493,88 @@ def test_resolve_ws_max_size_env_invalid_warns_and_defaults(monkeypatch):
     logger = _FakeLogger()
     assert agent_init._resolve_ws_max_size(logger) == agent_init._WS_MAXSIZE_DEFAULT_CAP
     assert logger.warnings, "invalid env value should have logged a warning"
+
+
+# ── v0.16.0 feature tests ──────────────────────────────────────────────────
+
+
+def test_serialize_stop_args_none():
+    assert agent_init._serialize_stop_args(None) == "{}"
+
+
+def test_serialize_stop_args_populated():
+    from collections import namedtuple
+
+    StopArgsFake = namedtuple(
+        "StopArgsFake",
+        [
+            "response_text",
+            "trajectory_id",
+            "continuation_count",
+            "stop_reason",
+            "error_message",
+        ],
+    )
+    fake_args = StopArgsFake(
+        response_text="Task finished successfully",
+        trajectory_id="traj-12345",
+        continuation_count=2,
+        stop_reason=EnumLike("MAX_MODEL_CALLS_EXCEEDED"),
+        error_message="",
+    )
+    serialized = agent_init._serialize_stop_args(fake_args)
+    data = json.loads(serialized)
+    assert data["response_text"] == "Task finished successfully"
+    assert data["trajectory_id"] == "traj-12345"
+    assert data["continuation_count"] == 2
+    assert data["stop_reason"] == "MAX_MODEL_CALLS_EXCEEDED"
+    assert data["error_message"] == ""
+
+
+def test_normalize_capabilities_with_run_command_config():
+    config = {
+        "capabilities": {
+            "run_command_config": {
+                "enable_daemons": True,
+                "timeout_seconds": 45.5,
+                "enable_sandbox": True,
+            }
+        }
+    }
+    agent_init._normalize_capabilities(config)
+    cap = config["capabilities"]
+    from google.antigravity import types
+
+    assert isinstance(cap["run_command_config"], types.RunCommandConfig)
+    assert cap["run_command_config"].enable_daemons is True
+    assert cap["run_command_config"].timeout_seconds == 45.5
+    assert cap["run_command_config"].enable_sandbox is True
+
+
+def test_wire_subagents_with_run_command_config():
+    config = {
+        "subagents": [
+            {
+                "name": "worker",
+                "description": "Worker subagent",
+                "system_instructions": "Do work",
+                "capabilities": {
+                    "run_command_config": {
+                        "enable_daemons": False,
+                        "timeout_seconds": 15.0,
+                        "enable_sandbox": True,
+                    }
+                },
+            }
+        ]
+    }
+    agent_init._wire_subagents(config)
+    sub = config["subagents"][0]
+    from google.antigravity import types
+
+    assert isinstance(sub, types.SubagentConfig)
+    assert sub.capabilities is not None
+    assert sub.capabilities.run_command_config is not None
+    assert sub.capabilities.run_command_config.enable_daemons is False
+    assert sub.capabilities.run_command_config.timeout_seconds == 15.0
+    assert sub.capabilities.run_command_config.enable_sandbox is True

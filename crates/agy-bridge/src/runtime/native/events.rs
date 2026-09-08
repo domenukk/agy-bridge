@@ -62,6 +62,21 @@ pub(crate) fn to_usage_metadata(u: &proto::localharness::UsageMetadata) -> Usage
         tool_use_prompt_tokens_details: to_domain_modality_counts(
             &u.tool_use_prompt_tokens_details,
         ),
+        service_tier: if u.service_tier.is_empty() {
+            None
+        } else {
+            match u.service_tier.parse::<crate::types::ServiceTier>() {
+                Ok(tier) => Some(tier),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        service_tier = %u.service_tier,
+                        "unrecognized service_tier in usage metadata"
+                    );
+                    None
+                }
+            }
+        },
     }
 }
 
@@ -399,6 +414,22 @@ async fn execute_custom_tool(
     tool_state: llm_tool::SharedState,
     conv_id: Option<&String>,
 ) -> (String, String) {
+    match crate::runtime::bridge_state::check_tool_execution_allowed(agent_id, tool_name, args_json)
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                String::new(),
+                format!(
+                    "[POLICY_DENIED] Execution of tool '{tool_name}' was blocked by agent policy rules. Do NOT retry this tool call with the same arguments."
+                ),
+            );
+        }
+        Err(e) => {
+            return (String::new(), e.to_string());
+        }
+    }
+
     let mut tool_ctx = ToolContext::new().with_shared_state(tool_state);
     if let Some(id) = conv_id {
         tool_ctx = tool_ctx.with_conversation_id(id);
@@ -407,20 +438,13 @@ async fn execute_custom_tool(
     let mut args_val: serde_json::Value =
         serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
 
-    let mut hook_allowed = true;
-    let mut hook_err = String::new();
     if let Some(hr) = hr_opt {
         let ctx = PreToolCallDecideContext::new(tool_name, args_val.clone());
         let res = hr.run_pre_tool_call_decide(&ctx);
         if !res.allow {
-            hook_allowed = false;
-            hook_err = res.message;
+            return (String::new(), res.message);
         }
         args_val = hr.run_transform_tool_input(&ctx);
-    }
-
-    if !hook_allowed {
-        return (String::new(), hook_err);
     }
 
     match reg.dispatch(tool_name, args_val.clone(), &tool_ctx).await {
@@ -609,6 +633,15 @@ fn dispatch_pre_tool_hook(
     };
     let ctx = PreToolCallDecideContext::new(tool_name, args_val);
     let res = hr.run_pre_tool_call_decide(&ctx);
+    if !res.allow {
+        return proto::localharness::call_hook_response::Result::PreToolResult(
+            proto::localharness::PreToolResult {
+                decision: 2,
+                reason: res.message,
+                modified_arguments_json: String::new(),
+            },
+        );
+    }
     let transformed = hr.run_transform_tool_input(&ctx);
     let modified_arguments_json = if transformed == ctx.tool_args {
         String::new()
@@ -617,11 +650,147 @@ fn dispatch_pre_tool_hook(
     };
     proto::localharness::call_hook_response::Result::PreToolResult(
         proto::localharness::PreToolResult {
-            decision: if res.allow { 1 } else { 2 },
+            decision: 1,
             reason: res.message,
             modified_arguments_json,
         },
     )
+}
+
+fn dispatch_post_tool_hook(
+    hr: &crate::hooks::Hooks,
+    req: &proto::localharness::CallHookRequest,
+) -> proto::localharness::call_hook_response::Result {
+    let (tool_name, result) = match req.args {
+        Some(proto::localharness::call_hook_request::Args::PostToolArgs(ref a)) => {
+            (a.tool_name.clone(), a.result.clone())
+        }
+        _ => (String::new(), String::new()),
+    };
+    let ctx = PostToolCallContext {
+        tool_name,
+        tool_args: serde_json::Value::Null,
+        result,
+        metadata: serde_json::Value::Null,
+    };
+    hr.run_post_tool_call(&ctx);
+    proto::localharness::call_hook_response::Result::EmptyResult(
+        proto::localharness::EmptyResult {},
+    )
+}
+
+fn dispatch_on_tool_error_hook(
+    agent_id: AgentId,
+    hr: &crate::hooks::Hooks,
+    req: &proto::localharness::CallHookRequest,
+) -> proto::localharness::call_hook_response::Result {
+    let (tool_name, error_message) = match req.args {
+        Some(proto::localharness::call_hook_request::Args::OnToolErrorArgs(ref a)) => {
+            (a.tool_name.clone(), a.error_message.clone())
+        }
+        _ => (String::new(), String::new()),
+    };
+    let metadata = crate::runtime::bridge_state::take_last_tool_error(agent_id)
+        .unwrap_or(serde_json::Value::Null);
+    let ctx = OnToolErrorContext {
+        tool_name,
+        tool_args: serde_json::Value::Null,
+        error: error_message,
+        metadata,
+    };
+    let res = hr.run_on_tool_error(&ctx);
+    // NOLINT: empty string default for proto custom_error_message
+    let custom_error_message = res.unwrap_or_default();
+    proto::localharness::call_hook_response::Result::OnToolErrorResult(
+        proto::localharness::OnToolErrorResult {
+            custom_error_message,
+        },
+    )
+}
+
+fn dispatch_on_session_start_hook(
+    agent_id: AgentId,
+    hr: &crate::hooks::Hooks,
+) -> proto::localharness::call_hook_response::Result {
+    let session_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id)
+        .unwrap_or_else(|| format!("agent-{agent_id}"));
+    let ctx = crate::hooks::OnSessionStartContext {
+        session: crate::hooks::SessionContext {
+            session_id,
+            agent_id,
+            started_at: std::time::SystemTime::now(),
+        },
+    };
+    hr.run_on_session_start(&ctx);
+    proto::localharness::call_hook_response::Result::EmptyResult(
+        proto::localharness::EmptyResult {},
+    )
+}
+
+fn dispatch_on_session_end_hook(
+    agent_id: AgentId,
+    hr: &crate::hooks::Hooks,
+) -> proto::localharness::call_hook_response::Result {
+    let session_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id)
+        .unwrap_or_else(|| format!("agent-{agent_id}"));
+    let ctx = crate::hooks::OnSessionEndContext {
+        session: crate::hooks::SessionContext {
+            session_id,
+            agent_id,
+            started_at: std::time::SystemTime::now(),
+        },
+    };
+    hr.run_on_session_end(&ctx);
+    proto::localharness::call_hook_response::Result::EmptyResult(
+        proto::localharness::EmptyResult {},
+    )
+}
+
+fn parse_stop_args(a: &proto::localharness::StopArgs) -> crate::hooks::StopArgs {
+    let stop_reason = match a.stop_reason.parse::<crate::types::StopReason>() {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                raw_stop_reason = %a.stop_reason,
+                "failed to parse stop_reason proto field, defaulting to Unknown"
+            );
+            crate::types::StopReason::Unknown
+        }
+    };
+    let continuation_count = match u32::try_from(a.continuation_count) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                continuation_count = a.continuation_count,
+                "failed to convert continuation_count to u32, using 0"
+            );
+            0
+        }
+    };
+    crate::hooks::StopArgs {
+        response_text: a.response_text.clone(),
+        trajectory_id: a.trajectory_id.clone(),
+        continuation_count,
+        stop_reason,
+        error_message: a.error_message.clone(),
+    }
+}
+
+fn dispatch_stop_hook(
+    hr: &crate::hooks::Hooks,
+    req: &proto::localharness::CallHookRequest,
+) -> proto::localharness::call_hook_response::Result {
+    let stop_args = match req.args {
+        Some(proto::localharness::call_hook_request::Args::StopArgs(ref a)) => parse_stop_args(a),
+        _ => crate::hooks::StopArgs::default(),
+    };
+    let res = hr.run_stop(&stop_args);
+    proto::localharness::call_hook_response::Result::StopResult(proto::localharness::StopResult {
+        decision: res.decision.to_proto_i32(),
+        reason: res.reason,
+    })
 }
 
 pub(crate) async fn handle_call_hook_request(
@@ -643,14 +812,28 @@ pub(crate) async fn handle_call_hook_request(
     let hook_result = if let Some(hr) = hr_opt {
         let turn = turn_count_clone.load(Ordering::Relaxed);
         match req.r#type {
+            1 => Some(dispatch_on_session_start_hook(agent_id, &hr)),
+            2 => Some(dispatch_on_session_end_hook(agent_id, &hr)),
             3 => Some(dispatch_pre_turn_hook(&hr, &req, turn)),
             4 => Some(dispatch_post_turn_hook(&hr, &req, turn)),
             5 => Some(dispatch_pre_tool_hook(&hr, &req)),
-            _ => Some(
-                proto::localharness::call_hook_response::Result::EmptyResult(
-                    proto::localharness::EmptyResult {},
-                ),
-            ),
+            6 => Some(dispatch_post_tool_hook(&hr, &req)),
+            7 => Some(dispatch_on_tool_error_hook(agent_id, &hr, &req)),
+            9 => Some(dispatch_stop_hook(&hr, &req)),
+            _ => {
+                if matches!(
+                    req.args,
+                    Some(proto::localharness::call_hook_request::Args::StopArgs(_))
+                ) {
+                    Some(dispatch_stop_hook(&hr, &req))
+                } else {
+                    Some(
+                        proto::localharness::call_hook_response::Result::EmptyResult(
+                            proto::localharness::EmptyResult {},
+                        ),
+                    )
+                }
+            }
         }
     } else {
         Some(
@@ -839,295 +1022,5 @@ pub(crate) async fn handle_trajectory_state_update(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        content::{Audio, Document, Image, Video},
-        hooks::{HookResult, Hooks},
-    };
-
-    #[test]
-    fn test_to_domain_step_states_and_sources() {
-        let active_user = proto::localharness::StepUpdate {
-            step_index: 1,
-            state: 1,
-            source: 2,
-            text: "Hello".to_string(),
-            ..Default::default()
-        };
-        let step = to_domain_step(&active_user);
-        assert_eq!(step.status, StepStatus::Active);
-        assert_eq!(step.source, StepSource::User);
-        assert_eq!(step.step_type, StepType::TextResponse);
-        assert_eq!(step.content, "Hello");
-
-        let waiting_system = proto::localharness::StepUpdate {
-            step_index: 2,
-            state: 3,
-            source: 1,
-            thinking: "Thinking...".to_string(),
-            ..Default::default()
-        };
-        let step = to_domain_step(&waiting_system);
-        assert_eq!(step.status, StepStatus::WaitingForUser);
-        assert_eq!(step.source, StepSource::System);
-        assert_eq!(step.step_type, StepType::Thinking);
-        assert_eq!(step.thinking, "Thinking...");
-
-        let error_model = proto::localharness::StepUpdate {
-            step_index: 3,
-            state: 4,
-            source: 0,
-            error_message: "Boom".to_string(),
-            ..Default::default()
-        };
-        let step = to_domain_step(&error_model);
-        assert_eq!(step.status, StepStatus::Error);
-        assert_eq!(step.source, StepSource::Model);
-        assert_eq!(step.error, "Boom");
-    }
-
-    #[test]
-    fn test_to_domain_step_finish_and_compaction() {
-        let compaction = proto::localharness::StepUpdate {
-            step_index: 1,
-            compaction: Some(proto::localharness::ActionCompaction {}),
-            ..Default::default()
-        };
-        let step = to_domain_step(&compaction);
-        assert_eq!(step.step_type, StepType::Compaction);
-
-        let finish_valid = proto::localharness::StepUpdate {
-            step_index: 2,
-            finish: Some(proto::localharness::ActionFinish {
-                output_string: "{\"key\": \"value\"}".to_string(),
-            }),
-            ..Default::default()
-        };
-        let step = to_domain_step(&finish_valid);
-        assert_eq!(step.step_type, StepType::Finish);
-        assert_eq!(
-            step.structured_output,
-            Some(serde_json::json!({"key": "value"}))
-        );
-
-        let finish_invalid = proto::localharness::StepUpdate {
-            step_index: 3,
-            finish: Some(proto::localharness::ActionFinish {
-                output_string: "not json".to_string(),
-            }),
-            ..Default::default()
-        };
-        let step = to_domain_step(&finish_invalid);
-        assert_eq!(step.step_type, StepType::Finish);
-        assert!(step.structured_output.is_none());
-    }
-
-    #[test]
-    fn test_to_proto_user_input_all_media_types() {
-        let img = Image::png(vec![1, 2, 3]);
-        let aud = Audio::mp3(vec![4, 5, 6]);
-        let doc = Document::pdf(vec![7, 8, 9]);
-        let vid = Video::mp4(vec![10, 11, 12]);
-
-        let content = Content::Multi {
-            parts: vec![
-                ContentPrimitive::Text {
-                    text: "Prompt".to_string(),
-                },
-                ContentPrimitive::Image(img),
-                ContentPrimitive::Audio(aud),
-                ContentPrimitive::Document(doc),
-                ContentPrimitive::Video(vid),
-            ],
-        };
-
-        let user_input = to_proto_user_input(&content);
-        assert_eq!(user_input.parts.len(), 5);
-    }
-
-    #[test]
-    fn test_dispatch_pre_turn_and_pre_tool_hooks() {
-        let mut hooks = Hooks::new();
-        hooks.on_pre_turn("log_turn", |_ctx| HookResult::allow());
-        hooks.on_pre_tool_call_decide("deny_all", |_ctx| HookResult::deny("blocked"));
-
-        let turn_req = proto::localharness::CallHookRequest {
-            request_id: "req-1".to_string(),
-            name: "pre_turn".to_string(),
-            r#type: 3,
-            args: Some(proto::localharness::call_hook_request::Args::PreTurnArgs(
-                proto::localharness::PreTurnArgs {
-                    user_input: Some(proto::localharness::UserInput {
-                        parts: vec![proto::localharness::user_input::Part {
-                            part: Some(proto::localharness::user_input::part::Part::Text(
-                                "Hello".to_string(),
-                            )),
-                        }],
-                    }),
-                },
-            )),
-        };
-        let turn_outcome = dispatch_pre_turn_hook(&hooks, &turn_req, 1);
-        match turn_outcome {
-            proto::localharness::call_hook_response::Result::PreTurnResult(res) => {
-                assert_eq!(res.decision, 1); // ALLOW
-            }
-            other => panic!("Expected PreTurnResult, got: {other:?}"),
-        }
-
-        let tool_req = proto::localharness::CallHookRequest {
-            request_id: "req-2".to_string(),
-            name: "pre_tool".to_string(),
-            r#type: 5,
-            args: Some(proto::localharness::call_hook_request::Args::PreToolArgs(
-                proto::localharness::PreToolArgs {
-                    tool_name: "write_file".to_string(),
-                    arguments_json: "{}".to_string(),
-                    server_name: String::new(),
-                    call_id: "call-1".to_string(),
-                },
-            )),
-        };
-        let tool_outcome = dispatch_pre_tool_hook(&hooks, &tool_req);
-        match tool_outcome {
-            proto::localharness::call_hook_response::Result::PreToolResult(res) => {
-                assert_eq!(res.decision, 2); // DENY
-                assert_eq!(res.reason, "blocked");
-            }
-            other => panic!("Expected PreToolResult, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_trajectory_state_update_flow() {
-        let turn_count = Arc::new(AtomicU32::new(0));
-        let is_idle = Arc::new(AtomicBool::new(false));
-        let idle_notify = Arc::new(Notify::new());
-        let active_writer = Arc::new(tokio::sync::Mutex::new(None));
-        let last_error = Arc::new(Mutex::new(None));
-        let produced_output = Arc::new(AtomicBool::new(true));
-        let turn_activity = Arc::new(AtomicBool::new(true));
-        let history = Arc::new(Mutex::new(Vec::new()));
-        let last_response_text = Arc::new(Mutex::new(Some("Final reply".to_string())));
-
-        let ctx = TrajectoryStateContext {
-            turn_count: &turn_count,
-            is_idle: &is_idle,
-            idle_notify: &idle_notify,
-            active_writer: &active_writer,
-            last_error: &last_error,
-            produced_output: &produced_output,
-            turn_activity: &turn_activity,
-            history: &history,
-            last_response_text: &last_response_text,
-        };
-
-        let state_update = proto::localharness::TrajectoryStateUpdate {
-            state: 2, // Terminal/Idle state
-            error: String::new(),
-            trajectory_id: "traj-1".to_string(),
-            ..Default::default()
-        };
-
-        handle_trajectory_state_update(state_update, &ctx).await;
-
-        assert_eq!(turn_count.load(Ordering::SeqCst), 1);
-        assert!(is_idle.load(Ordering::SeqCst));
-        let hist = history.lock().unwrap();
-        assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].content, "Final reply");
-        assert_eq!(hist[0].role, MessageRole::Model);
-    }
-
-    #[tokio::test]
-    async fn test_empty_completion_without_activity_yields_error() {
-        use crate::streaming::channel_with_buffer;
-
-        // A turn that completes FULLY_IDLE with no output, no captured error,
-        // and no harness activity must surface an error to the consumer rather
-        // than silently closing the stream (which would read as `Ok("")`).
-        let (writer, handle) = channel_with_buffer(16);
-        let turn_count = Arc::new(AtomicU32::new(0));
-        let is_idle = Arc::new(AtomicBool::new(false));
-        let idle_notify = Arc::new(Notify::new());
-        let active_writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
-        let last_error = Arc::new(Mutex::new(None));
-        let produced_output = Arc::new(AtomicBool::new(false));
-        let turn_activity = Arc::new(AtomicBool::new(false));
-        let history = Arc::new(Mutex::new(Vec::new()));
-        let last_response_text = Arc::new(Mutex::new(None));
-
-        let ctx = TrajectoryStateContext {
-            turn_count: &turn_count,
-            is_idle: &is_idle,
-            idle_notify: &idle_notify,
-            active_writer: &active_writer,
-            last_error: &last_error,
-            produced_output: &produced_output,
-            turn_activity: &turn_activity,
-            history: &history,
-            last_response_text: &last_response_text,
-        };
-
-        let state_update = proto::localharness::TrajectoryStateUpdate {
-            state: TRAJECTORY_STATE_FULLY_IDLE,
-            error: String::new(),
-            trajectory_id: "traj-empty".to_string(),
-            ..Default::default()
-        };
-
-        handle_trajectory_state_update(state_update, &ctx).await;
-
-        handle
-            .text()
-            .await
-            .expect_err("Empty completion with no activity must be an error");
-    }
-
-    #[tokio::test]
-    async fn test_empty_completion_with_activity_is_ok() {
-        use crate::streaming::channel_with_buffer;
-
-        // If the harness produced activity during the turn (e.g. a tool-only or
-        // structured-output turn) an empty text completion is legitimate and
-        // must NOT be turned into an error.
-        let (writer, handle) = channel_with_buffer(16);
-        let turn_count = Arc::new(AtomicU32::new(0));
-        let is_idle = Arc::new(AtomicBool::new(false));
-        let idle_notify = Arc::new(Notify::new());
-        let active_writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
-        let last_error = Arc::new(Mutex::new(None));
-        let produced_output = Arc::new(AtomicBool::new(false));
-        let turn_activity = Arc::new(AtomicBool::new(true));
-        let history = Arc::new(Mutex::new(Vec::new()));
-        let last_response_text = Arc::new(Mutex::new(None));
-
-        let ctx = TrajectoryStateContext {
-            turn_count: &turn_count,
-            is_idle: &is_idle,
-            idle_notify: &idle_notify,
-            active_writer: &active_writer,
-            last_error: &last_error,
-            produced_output: &produced_output,
-            turn_activity: &turn_activity,
-            history: &history,
-            last_response_text: &last_response_text,
-        };
-
-        let state_update = proto::localharness::TrajectoryStateUpdate {
-            state: TRAJECTORY_STATE_FULLY_IDLE,
-            error: String::new(),
-            trajectory_id: "traj-active".to_string(),
-            ..Default::default()
-        };
-
-        handle_trajectory_state_update(state_update, &ctx).await;
-
-        let result = handle
-            .text()
-            .await
-            .expect("Empty completion with harness activity must be Ok");
-        assert_eq!(result.into_string(), "");
-    }
-}
+#[path = "events_tests.rs"]
+mod tests;

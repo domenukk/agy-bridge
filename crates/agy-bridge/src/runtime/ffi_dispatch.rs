@@ -32,6 +32,7 @@ pub(crate) fn dispatch_hook_by_name(
         "on_session_end" => handle_on_session_end(hook_runner, context_json)?,
         "on_tool_error" => return handle_on_tool_error(agent_id, hook_runner, context_json),
         "on_interaction" => return handle_on_interaction(hook_runner, context_json),
+        "stop" => return handle_stop(hook_runner, context_json),
         _ => {
             return Err(crate::error::Error::BackendError {
                 message: format!("Unknown hook point: {hook_point}"),
@@ -39,6 +40,14 @@ pub(crate) fn dispatch_hook_by_name(
         }
     }
     Ok(String::new())
+}
+
+fn handle_stop(runner: &crate::hooks::Hooks, json: &str) -> Result<String, crate::error::Error> {
+    let args = deserialize_ctx(json, "StopArgs")?;
+    let res = runner.run_stop(&args);
+    serde_json::to_string(&res).map_err(|e| crate::error::Error::BackendError {
+        message: format!("Failed to serialize Stop result: {e}"),
+    })
 }
 
 fn deserialize_ctx<'a, T: serde::Deserialize<'a>>(
@@ -315,49 +324,7 @@ pub(crate) fn dispatch_rust_policy_confirm(
     })
 }
 
-/// Evaluates policies and registered handlers to check if a tool execution is allowed.
-pub(crate) fn check_tool_execution_allowed(
-    agent_id: u64,
-    name: &str,
-    args_json: &str,
-) -> Result<bool, crate::error::Error> {
-    let map = bridge_state()
-        .read()
-        .map_err(|e| crate::error::Error::BackendError {
-            message: format!("Failed to read BRIDGE_STATE: {e}"),
-        })?;
-
-    let Some(state) = map.get(&agent_id) else {
-        return Err(crate::error::Error::BackendError {
-            message: format!(
-                "Agent {agent_id} not found in bridge state — it may have been shut down"
-            ),
-        });
-    };
-
-    let (is_allowed, needs_confirm) = match state.policies.evaluate(name) {
-        crate::policies::PolicyDecision::Allow => (true, false),
-        crate::policies::PolicyDecision::Deny => (false, false),
-        crate::policies::PolicyDecision::NeedsConfirmation { .. } => (false, true),
-    };
-
-    if is_allowed {
-        return Ok(true);
-    }
-
-    if needs_confirm && let Some(ref handler) = state.policy_handler {
-        let handler = Arc::clone(handler);
-        // Drop the lock before calling the handler (it may block).
-        drop(map);
-        let args_val: serde_json::Value =
-            serde_json::from_str(args_json).map_err(|e| crate::error::Error::BackendError {
-                message: format!("Failed to parse policy args JSON: {e}"),
-            })?;
-        return Ok(handler.confirm(name, &args_val));
-    }
-
-    Ok(false)
-}
+pub(crate) use super::bridge_state::check_tool_execution_allowed;
 
 /// Build the [`ToolContext`](crate::tools::ToolContext) for a custom-tool
 /// dispatch: the agent's shared, cross-call key-value state plus its current

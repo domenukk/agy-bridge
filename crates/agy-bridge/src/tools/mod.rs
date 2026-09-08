@@ -10,9 +10,13 @@
 // appear in user-facing documentation.
 #[doc(hidden)]
 pub use llm_tool::__private;
+#[cfg(feature = "md-tmpl")]
+pub use llm_tool::md_tmpl;
 pub use llm_tool::{
-    EmptyParams, Json, JsonSchema, RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput,
-    ToolRegistry, definition_of,
+    EmptyParams, Json, JsonSchema, PromptDefinition, PromptOutput, PromptRegistry, RegistryItem,
+    ResourceDefinition, ResourceOutput, ResourceRegistry, RustPrompt, RustResource, RustTool,
+    SharedState, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry, definition_of,
+    llm_prompt, llm_resource, llm_tool,
 };
 
 // ── Available tool discovery types ──────────────────────────────────

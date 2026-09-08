@@ -18,7 +18,7 @@ Add `agy-bridge` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agy-bridge = "0.10"
+agy-bridge = "0.16"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -35,7 +35,7 @@ by the `localharness` binary:
 
 ```toml
 [dependencies]
-agy-bridge = { version = "0.10", default-features = false, features = ["native"] }
+agy-bridge = { version = "0.16", default-features = false, features = ["native"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -309,6 +309,11 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
         }
     });
 
+    hooks.on_stop("audit_stop", |args| {
+        println!("Agent stop requested: {:?}", args.stop_reason);
+        agy_bridge::hooks::StopHookResult::allow()
+    });
+
     let agent = bridge
         .agent(AgentConfig::builder().build())
         .hooks(hooks)
@@ -320,6 +325,43 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
     agent.shutdown().await?;
     Ok(())
 }
+```
+
+### Execution Budgets & Shell Safety
+
+Enforce hard operational bounds on model calls, tool calls, and token usage,
+configure session continuation, and harden background shell commands:
+
+```rust
+use agy_bridge::config::{
+    AgentBehavior, AgentConfig, BudgetConfig, CapabilitiesConfig,
+    RunCommandConfig, SessionContinuationMode,
+};
+
+let budget = BudgetConfig::builder()
+    .max_model_calls(20)
+    .max_tool_calls(100)
+    .max_total_tokens(500_000)
+    .build();
+
+let shell_config = RunCommandConfig::builder()
+    .enable_daemons(true)
+    .timeout_seconds(60.0)
+    .enable_sandbox(true)
+    .build();
+
+let config = AgentConfig::builder()
+    .behavior(AgentBehavior::Autonomous)
+    .session_continuation_mode(SessionContinuationMode::CreateOrResume)
+    .budget(budget)
+    .capabilities(
+        CapabilitiesConfig::builder()
+            .run_command_config(shell_config)
+            .build(),
+    )
+    .build();
+
+assert!(config.budget.is_some());
 ```
 
 ### Policies

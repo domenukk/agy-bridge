@@ -12,6 +12,8 @@ enum LifecycleHook {
   LIFECYCLE_HOOK_PRE_TOOL = 5;
   LIFECYCLE_HOOK_POST_TOOL = 6;
   LIFECYCLE_HOOK_ON_TOOL_ERROR = 7;
+  LIFECYCLE_HOOK_ON_COMPACTION = 8;
+  LIFECYCLE_HOOK_STOP = 9;
 }
 
 enum AgentBehavior {
@@ -666,12 +668,15 @@ message CallHookRequest {
   string request_id = 1;
   string name = 2;
   antigravity.localharness.LifecycleHook type = 7;
+  string client_id = 11;
   oneof args {
     antigravity.localharness.PreTurnArgs pre_turn_args = 3;
     antigravity.localharness.PostTurnArgs post_turn_args = 4;
     antigravity.localharness.PreToolArgs pre_tool_args = 5;
     antigravity.localharness.PostToolArgs post_tool_args = 6;
     antigravity.localharness.OnToolErrorArgs on_tool_error_args = 8;
+    antigravity.localharness.OnCompactionArgs on_compaction_args = 9;
+    antigravity.localharness.StopArgs stop_args = 10;
   }
 }
 
@@ -683,6 +688,7 @@ message CallHookResponse {
     antigravity.localharness.EmptyResult empty_result = 4;
     string error_message = 5;
     antigravity.localharness.OnToolErrorResult on_tool_error_result = 6;
+    antigravity.localharness.StopResult stop_result = 7;
   }
 }
 
@@ -691,6 +697,8 @@ message PreToolArgs {
   string arguments_json = 2;
   string server_name = 3;
   string call_id = 4;
+  string trajectory_id = 5;
+  int32 step_index = 6;
 }
 
 message PostToolArgs {
@@ -699,6 +707,8 @@ message PostToolArgs {
   string error = 3;
   string server_name = 5;
   string call_id = 6;
+  string trajectory_id = 7;
+  int32 step_index = 8;
 }
 
 message OnToolErrorArgs {
@@ -706,14 +716,37 @@ message OnToolErrorArgs {
   string error_message = 2;
   string server_name = 4;
   string call_id = 5;
+  string trajectory_id = 6;
+  int32 step_index = 7;
 }
 
 message PreTurnArgs {
   antigravity.localharness.UserInput user_input = 1;
+  string trajectory_id = 2;
 }
 
 message PostTurnArgs {
   string response_text = 1;
+  string trajectory_id = 2;
+}
+
+message OnCompactionArgs {
+  string trajectory_id = 1;
+  int32 step_index = 2;
+  string summary = 3;
+}
+
+message StopArgs {
+  string response_text = 1;
+  string trajectory_id = 2;
+  int32 continuation_count = 3;
+  string stop_reason = 4;
+  string error_message = 5;
+}
+
+message StopResult {
+  int32 decision = 1;
+  string reason = 2;
 }
 
 message EmptyResult {

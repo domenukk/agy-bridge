@@ -223,24 +223,47 @@ fn spawn_ws_sink_task(
     });
 }
 
+struct SessionReaderContext {
+    active_writer: Arc<tokio::sync::Mutex<Option<crate::streaming::ChatResponseWriter>>>,
+    last_response_text: Arc<Mutex<Option<String>>>,
+    last_error: Arc<Mutex<Option<crate::streaming::StreamError>>>,
+    produced_output: Arc<AtomicBool>,
+    turn_activity: Arc<AtomicBool>,
+    event_tx: mpsc::Sender<proto::localharness::InputEvent>,
+    turn_count: Arc<AtomicU32>,
+    total_usage: Arc<Mutex<crate::types::UsageMetadata>>,
+    last_turn_usage: Arc<Mutex<crate::types::UsageMetadata>>,
+    is_idle: Arc<AtomicBool>,
+    idle_notify: Arc<Notify>,
+    history: Arc<Mutex<Vec<ConversationMessage>>>,
+}
+
+impl SessionReaderContext {
+    fn from_session(session: &NativeAgentSession) -> Self {
+        Self {
+            active_writer: Arc::clone(&session.active_writer),
+            last_response_text: Arc::clone(&session.last_response_text),
+            last_error: Arc::clone(&session.last_error),
+            produced_output: Arc::clone(&session.produced_output),
+            turn_activity: Arc::clone(&session.turn_activity),
+            event_tx: session.event_tx.clone(),
+            turn_count: Arc::clone(&session.turn_count),
+            total_usage: Arc::clone(&session.total_usage),
+            last_turn_usage: Arc::clone(&session.last_turn_usage),
+            is_idle: Arc::clone(&session.is_idle),
+            idle_notify: Arc::clone(&session.idle_notify),
+            history: Arc::clone(&session.history),
+        }
+    }
+}
+
 fn spawn_ws_reader_task(
     agent_id: AgentId,
     mut ws_stream_reader: futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     session: &NativeAgentSession,
 ) {
-    let total_usage_clone = session.total_usage.clone();
-    let last_turn_usage_clone = session.last_turn_usage.clone();
-    let last_response_text_clone = session.last_response_text.clone();
-    let turn_count_clone = session.turn_count.clone();
-    let is_idle_clone = session.is_idle.clone();
-    let idle_notify_clone = session.idle_notify.clone();
-    let active_writer_clone = session.active_writer.clone();
-    let event_tx_clone = session.event_tx.clone();
-    let last_error_clone = session.last_error.clone();
-    let produced_output_clone = session.produced_output.clone();
-    let turn_activity_clone = session.turn_activity.clone();
-    let connected_clone = session.connected.clone();
-    let history_clone = session.history.clone();
+    let ctx = SessionReaderContext::from_session(session);
+    let connected_clone = Arc::clone(&session.connected);
 
     tokio::spawn(async move {
         while let Some(msg_res) = ws_stream_reader.next().await {
@@ -263,74 +286,84 @@ fn spawn_ws_reader_task(
             };
 
             if let Some(event) = output_event.event {
-                match event {
-                    proto::localharness::output_event::Event::StepUpdate(step_update) => {
-                        handle_step_update(
-                            agent_id,
-                            step_update,
-                            &active_writer_clone,
-                            &last_response_text_clone,
-                            &last_error_clone,
-                            &produced_output_clone,
-                            &turn_activity_clone,
-                        )
-                        .await;
-                    }
-                    proto::localharness::output_event::Event::ToolCall(tool_call) => {
-                        handle_tool_call(
-                            agent_id,
-                            tool_call,
-                            &active_writer_clone,
-                            &event_tx_clone,
-                            &turn_activity_clone,
-                        )
-                        .await;
-                    }
-                    proto::localharness::output_event::Event::CallHookRequest(req) => {
-                        handle_call_hook_request(agent_id, req, &turn_count_clone, &event_tx_clone)
-                            .await;
-                    }
-                    proto::localharness::output_event::Event::PolicyDecisionRequest(req) => {
-                        handle_policy_decision_request(agent_id, req, &event_tx_clone).await;
-                    }
-                    proto::localharness::output_event::Event::UsageUpdate(usage) => {
-                        handle_usage_update(
-                            usage,
-                            &total_usage_clone,
-                            &last_turn_usage_clone,
-                            &active_writer_clone,
-                        )
-                        .await;
-                    }
-                    proto::localharness::output_event::Event::TrajectoryStateUpdate(
-                        state_update,
-                    ) => {
-                        let ctx = TrajectoryStateContext {
-                            turn_count: &turn_count_clone,
-                            is_idle: &is_idle_clone,
-                            idle_notify: &idle_notify_clone,
-                            active_writer: &active_writer_clone,
-                            last_error: &last_error_clone,
-                            produced_output: &produced_output_clone,
-                            turn_activity: &turn_activity_clone,
-                            history: &history_clone,
-                            last_response_text: &last_response_text_clone,
-                        };
-                        handle_trajectory_state_update(state_update, &ctx).await;
-                    }
-                    _ => {}
-                }
+                dispatch_output_event(agent_id, event, &ctx).await;
             }
         }
 
         handle_ws_reader_exit(
             &connected_clone,
-            &is_idle_clone,
-            &idle_notify_clone,
-            &active_writer_clone,
+            &ctx.is_idle,
+            &ctx.idle_notify,
+            &ctx.active_writer,
         )
         .await;
     });
+}
+
+async fn dispatch_output_event(
+    agent_id: AgentId,
+    event: proto::localharness::output_event::Event,
+    ctx: &SessionReaderContext,
+) {
+    match event {
+        proto::localharness::output_event::Event::StepUpdate(step_update) => {
+            handle_step_update(
+                agent_id,
+                step_update,
+                &ctx.active_writer,
+                &ctx.last_response_text,
+                &ctx.last_error,
+                &ctx.produced_output,
+                &ctx.turn_activity,
+            )
+            .await;
+        }
+        proto::localharness::output_event::Event::ToolCall(tool_call) => {
+            let writer = Arc::clone(&ctx.active_writer);
+            let tx = ctx.event_tx.clone();
+            let activity = Arc::clone(&ctx.turn_activity);
+            tokio::spawn(async move {
+                handle_tool_call(agent_id, tool_call, &writer, &tx, &activity).await;
+            });
+        }
+        proto::localharness::output_event::Event::CallHookRequest(req) => {
+            let tc = Arc::clone(&ctx.turn_count);
+            let tx = ctx.event_tx.clone();
+            tokio::spawn(async move {
+                handle_call_hook_request(agent_id, req, &tc, &tx).await;
+            });
+        }
+        proto::localharness::output_event::Event::PolicyDecisionRequest(req) => {
+            let tx = ctx.event_tx.clone();
+            tokio::spawn(async move {
+                handle_policy_decision_request(agent_id, req, &tx).await;
+            });
+        }
+        proto::localharness::output_event::Event::UsageUpdate(usage) => {
+            handle_usage_update(
+                usage,
+                &ctx.total_usage,
+                &ctx.last_turn_usage,
+                &ctx.active_writer,
+            )
+            .await;
+        }
+        proto::localharness::output_event::Event::TrajectoryStateUpdate(state_update) => {
+            let traj_ctx = TrajectoryStateContext {
+                turn_count: &ctx.turn_count,
+                is_idle: &ctx.is_idle,
+                idle_notify: &ctx.idle_notify,
+                active_writer: &ctx.active_writer,
+                last_error: &ctx.last_error,
+                produced_output: &ctx.produced_output,
+                turn_activity: &ctx.turn_activity,
+                history: &ctx.history,
+                last_response_text: &ctx.last_response_text,
+            };
+            handle_trajectory_state_update(state_update, &traj_ctx).await;
+        }
+        _ => {}
+    }
 }
 
 /// Clean up session state after the harness WebSocket reader loop terminates.
@@ -523,12 +556,24 @@ impl Runtime for NativeRuntime {
 
             if !session.connected.load(Ordering::SeqCst) {
                 return Err(Error::BackendError {
-                    message: "Agent session is disconnected: the harness                               WebSocket has closed and cannot accept new turns"
+                    message: "Agent session is disconnected: the harness \
+                              WebSocket has closed and cannot accept new turns"
                         .to_string(),
                 });
             }
 
-            session.is_idle.store(false, Ordering::SeqCst);
+            match session
+                .is_idle
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {}
+                Err(current) => {
+                    tracing::debug!(current, "Agent is busy, cannot acquire turn");
+                    return Err(Error::BackendError {
+                        message: "Agent is already executing a turn; wait for completion before starting a new turn".to_string(),
+                    });
+                }
+            }
             session.produced_output.store(false, Ordering::SeqCst);
             session.turn_activity.store(false, Ordering::SeqCst);
             match session.last_error.lock() {
@@ -542,7 +587,15 @@ impl Runtime for NativeRuntime {
 
             let prompt_text = match &content {
                 Content::Text { text } => text.clone(),
-                _ => format!("{content:?}"),
+                Content::Multi { parts } => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        crate::content::ContentPrimitive::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
             };
 
             match session.history.lock() {
@@ -603,8 +656,8 @@ impl Runtime for NativeRuntime {
                     tracing::debug!(error = %e, "Harness already disconnected on shutdown");
                 }
 
-                let mut proc_opt = s.process.lock().await;
-                if let Some(mut proc) = proc_opt.take() {
+                let taken_proc = s.process.lock().await.take();
+                if let Some(mut proc) = taken_proc {
                     if let Err(e) = proc.child.kill().await {
                         tracing::debug!(error = %e, "Process already terminated on shutdown");
                     }

@@ -339,13 +339,11 @@ impl<R: Runtime> AgentHandle<R> {
         effective_hook_runner: Arc<crate::hooks::Hooks>,
         policy_handler: Option<&Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Arc<Mutex<Option<String>>>, Error> {
-        #[cfg(feature = "python")]
         let policies_set = crate::policies::PolicySet::validated_from(config.policies.clone())?;
         let conversation_id = Arc::new(Mutex::new(config.conversation_id.clone()));
         let bridge_entry = crate::runtime::AgentBridgeState {
             registry: registry.map(Arc::clone),
             hook_runner: Some(effective_hook_runner),
-            #[cfg(feature = "python")]
             policies: policies_set,
             policy_handler: policy_handler.map(Arc::clone),
             tool_state: llm_tool::SharedState::new(),

@@ -188,6 +188,7 @@ fn test_modality_token_counts_in_usage_metadata() {
             token_count: 300,
         }],
         tool_use_prompt_tokens_details: Vec::new(),
+        service_tier: None,
     };
 
     let json = serde_json::to_string(&usage).expect("serialize");

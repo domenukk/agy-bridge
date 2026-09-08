@@ -55,8 +55,11 @@ impl std::fmt::Display for ThinkingLevel {
 pub struct GenerationConfig {
     /// Thinking level for models that support extended thinking.
     /// When `None`, the model's default level is used.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ThinkingLevel>,
+    /// Service tier for the model (standard, priority, flex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<crate::types::ServiceTier>,
 }
 
 /// A single model slot with its name, optional API key, and generation config.
@@ -179,6 +182,7 @@ mod tests {
             api_key: Some("mock_test_api_key_123".to_string()),
             generation: GenerationConfig {
                 thinking_level: Some(ThinkingLevel::High),
+                service_tier: None,
             },
         };
         let json = serde_json::to_string(&entry).unwrap();

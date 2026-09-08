@@ -357,6 +357,7 @@ async fn handle_mock_hook_exchange(
                 request_id: "hook-req-1".to_string(),
                 name: "pre_turn".to_string(),
                 r#type: 3,
+                client_id: String::new(),
                 args: Some(proto::localharness::call_hook_request::Args::PreTurnArgs(
                     proto::localharness::PreTurnArgs {
                         user_input: Some(proto::localharness::UserInput {
@@ -366,6 +367,7 @@ async fn handle_mock_hook_exchange(
                                 )),
                             }],
                         }),
+                        trajectory_id: String::new(),
                     },
                 )),
             },
@@ -687,6 +689,201 @@ async fn test_native_backend_budget_and_subagents_e2e() {
 
     let reply = agent.chat_text("Perform budget task").await.expect("chat");
     assert_eq!(reply, "Budget-constrained answer");
+
+    agent.shutdown().await.expect("shutdown");
+    server_task.await.expect("server task completed");
+
+    cleanup_mock_binary(&mock_bin_path);
+}
+
+async fn handle_mock_stop_hook_exchange(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) {
+    let hook_req_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::CallHookRequest(
+            proto::localharness::CallHookRequest {
+                request_id: "stop-req-1".to_string(),
+                name: "stop".to_string(),
+                r#type: 9,
+                client_id: String::new(),
+                args: Some(proto::localharness::call_hook_request::Args::StopArgs(
+                    proto::localharness::StopArgs {
+                        response_text: "Checking final work".to_string(),
+                        trajectory_id: "traj-stop-1".to_string(),
+                        continuation_count: 0,
+                        stop_reason: "MAX_MODEL_CALLS_EXCEEDED".to_string(),
+                        error_message: String::new(),
+                    },
+                )),
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&hook_req_event).unwrap().into(),
+    ))
+    .await
+    .expect("send stop hook req");
+
+    let hook_resp_msg = ws.next().await.expect("hook resp msg").expect("valid msg");
+    let hook_resp_event: proto::localharness::InputEvent =
+        serde_json::from_str(hook_resp_msg.to_text().unwrap()).expect("parse hook resp");
+    if let Some(proto::localharness::input_event::Event::CallHookResponse(resp)) =
+        hook_resp_event.event
+    {
+        assert_eq!(resp.request_id, "stop-req-1");
+        if let Some(proto::localharness::call_hook_response::Result::StopResult(stop_res)) =
+            resp.result
+        {
+            assert_eq!(stop_res.decision, 2); // CONTINUE
+            assert_eq!(stop_res.reason, "Please continue verification");
+        } else {
+            panic!("Expected StopResult, got {:?}", resp.result);
+        }
+    } else {
+        panic!("Expected CallHookResponse, got {hook_resp_event:?}");
+    }
+}
+
+async fn run_mock_v016_session(listener: TcpListener) {
+    let (stream, _) = listener.accept().await.expect("accept connection");
+    let mut ws = accept_async(stream).await.expect("ws handshake");
+
+    let init_msg = ws.next().await.expect("first message").expect("valid msg");
+    let _init_event: proto::localharness::InitializeConversationEvent =
+        serde_json::from_str(init_msg.to_text().unwrap()).expect("parse init event");
+
+    let init_resp = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::InitializeConversationResponse(
+                proto::localharness::InitializeConversationResponse {
+                    cascade_id: "v016-cascade-1".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&init_resp).unwrap().into(),
+    ))
+    .await
+    .expect("send init resp");
+
+    let _user_msg = ws.next().await.expect("user msg").expect("valid msg");
+
+    handle_mock_stop_hook_exchange(&mut ws).await;
+
+    let step_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::StepUpdate(
+            proto::localharness::StepUpdate {
+                text_delta: "v016 answer".to_string(),
+                text: "v016 answer".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&step_event).unwrap().into(),
+    ))
+    .await
+    .expect("send step");
+
+    let usage_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::UsageUpdate(
+            proto::localharness::UsageUpdate {
+                total: Some(proto::localharness::UsageMetadata {
+                    prompt_token_count: 50,
+                    candidates_token_count: 25,
+                    total_token_count: 75,
+                    service_tier: "priority".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&usage_event).unwrap().into(),
+    ))
+    .await
+    .expect("send usage update");
+
+    let state_event = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::TrajectoryStateUpdate(
+                proto::localharness::TrajectoryStateUpdate {
+                    state: 3,
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&state_event).unwrap().into(),
+    ))
+    .await
+    .expect("send state update");
+}
+
+#[tokio::test]
+async fn test_native_backend_v016_features_e2e() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let server_task = tokio::spawn(run_mock_v016_session(listener));
+
+    let mock_bin_path = create_mock_harness_binary(port, "v016");
+
+    let bridge = AgyBridge::native_builder()
+        .harness_path(&mock_bin_path)
+        .build_native()
+        .expect("build bridge");
+
+    let stop_called = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_called.clone();
+
+    let mut hooks = agy_bridge::hooks::Hooks::new();
+    hooks.on_stop("stop_checker", move |args| {
+        assert_eq!(args.continuation_count, 0);
+        assert_eq!(
+            args.stop_reason,
+            agy_bridge::types::StopReason::MaxModelCallsExceeded
+        );
+        assert_eq!(args.response_text, "Checking final work");
+        assert_eq!(args.trajectory_id, "traj-stop-1");
+        stop_flag.store(true, Ordering::SeqCst);
+        agy_bridge::hooks::StopHookResult::continue_with("Please continue verification")
+    });
+
+    let config = AgentConfig::builder()
+        .session_continuation_mode(agy_bridge::config::SessionContinuationMode::CreateOrResume)
+        .capabilities(
+            agy_bridge::config::CapabilitiesConfig::builder()
+                .run_command_config(
+                    agy_bridge::config::RunCommandConfig::builder()
+                        .enable_daemons(true)
+                        .timeout_seconds(30.0)
+                        .enable_sandbox(true)
+                        .build(),
+                )
+                .build(),
+        )
+        .build();
+
+    let agent = bridge
+        .agent(config)
+        .hooks(hooks)
+        .await
+        .expect("create agent");
+
+    let reply = agent.chat_text("Perform v016 task").await.expect("chat");
+    assert_eq!(reply, "v016 answer");
+    assert!(stop_called.load(Ordering::SeqCst));
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");

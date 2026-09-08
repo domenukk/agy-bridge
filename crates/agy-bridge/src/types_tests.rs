@@ -227,6 +227,7 @@ fn test_step_full_roundtrip() {
                 token_count: 100,
             }],
             tool_use_prompt_tokens_details: Vec::new(),
+            service_tier: None,
         }),
     };
 

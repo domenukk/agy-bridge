@@ -16,23 +16,32 @@ use fast_rands::Rand;
 ///
 /// Panics if the key is not found in either location.
 pub fn api_key() -> String {
+    use agy_bridge::config::{ENV_GEMINI_API_BASE_URL, ENV_GEMINI_API_KEY, PROXY_AUTH_SENTINEL};
+
     // NOLINT: env var not set is expected — falls through to .env file below
-    if let Ok(key) = std::env::var("GEMINI_API_KEY")
+    if let Ok(key) = std::env::var(ENV_GEMINI_API_KEY)
         && !key.is_empty()
     {
         return key.trim_matches('"').to_string();
     }
     // Try loading from .env
     let env_map = agy_bridge::load_dotenv();
-    if let Some(key) = env_map.get("GEMINI_API_KEY")
+    if let Some(key) = env_map.get(ENV_GEMINI_API_KEY)
         && !key.is_empty()
     {
         return key.trim_matches('"').to_string();
     }
+    // When running in proxy mode (via GEMINI_API_BASE_URL),
+    // the proxy handles authentication via proxy credentials.
+    if std::env::var(ENV_GEMINI_API_BASE_URL).is_ok()
+        || env_map.contains_key(ENV_GEMINI_API_BASE_URL)
+    {
+        return PROXY_AUTH_SENTINEL.to_string();
+    }
     // NOLINT: test helper — cwd default is fine, path is only used in the panic message
     let dotenv_path = std::env::current_dir().unwrap_or_default().join(".env");
     panic!(
-        "GEMINI_API_KEY not set in environment or in {dotenv}",
+        "{ENV_GEMINI_API_KEY} (or {ENV_GEMINI_API_BASE_URL} for proxy mode) not set in environment or in {dotenv}",
         dotenv = dotenv_path.display(),
     );
 }

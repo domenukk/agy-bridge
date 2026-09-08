@@ -216,6 +216,7 @@ impl MockGeminiServer {
         let count = Arc::clone(&post_count);
         let recs = Arc::clone(&posts);
 
+        let responses = Arc::new(responses);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -223,74 +224,77 @@ impl MockGeminiServer {
                 };
                 let count = Arc::clone(&count);
                 let recs = Arc::clone(&recs);
-                let responses = responses.clone();
+                let responses = Arc::clone(&responses);
                 tokio::spawn(async move {
                     let (reader, mut writer) = tokio::io::split(stream);
                     let mut buf_reader = BufReader::new(reader);
 
-                    let Some((request_line, body)) =
+                    while let Some((request_line, body)) =
                         parse_http_request_with_body(&mut buf_reader).await
-                    else {
-                        return;
-                    };
+                    {
+                        if request_line.starts_with("GET ") {
+                            let resp = json_response(200, &model_list_json());
+                            if let Err(e) = writer.write_all(resp.as_bytes()).await {
+                                eprintln!("mock server: write failed: {e}");
+                                break;
+                            }
+                            if let Err(e) = writer.flush().await {
+                                eprintln!("mock server: flush failed: {e}");
+                                break;
+                            }
+                            continue;
+                        }
 
-                    if request_line.starts_with("GET ") {
-                        let resp = json_response(200, &model_list_json());
-                        if let Err(e) = writer.write_all(resp.as_bytes()).await {
+                        let n = count.fetch_add(1, Ordering::SeqCst);
+                        recs.lock().await.push(RecordedPost { body });
+
+                        let idx = n.min(responses.len().saturating_sub(1));
+                        let response = match &responses[idx] {
+                            MockResponse::FunctionCall { name, args } => {
+                                sse_response(&function_call_json(name, args))
+                            }
+                            MockResponse::Text(text) => sse_response(&text_response_json(text)),
+                            MockResponse::EmptyCandidate => sse_response(&empty_candidate_json()),
+                            MockResponse::HttpError { status, message } => {
+                                http_error_response(*status, message)
+                            }
+                            MockResponse::Sequence(items) => {
+                                let mut frames = String::new();
+                                for item in items {
+                                    let json = match item {
+                                        MockResponse::Text(t) => text_response_json(t),
+                                        MockResponse::FunctionCall { name, args } => {
+                                            function_call_json(name, args)
+                                        }
+                                        MockResponse::EmptyCandidate => empty_candidate_json(),
+                                        MockResponse::HttpError { .. }
+                                        | MockResponse::Sequence(_) => {
+                                            continue;
+                                        }
+                                    };
+                                    write!(frames, "data: {json}\n\n")
+                                        .expect("writing to a String is infallible");
+                                }
+                                format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: text/event-stream\r\n\
+                                     Content-Length: {}\r\n\
+                                     \r\n\
+                                     {}",
+                                    frames.len(),
+                                    frames,
+                                )
+                            }
+                        };
+
+                        if let Err(e) = writer.write_all(response.as_bytes()).await {
                             eprintln!("mock server: write failed: {e}");
+                            break;
                         }
                         if let Err(e) = writer.flush().await {
                             eprintln!("mock server: flush failed: {e}");
+                            break;
                         }
-                        return;
-                    }
-
-                    let n = count.fetch_add(1, Ordering::SeqCst);
-                    recs.lock().await.push(RecordedPost { body });
-
-                    let idx = n.min(responses.len().saturating_sub(1));
-                    let response = match &responses[idx] {
-                        MockResponse::FunctionCall { name, args } => {
-                            sse_response(&function_call_json(name, args))
-                        }
-                        MockResponse::Text(text) => sse_response(&text_response_json(text)),
-                        MockResponse::EmptyCandidate => sse_response(&empty_candidate_json()),
-                        MockResponse::HttpError { status, message } => {
-                            http_error_response(*status, message)
-                        }
-                        MockResponse::Sequence(items) => {
-                            let mut frames = String::new();
-                            for item in items {
-                                let json = match item {
-                                    MockResponse::Text(t) => text_response_json(t),
-                                    MockResponse::FunctionCall { name, args } => {
-                                        function_call_json(name, args)
-                                    }
-                                    MockResponse::EmptyCandidate => empty_candidate_json(),
-                                    MockResponse::HttpError { .. } | MockResponse::Sequence(_) => {
-                                        continue;
-                                    }
-                                };
-                                write!(frames, "data: {json}\n\n")
-                                    .expect("writing to a String is infallible");
-                            }
-                            format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: text/event-stream\r\n\
-                                 Content-Length: {}\r\n\
-                                 \r\n\
-                                 {}",
-                                frames.len(),
-                                frames,
-                            )
-                        }
-                    };
-
-                    if let Err(e) = writer.write_all(response.as_bytes()).await {
-                        eprintln!("mock server: write failed: {e}");
-                    }
-                    if let Err(e) = writer.flush().await {
-                        eprintln!("mock server: flush failed: {e}");
                     }
                 });
             }

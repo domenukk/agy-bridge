@@ -264,6 +264,8 @@ pub enum HookPoint {
     OnToolError,
     /// Fires on each user interaction (message received from user).
     OnInteraction,
+    /// Fires when the turn reaches fully idle to decide whether to stop or continue.
+    Stop,
 }
 
 impl HookPoint {
@@ -280,6 +282,119 @@ impl HookPoint {
             Self::OnSessionEnd => "on_session_end",
             Self::OnToolError => "on_tool_error",
             Self::OnInteraction => "on_interaction",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// Decision returned by a Stop lifecycle hook.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StopDecision {
+    /// Allows the turn execution to terminate and transition to idle.
+    #[default]
+    #[serde(rename = "ALLOW_STOP")]
+    AllowStop,
+    /// Blocks termination, injects reason as a system prompt, and resumes execution.
+    #[serde(rename = "CONTINUE")]
+    Continue,
+}
+
+impl StopDecision {
+    /// Returns the string representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::AllowStop => "ALLOW_STOP",
+            Self::Continue => "CONTINUE",
+        }
+    }
+
+    /// Returns the proto numeric value for localharness `StopResult`.
+    #[must_use]
+    pub const fn to_proto_i32(self) -> i32 {
+        match self {
+            Self::AllowStop => 1,
+            Self::Continue => 2,
+        }
+    }
+
+    /// Convert from protobuf numeric value.
+    #[must_use]
+    pub const fn from_proto_i32(val: i32) -> Option<Self> {
+        match val {
+            1 => Some(Self::AllowStop),
+            2 => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StopDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StopDecision {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ALLOW_STOP" | "allow_stop" => Ok(Self::AllowStop),
+            "CONTINUE" | "continue" => Ok(Self::Continue),
+            other => Err(format!("Unrecognized StopDecision: {other}")),
+        }
+    }
+}
+
+/// Arguments delivered to a Stop hook when the root turn reaches idle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StopArgs {
+    /// Most recent assistant response text in the turn.
+    #[serde(default)]
+    pub response_text: String,
+    /// Unique identifier of the trajectory executing this turn.
+    #[serde(default)]
+    pub trajectory_id: String,
+    /// The 0-based iteration count of Stop hook continuations within the current turn cycle.
+    #[serde(default)]
+    pub continuation_count: u32,
+    /// The reason why the trajectory stopped (strongly typed enum).
+    #[serde(default)]
+    pub stop_reason: crate::types::StopReason,
+    /// Error message if execution stopped due to a fatal error.
+    #[serde(default)]
+    pub error_message: String,
+}
+
+/// Result returned by a Stop lifecycle hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StopHookResult {
+    /// Whether to allow the turn to stop or continue execution.
+    #[serde(default)]
+    pub decision: StopDecision,
+    /// Feedback/prompt injected into the conversation when decision is CONTINUE.
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl StopHookResult {
+    /// Creates a stop result allowing the turn to complete.
+    #[must_use]
+    pub const fn allow() -> Self {
+        Self {
+            decision: StopDecision::AllowStop,
+            reason: String::new(),
+        }
+    }
+
+    /// Creates a stop result continuing the turn with the given feedback reason.
+    #[must_use]
+    pub fn continue_with(reason: impl Into<String>) -> Self {
+        Self {
+            decision: StopDecision::Continue,
+            reason: reason.into(),
         }
     }
 }
@@ -524,6 +639,8 @@ pub enum HookCallback {
     OnCompaction(Box<dyn Fn(&OnCompactionContext) + Send + Sync>),
     /// Callback invoked on each interaction event.
     OnInteraction(Box<dyn Fn(&OnInteractionContext) -> HookResult + Send + Sync>),
+    /// Callback invoked when the turn reaches fully idle to decide whether to stop or continue.
+    Stop(Box<dyn Fn(&StopArgs) -> StopHookResult + Send + Sync>),
     /// Transform tool input arguments before execution.
     ///
     /// The closure receives the pre-tool-call context and may return
@@ -550,6 +667,7 @@ impl HookCallback {
             Self::OnSessionEnd(_) => HookPoint::OnSessionEnd,
             Self::OnCompaction(_) => HookPoint::OnCompaction,
             Self::OnInteraction(_) => HookPoint::OnInteraction,
+            Self::Stop(_) => HookPoint::Stop,
         }
     }
 }

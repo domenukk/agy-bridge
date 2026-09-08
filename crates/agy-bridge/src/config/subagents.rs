@@ -3,10 +3,10 @@
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-use super::{AgentBehavior, BuiltinTools, SystemInstructions};
+use super::{AgentBehavior, BuiltinTools, SystemInstructions, capabilities::RunCommandConfig};
 
 /// Capabilities configuration specifically for a custom subagent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TypedBuilder, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TypedBuilder, Default)]
 #[builder(field_defaults(default))]
 pub struct SubagentCapabilities {
     /// Behavioral mode of the subagent.
@@ -24,10 +24,14 @@ pub struct SubagentCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub disabled_tools: Option<Vec<BuiltinTools>>,
+    /// Configuration for the `run_command` builtin tool for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option))]
+    pub run_command_config: Option<RunCommandConfig>,
 }
 
 /// Configuration for defining a custom subagent available to the primary agent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TypedBuilder)]
 pub struct SubagentConfig {
     /// Unique name of the subagent.
     #[builder(setter(into))]

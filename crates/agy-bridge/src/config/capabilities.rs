@@ -203,7 +203,7 @@ impl std::fmt::Display for AgentBehavior {
 /// assert!(!caps.enable_subagents);
 /// assert_eq!(caps.compaction_threshold, Some(8000));
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TypedBuilder)]
 pub struct CapabilitiesConfig {
     /// Whether this agent can spawn subagents.
     #[serde(default = "super::default_true")]
@@ -248,6 +248,26 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     #[builder(default, setter(into, strip_option))]
     pub finish_tool_schema_json: Option<String>,
+    /// Configuration for the `run_command` builtin tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub run_command_config: Option<RunCommandConfig>,
+}
+
+/// Configuration for the builtin `run_command` tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TypedBuilder, Default)]
+#[builder(field_defaults(default))]
+pub struct RunCommandConfig {
+    /// Whether the agent is authorized to start long-running daemon commands.
+    #[serde(default)]
+    pub enable_daemons: bool,
+    /// Maximum execution duration in seconds for commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option))]
+    pub timeout_seconds: Option<f64>,
+    /// When true, terminal commands are executed inside the OS-level sandbox.
+    #[serde(default)]
+    pub enable_sandbox: bool,
 }
 
 impl CapabilitiesConfig {

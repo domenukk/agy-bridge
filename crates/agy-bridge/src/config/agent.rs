@@ -263,6 +263,76 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<super::subagents::SubagentConfig>>| v.into_iter().map(Into::into).collect()))]
     pub subagents: Vec<super::subagents::SubagentConfig>,
+    /// Session continuation strategy for conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub session_continuation_mode: Option<SessionContinuationMode>,
+}
+
+/// Controls whether an agent session resumes an existing conversation or starts fresh.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionContinuationMode {
+    /// Resume an existing conversation trajectory. Fails if the conversation does not exist.
+    Resume,
+    /// Resume an existing conversation if found, or create a new one.
+    #[default]
+    CreateOrResume,
+    /// Always create a new conversation trajectory. Fails if one already exists.
+    CreateOnly,
+}
+
+impl SessionContinuationMode {
+    /// Returns the string representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::CreateOrResume => "create_or_resume",
+            Self::CreateOnly => "create_only",
+        }
+    }
+
+    /// Convert to protobuf numeric value for localharness.
+    #[must_use]
+    pub const fn to_proto_i32(self) -> i32 {
+        match self {
+            Self::Resume => 1,
+            Self::CreateOrResume => 2,
+            Self::CreateOnly => 3,
+        }
+    }
+
+    /// Convert from protobuf numeric value.
+    #[must_use]
+    pub const fn from_proto_i32(val: i32) -> Option<Self> {
+        match val {
+            1 => Some(Self::Resume),
+            2 => Some(Self::CreateOrResume),
+            3 => Some(Self::CreateOnly),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionContinuationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SessionContinuationMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "resume" => Ok(Self::Resume),
+            "create_or_resume" => Ok(Self::CreateOrResume),
+            "create_only" => Ok(Self::CreateOnly),
+            other => Err(format!("Unrecognized SessionContinuationMode: {other}")),
+        }
+    }
 }
 
 /// Configuration for API retry behavior with exponential backoff.
@@ -332,7 +402,20 @@ impl AgentConfig {
             .or_else(|| self.gemini.as_ref().and_then(|g| g.api_key.clone()))
             .or_else(|| self.api_key.clone())
             // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
-            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .or_else(|| std::env::var(super::ENV_GEMINI_API_KEY).ok())
+    }
+
+    /// Resolve the effective base URL using the priority chain:
+    ///
+    /// 1. Explicit `GeminiConfig` base URL (`gemini.base_url`)
+    /// 2. `$GEMINI_API_BASE_URL` environment variable
+    #[must_use]
+    pub fn effective_base_url(&self) -> Option<String> {
+        self.gemini
+            .as_ref()
+            .and_then(|g| g.base_url.clone())
+            // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
+            .or_else(|| std::env::var(super::ENV_GEMINI_API_BASE_URL).ok())
     }
 
     /// Returns the names of all explicitly registered custom tools.
@@ -452,6 +535,7 @@ mod tests {
                     api_key: None,
                     generation: GenerationConfig {
                         thinking_level: Some(ThinkingLevel::High),
+                        service_tier: None,
                     },
                 },
                 image_generation: default_image_model_entry(),
@@ -484,6 +568,7 @@ mod tests {
                         api_key: Some("model-key".to_string()),
                         generation: GenerationConfig {
                             thinking_level: Some(ThinkingLevel::Medium),
+                            service_tier: None,
                         },
                     },
                     image_generation: default_image_model_entry(),

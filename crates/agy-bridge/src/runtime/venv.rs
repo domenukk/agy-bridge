@@ -84,7 +84,84 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
         tracing::debug!(path = %sp_str, "Added venv site-packages via site.addsitedir() and sys.path.insert(0)");
     }
 
+    verify_python_sdk_version(py)?;
+
     Ok(())
+}
+
+/// Minimum supported version of `google-antigravity`.
+pub const MIN_SUPPORTED_SDK_VERSION: &str = "0.1.16";
+
+/// Parses a semver-like version string (e.g. "0.1.16" or "0.1.16.post1") into `(major, minor, patch)`.
+pub fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = match parts.next()?.parse::<u64>() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(error = %err, version, "failed to parse major version");
+            return None;
+        }
+    };
+    let minor = match parts.next()?.parse::<u64>() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(error = %err, version, "failed to parse minor version");
+            return None;
+        }
+    };
+    let patch_part = parts.next()?.split(['-', '+', 'a', 'b', 'r']).next()?;
+    let patch = match patch_part.parse::<u64>() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(error = %err, version, "failed to parse patch version");
+            return None;
+        }
+    };
+    Some((major, minor, patch))
+}
+
+/// Checks whether `installed` version satisfies the `required` version.
+pub fn is_version_compatible(installed: &str, required: &str) -> bool {
+    match (parse_semver(installed), parse_semver(required)) {
+        (Some(inst), Some(req)) => inst >= req,
+        _ => false,
+    }
+}
+
+/// Verifies that the installed `google-antigravity` Python package satisfies the
+/// minimum supported version requirements.
+pub(crate) fn verify_python_sdk_version(py: Python<'_>) -> PyResult<Option<String>> {
+    let importlib_metadata = match py.import("importlib.metadata") {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "importlib.metadata not available in Python environment");
+            return Ok(None);
+        }
+    };
+
+    let version_obj = match importlib_metadata.call_method1("version", ("google-antigravity",)) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "google-antigravity package not installed in environment");
+            return Ok(None);
+        }
+    };
+
+    let version_str: String = version_obj.extract()?;
+    if !is_version_compatible(&version_str, MIN_SUPPORTED_SDK_VERSION) {
+        let msg = format!(
+            "Installed google-antigravity version {version_str} is older than minimum supported version {MIN_SUPPORTED_SDK_VERSION}"
+        );
+        tracing::error!("{msg}");
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(msg));
+    }
+
+    tracing::debug!(
+        installed = %version_str,
+        min_required = MIN_SUPPORTED_SDK_VERSION,
+        "google-antigravity version check succeeded"
+    );
+    Ok(Some(version_str))
 }
 
 /// Walk upward from `start` to find the nearest ancestor containing a `.venv`
@@ -154,5 +231,30 @@ mod tests {
         // Starting from child, should find child's .venv first.
         let result = discover_venv_root(&child);
         assert_eq!(result, child);
+    }
+
+    #[test]
+    fn test_parse_semver_valid() {
+        assert_eq!(parse_semver("0.1.16"), Some((0, 1, 16)));
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("0.1.16.post1"), Some((0, 1, 16)));
+        assert_eq!(parse_semver("0.1.16-alpha"), Some((0, 1, 16)));
+    }
+
+    #[test]
+    fn test_parse_semver_invalid() {
+        assert_eq!(parse_semver("invalid"), None);
+        assert_eq!(parse_semver("0.1"), None);
+    }
+
+    #[test]
+    fn test_is_version_compatible() {
+        assert!(is_version_compatible("0.1.16", "0.1.16"));
+        assert!(is_version_compatible("0.1.17", "0.1.16"));
+        assert!(is_version_compatible("0.2.0", "0.1.16"));
+        assert!(is_version_compatible("1.0.0", "0.1.16"));
+        assert!(!is_version_compatible("0.1.15", "0.1.16"));
+        assert!(!is_version_compatible("0.0.9", "0.1.16"));
+        assert!(!is_version_compatible("not-a-version", "0.1.16"));
     }
 }
