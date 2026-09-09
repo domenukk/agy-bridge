@@ -15,39 +15,71 @@ use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-fn create_mock_harness_binary(port: u16, prefix: &str) -> String {
-    let output_config = proto::localharness::OutputConfig {
-        port: i32::from(port),
-        api_key: "mock-api-key".to_string(),
-    };
-    let mut out_bytes = Vec::new();
-    output_config
-        .encode(&mut out_bytes)
-        .expect("encode output config");
-
-    let mut frame = Vec::new();
-    let len_u32 = u32::try_from(out_bytes.len()).expect("len fits u32");
-    frame.extend_from_slice(&len_u32.to_le_bytes());
-    frame.extend_from_slice(&out_bytes);
-
-    let mock_bin_path = format!("/tmp/mock_localharness_{prefix}_{port}");
-    let payload_path = format!("{mock_bin_path}.dat");
-    fs::write(&payload_path, &frame).expect("write mock payload");
-
-    let script_content = format!("#!/bin/sh\ncat '{payload_path}'\nexec sleep 30\n");
-
-    fs::write(&mock_bin_path, script_content).expect("write mock binary");
-    fs::set_permissions(&mock_bin_path, Permissions::from_mode(0o755)).expect("set executable");
-    mock_bin_path
+struct MockHarness {
+    _dir: tempfile::TempDir,
+    bin_path: std::path::PathBuf,
+    pid_file: std::path::PathBuf,
 }
 
-fn cleanup_mock_binary(mock_bin_path: &str) {
-    // NOLINT: cleanup in test may fail if mock binary was already cleaned up
-    let _ = fs::remove_file(mock_bin_path);
-    // NOLINT: cleanup in test may fail if mock payload was already cleaned up
-    let _ = fs::remove_file(format!("{mock_bin_path}.dat"));
-    // NOLINT: cleanup in test may fail if pid file was not written or already cleaned up
-    let _ = fs::remove_file(format!("{mock_bin_path}.pid"));
+impl MockHarness {
+    fn create(port: u16, prefix: &str, record_pid: bool) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("mock_harness_{prefix}_"))
+            .tempdir()
+            .expect("create mock tempdir");
+        let bin_path = dir.path().join("mock_localharness");
+        let payload_path = dir.path().join("payload.dat");
+        let pid_file = dir.path().join("harness.pid");
+
+        let output_config = proto::localharness::OutputConfig {
+            port: i32::from(port),
+            api_key: "mock-api-key".to_string(),
+        };
+        let mut out_bytes = Vec::new();
+        output_config
+            .encode(&mut out_bytes)
+            .expect("encode output config");
+
+        let mut frame = Vec::new();
+        let len_u32 = u32::try_from(out_bytes.len()).expect("len fits u32");
+        frame.extend_from_slice(&len_u32.to_le_bytes());
+        frame.extend_from_slice(&out_bytes);
+
+        fs::write(&payload_path, &frame).expect("write mock payload");
+
+        let script_content = if record_pid {
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\ncat '{}'\nexec sleep 30\n",
+                pid_file.display(),
+                payload_path.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\ncat '{}'\nexec sleep 30\n",
+                payload_path.display()
+            )
+        };
+
+        fs::write(&bin_path, script_content).expect("write mock binary");
+        fs::set_permissions(&bin_path, Permissions::from_mode(0o755)).expect("set executable");
+
+        Self {
+            _dir: dir,
+            bin_path,
+            pid_file,
+        }
+    }
+
+    fn bin_path(&self) -> &std::path::Path {
+        &self.bin_path
+    }
+
+    fn read_pid(&self) -> String {
+        fs::read_to_string(&self.pid_file)
+            .expect("read pid file")
+            .trim()
+            .to_string()
+    }
 }
 
 async fn handle_mock_agent_session(
@@ -145,10 +177,10 @@ async fn test_native_backend_multiplexing_multiple_agents_on_single_harness() {
         tokio::try_join!(h1, h2).expect("mock agent tasks panicked");
     });
 
-    let mock_bin_path = create_mock_harness_binary(port, "multiplex");
+    let mock = MockHarness::create(port, "multiplex", false);
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -201,8 +233,6 @@ async fn test_native_backend_multiplexing_multiple_agents_on_single_harness() {
     server_task.await.expect("server task completed");
     bridge.runtime().shutdown().await.expect("runtime shutdown");
     assert_eq!(bridge.runtime().active_harness_count().await, 0);
-
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 #[tokio::test]
@@ -239,17 +269,11 @@ async fn test_native_harness_killed_when_last_agent_shuts_down() {
         .expect("send init resp");
     });
 
-    let mock_bin_path = create_mock_harness_binary(port, "kill_last_agent");
-    let pid_file = format!("{mock_bin_path}.pid");
-    let payload_path = format!("{mock_bin_path}.dat");
-    let script_content =
-        format!("#!/bin/sh\necho $$ > '{pid_file}'\ncat '{payload_path}'\nexec sleep 30\n");
-    fs::write(&mock_bin_path, script_content).expect("write mock binary with pid");
-    fs::set_permissions(&mock_bin_path, Permissions::from_mode(0o755)).expect("set executable");
+    let mock = MockHarness::create(port, "kill_last_agent", true);
 
     let save_dir = tempfile::tempdir().expect("tempdir");
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -263,10 +287,7 @@ async fn test_native_harness_killed_when_last_agent_shuts_down() {
 
     assert_eq!(bridge.runtime().active_harness_count().await, 1);
 
-    let pid_str = fs::read_to_string(&pid_file)
-        .expect("read pid file")
-        .trim()
-        .to_string();
+    let pid_str = mock.read_pid();
 
     // Verify child process is alive before shutdown
     let alive_before = std::process::Command::new("kill")
@@ -301,7 +322,6 @@ async fn test_native_harness_killed_when_last_agent_shuts_down() {
     );
 
     server_task.await.expect("server task completed");
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 #[tokio::test]
@@ -329,11 +349,11 @@ async fn test_native_shared_harness_survives_until_last_agent_shuts_down() {
         tokio::try_join!(h1, h2).expect("mock agent tasks");
     });
 
-    let mock_bin_path = create_mock_harness_binary(port, "shared_survive");
+    let mock = MockHarness::create(port, "shared_survive", false);
     let shared_dir = tempfile::tempdir().expect("shared tempdir");
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -368,7 +388,6 @@ async fn test_native_shared_harness_survives_until_last_agent_shuts_down() {
     );
 
     server_task.await.expect("server task completed");
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 #[tokio::test]
@@ -405,17 +424,11 @@ async fn test_native_harness_killed_when_agent_handle_dropped() {
         .expect("send init resp");
     });
 
-    let mock_bin_path = create_mock_harness_binary(port, "drop_handle");
-    let pid_file = format!("{mock_bin_path}.pid");
-    let payload_path = format!("{mock_bin_path}.dat");
-    let script_content =
-        format!("#!/bin/sh\necho $$ > '{pid_file}'\ncat '{payload_path}'\nexec sleep 30\n");
-    fs::write(&mock_bin_path, script_content).expect("write mock binary with pid");
-    fs::set_permissions(&mock_bin_path, Permissions::from_mode(0o755)).expect("set executable");
+    let mock = MockHarness::create(port, "drop_handle", true);
 
     let save_dir = tempfile::tempdir().expect("tempdir");
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -432,10 +445,7 @@ async fn test_native_harness_killed_when_agent_handle_dropped() {
         // Drop `_agent` without calling `.shutdown().await`
     }
 
-    let pid_str = fs::read_to_string(&pid_file)
-        .expect("read pid file")
-        .trim()
-        .to_string();
+    let pid_str = mock.read_pid();
 
     // Poll briefly for async reaper task spawned during Drop to complete
     let mut exited = false;
@@ -466,5 +476,4 @@ async fn test_native_harness_killed_when_agent_handle_dropped() {
     );
 
     server_task.await.expect("server task completed");
-    cleanup_mock_binary(&mock_bin_path);
 }

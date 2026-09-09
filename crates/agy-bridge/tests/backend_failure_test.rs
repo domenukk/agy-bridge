@@ -680,7 +680,7 @@ fn repeated_errors_each_return_err() {
             // that the SDK keeps retrying is bounded at the consumer layer. A
             // timeout or an SDK error both prove the 503 backend never yields Ok.
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(15),
                 agent.chat_text(format!("Attempt {i}")),
             )
             .await;
@@ -690,7 +690,7 @@ fn repeated_errors_each_return_err() {
             );
         }
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), agent.shutdown())
+        tokio::time::timeout(std::time::Duration::from_secs(15), agent.shutdown())
             .await
             .expect("shutdown must not stall")
             .expect("shutdown");

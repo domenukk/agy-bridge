@@ -46,12 +46,18 @@ pip install google-antigravity watchfiles
 > `watchfiles` is only needed for file-change triggers; timer triggers
 > work without it.
 
-### API Key Setup
+### API Key & Endpoint Setup
 
 Set your API key (or put it in a `.env` file):
 
 ```bash
 export GEMINI_API_KEY="your-key-here"
+```
+
+For custom gateways or local proxies (e.g. Beyond proxy):
+
+```bash
+export GEMINI_API_BASE_URL="http://127.0.0.1:8642"
 ```
 
 ## Quick Start

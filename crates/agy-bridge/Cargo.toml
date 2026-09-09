@@ -6,7 +6,6 @@ rust-version = "1.95"
 description = "Async Rust bridge and native runtime for the Google Antigravity SDK"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/domenukk/agy-bridge"
-readme = "README.md"
 keywords = ["gemini", "agent", "pyo3", "antigravity", "llm"]
 categories = ["api-bindings", "asynchronous"]
 exclude = [

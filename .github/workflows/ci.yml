@@ -56,8 +56,12 @@ jobs:
         run: just lint
 
   test-python:
-    name: Test Python Backend
-    runs-on: ubuntu-latest
+    name: Test Python Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -100,8 +104,12 @@ jobs:
         run: just test-python
 
   test-native-standalone:
-    name: Test Native Backend (Pure Rust - No Python SDK)
-    runs-on: ubuntu-latest
+    name: Test Native Backend (Pure Rust - ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     timeout-minutes: 45
     steps:
       - name: Checkout repository

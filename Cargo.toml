@@ -32,12 +32,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
 
-# proc-macro support
-syn = { version = "2", features = ["full"] }
-quote = "1"
-proc-macro2 = "1"
-convert_case = "0.11"
-
 # utilities
 thiserror = "2"
 tracing = "0.1"
@@ -47,7 +41,6 @@ fast_rands = "0.16"
 
 # dev / testing
 tempfile = "3"
-trybuild = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # native backend & proto
@@ -65,6 +58,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 all = { level = "deny", priority = -1 }
+unused_async_trait_impl = "allow"
 
 [workspace.lints.rust]
 warnings = "deny"

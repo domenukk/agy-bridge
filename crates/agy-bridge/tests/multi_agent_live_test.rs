@@ -1,5 +1,27 @@
 mod common;
 
+/// Returns the effective base URL for live test agents.
+///
+/// Falls back to `"https://generativelanguage.googleapis.com"` when no custom
+/// `GEMINI_API_BASE_URL` is set in the environment or `.env`.
+fn test_base_url() -> String {
+    use agy_bridge::config::ENV_GEMINI_API_BASE_URL;
+
+    // NOLINT: env var not set is expected — falls through to .env file below
+    if let Ok(url) = std::env::var(ENV_GEMINI_API_BASE_URL)
+        && !url.is_empty()
+    {
+        return url.trim_matches('"').to_string();
+    }
+    let env_map = agy_bridge::load_dotenv();
+    if let Some(url) = env_map.get(ENV_GEMINI_API_BASE_URL)
+        && !url.is_empty()
+    {
+        return url.trim_matches('"').to_string();
+    }
+    "https://generativelanguage.googleapis.com".to_string()
+}
+
 // =============================================================================
 // Test 16: Multi-agent - create 3 agents, chat with each, shutdown all
 // =============================================================================
@@ -335,7 +357,7 @@ fn sequential_bridges_with_different_proxy_configs() {
                     .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                     .gemini(agy_bridge::config::GeminiConfig {
                         api_key: None, // falls back to env var
-                        base_url: Some("https://generativelanguage.googleapis.com".to_owned()),
+                        base_url: Some(test_base_url()),
                         models: agy_bridge::config::ModelConfig::default(),
                     })
                     .build();
@@ -398,7 +420,7 @@ fn same_bridge_proxy_and_direct_agents_isolation() {
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .gemini(agy_bridge::config::GeminiConfig {
                     api_key: None,
-                    base_url: Some("https://generativelanguage.googleapis.com".to_owned()),
+                    base_url: Some(test_base_url()),
                     models: agy_bridge::config::ModelConfig::default(),
                 })
                 .build();
@@ -469,7 +491,7 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .gemini(agy_bridge::config::GeminiConfig {
                     api_key: None,
-                    base_url: Some("https://generativelanguage.googleapis.com".to_owned()),
+                    base_url: Some(test_base_url()),
                     models: agy_bridge::config::ModelConfig::default(),
                 })
                 .build();
@@ -544,7 +566,7 @@ fn two_bridges_concurrent_proxy_and_direct_agents() {
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .gemini(agy_bridge::config::GeminiConfig {
                     api_key: None,
-                    base_url: Some("https://generativelanguage.googleapis.com".to_owned()),
+                    base_url: Some(test_base_url()),
                     models: agy_bridge::config::ModelConfig::default(),
                 })
                 .build();

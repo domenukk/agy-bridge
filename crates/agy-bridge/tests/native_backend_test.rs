@@ -23,37 +23,53 @@ use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-fn create_mock_harness_binary(port: u16, prefix: &str) -> String {
-    let output_config = proto::localharness::OutputConfig {
-        port: i32::from(port),
-        api_key: "mock-api-key".to_string(),
-    };
-    let mut out_bytes = Vec::new();
-    output_config
-        .encode(&mut out_bytes)
-        .expect("encode output config");
-
-    let mut frame = Vec::new();
-    let len_u32 = u32::try_from(out_bytes.len()).expect("len fits u32");
-    frame.extend_from_slice(&len_u32.to_le_bytes());
-    frame.extend_from_slice(&out_bytes);
-
-    let mock_bin_path = format!("/tmp/mock_localharness_{prefix}_{port}");
-    let payload_path = format!("{mock_bin_path}.dat");
-    fs::write(&payload_path, &frame).expect("write mock payload");
-
-    let script_content = format!("#!/bin/sh\ncat '{payload_path}'\nexec sleep 30\n");
-
-    fs::write(&mock_bin_path, script_content).expect("write mock binary");
-    fs::set_permissions(&mock_bin_path, Permissions::from_mode(0o755)).expect("set executable");
-    mock_bin_path
+struct MockHarness {
+    _dir: tempfile::TempDir,
+    bin_path: std::path::PathBuf,
 }
 
-fn cleanup_mock_binary(mock_bin_path: &str) {
-    // NOLINT: cleanup in test may fail if mock binary was already cleaned up
-    let _ = fs::remove_file(mock_bin_path);
-    // NOLINT: cleanup in test may fail if mock payload was already cleaned up
-    let _ = fs::remove_file(format!("{mock_bin_path}.dat"));
+impl MockHarness {
+    fn create(port: u16, prefix: &str) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("mock_harness_{prefix}_"))
+            .tempdir()
+            .expect("create mock tempdir");
+        let bin_path = dir.path().join("mock_localharness");
+        let payload_path = dir.path().join("payload.dat");
+
+        let output_config = proto::localharness::OutputConfig {
+            port: i32::from(port),
+            api_key: "mock-api-key".to_string(),
+        };
+        let mut out_bytes = Vec::new();
+        output_config
+            .encode(&mut out_bytes)
+            .expect("encode output config");
+
+        let mut frame = Vec::new();
+        let len_u32 = u32::try_from(out_bytes.len()).expect("len fits u32");
+        frame.extend_from_slice(&len_u32.to_le_bytes());
+        frame.extend_from_slice(&out_bytes);
+
+        fs::write(&payload_path, &frame).expect("write mock payload");
+
+        let script_content = format!(
+            "#!/bin/sh\ncat '{}'\nexec sleep 30\n",
+            payload_path.display()
+        );
+
+        fs::write(&bin_path, script_content).expect("write mock binary");
+        fs::set_permissions(&bin_path, Permissions::from_mode(0o755)).expect("set executable");
+
+        Self {
+            _dir: dir,
+            bin_path,
+        }
+    }
+
+    fn bin_path(&self) -> &std::path::Path {
+        &self.bin_path
+    }
 }
 
 struct MockPolicyHandler;
@@ -191,10 +207,10 @@ async fn test_native_backend_mock_harness_e2e() {
     let port = listener.local_addr().expect("local addr").port();
     let server_task = tokio::spawn(run_mock_chat_session(listener));
 
-    let mock_bin_path = create_mock_harness_binary(port, "basic");
+    let mock = MockHarness::create(port, "basic");
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -218,8 +234,6 @@ async fn test_native_backend_mock_harness_e2e() {
 
     agent.shutdown().await.expect("shutdown agent");
     server_task.await.expect("server task completed");
-
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 async fn run_mock_tool_session(listener: TcpListener) {
@@ -323,13 +337,13 @@ async fn test_native_backend_custom_tool_dispatch_e2e() {
     let port = listener.local_addr().expect("local addr").port();
     let server_task = tokio::spawn(run_mock_tool_session(listener));
 
-    let mock_bin_path = create_mock_harness_binary(port, "tool");
+    let mock = MockHarness::create(port, "tool");
 
     let mut registry = agy_bridge::tools::ToolRegistry::new();
     registry.register(CalcTool);
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -344,8 +358,6 @@ async fn test_native_backend_custom_tool_dispatch_e2e() {
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");
-
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 async fn handle_mock_hook_exchange(
@@ -512,7 +524,7 @@ async fn test_native_backend_hooks_and_policy_e2e() {
     let port = listener.local_addr().expect("local addr").port();
     let server_task = tokio::spawn(run_mock_hooks_and_policy_session(listener));
 
-    let mock_bin_path = create_mock_harness_binary(port, "hp");
+    let mock = MockHarness::create(port, "hp");
 
     let pre_turn_called = Arc::new(AtomicBool::new(false));
     let pre_turn_flag = pre_turn_called.clone();
@@ -527,7 +539,7 @@ async fn test_native_backend_hooks_and_policy_e2e() {
     );
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -544,8 +556,6 @@ async fn test_native_backend_hooks_and_policy_e2e() {
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");
-
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 async fn run_mock_budget_and_subagents_session(listener: TcpListener) {
@@ -656,10 +666,10 @@ async fn test_native_backend_budget_and_subagents_e2e() {
     let port = listener.local_addr().expect("local addr").port();
     let server_task = tokio::spawn(run_mock_budget_and_subagents_session(listener));
 
-    let mock_bin_path = create_mock_harness_binary(port, "bs");
+    let mock = MockHarness::create(port, "bs");
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -692,8 +702,6 @@ async fn test_native_backend_budget_and_subagents_e2e() {
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");
-
-    cleanup_mock_binary(&mock_bin_path);
 }
 
 async fn handle_mock_stop_hook_exchange(
@@ -837,10 +845,10 @@ async fn test_native_backend_v016_features_e2e() {
     let port = listener.local_addr().expect("local addr").port();
     let server_task = tokio::spawn(run_mock_v016_session(listener));
 
-    let mock_bin_path = create_mock_harness_binary(port, "v016");
+    let mock = MockHarness::create(port, "v016");
 
     let bridge = AgyBridge::native_builder()
-        .harness_path(&mock_bin_path)
+        .harness_path(mock.bin_path())
         .build_native()
         .expect("build bridge");
 
@@ -887,6 +895,4 @@ async fn test_native_backend_v016_features_e2e() {
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");
-
-    cleanup_mock_binary(&mock_bin_path);
 }

@@ -27,6 +27,8 @@ const ANTIGRAVITY_DIR: &str = "antigravity";
 const BIN_DIR: &str = "bin";
 const CLIENT_LANGUAGE: &str = "rust";
 const RUST_LANGUAGE_VERSION: &str = "1.95";
+const MAX_SPAWN_ATTEMPTS: u32 = 10;
+const SPAWN_RETRY_BACKOFF_MS: u64 = 15;
 
 /// Running local harness process with active stdin/stdout and parsed port.
 pub(crate) struct HarnessProcess {
@@ -197,17 +199,41 @@ impl HarnessProcess {
         for (k, v) in crate::load_dotenv() {
             cmd.env(k, v);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| Error::BackendError {
-                message: format!(
-                    "Failed to spawn localharness binary at {}: {e}",
-                    binary_path.display()
-                ),
-            })?;
+        let mut attempts = 0u32;
+        let mut child = loop {
+            match cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(e)
+                    if attempts < MAX_SPAWN_ATTEMPTS
+                        && (e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            || e.raw_os_error() == Some(26)) =>
+                {
+                    attempts += 1;
+                    tracing::warn!(
+                        attempt = attempts,
+                        error = %e,
+                        "Harness binary is busy; retrying spawn"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        SPAWN_RETRY_BACKOFF_MS * u64::from(attempts),
+                    ))
+                    .await;
+                }
+                Err(e) => {
+                    return Err(Error::BackendError {
+                        message: format!(
+                            "Failed to spawn localharness binary at {}: {e}",
+                            binary_path.display()
+                        ),
+                    });
+                }
+            }
+        };
 
         let mut stdin = child.stdin.take().ok_or_else(|| Error::BackendError {
             message: "Failed to open child stdin".to_string(),

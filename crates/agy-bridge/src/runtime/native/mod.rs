@@ -102,7 +102,7 @@ impl NativeRuntime {
     ///
     /// Returns an error if the internal session lock is poisoned.
     // NOLINT: uniform async interface across Python and native runtime backends.
-    #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn active_agent_count(&self) -> Result<usize, Error> {
         let sessions = self.sessions.read().map_err(|e| Error::BackendError {
             message: format!("Poisoned NATIVE_SESSIONS lock: {e}"),
