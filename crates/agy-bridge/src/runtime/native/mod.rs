@@ -8,8 +8,9 @@ pub(crate) mod session;
 pub(crate) mod tools;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -57,9 +58,16 @@ const WS_CONNECT_RETRY_COUNT: usize = 10;
 const WS_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const EVENT_CHANNEL_BUFFER_SIZE: usize = 64;
 
+/// Running local harness instance with reference counting of active agents.
+struct SharedHarnessEntry {
+    process: HarnessProcess,
+    active_agents: HashSet<AgentId>,
+}
+
 /// Native local harness runtime communicating natively via WebSocket and Protobuf.
 pub struct NativeRuntime {
     sessions: Arc<RwLock<HashMap<AgentId, Arc<NativeAgentSession>>>>,
+    harnesses: Arc<tokio::sync::Mutex<HashMap<PathBuf, SharedHarnessEntry>>>,
     config: RuntimeConfig,
 }
 
@@ -69,6 +77,7 @@ impl NativeRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            harnesses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -91,6 +100,88 @@ impl NativeRuntime {
             message: format!("Poisoned NATIVE_SESSIONS lock: {e}"),
         })?;
         Ok(sessions.len())
+    }
+
+    /// Return the number of active `localharness` child processes managed by this runtime.
+    pub async fn active_harness_count(&self) -> usize {
+        let mut harnesses = self.harnesses.lock().await;
+        harnesses.retain(|_, entry| entry.process.is_alive());
+        harnesses.len()
+    }
+
+    /// Terminate all managed localharness processes and wait for exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if process termination fails.
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        let mut harnesses = self.harnesses.lock().await;
+        for (_path, mut entry) in harnesses.drain() {
+            entry.process.kill().await;
+        }
+        Ok(())
+    }
+
+    /// Get an existing running localharness process for `save_dir` or spawn a new one.
+    async fn get_or_spawn_harness(
+        &self,
+        save_dir: &Path,
+        custom_binary_path: Option<&Path>,
+        agent_id: AgentId,
+        force_new: bool,
+    ) -> Result<(u16, String, bool), Error> {
+        let key = save_dir.to_path_buf();
+        let mut harnesses = self.harnesses.lock().await;
+
+        if !force_new
+            && let Some(entry) = harnesses.get_mut(&key)
+            && entry.process.is_alive()
+        {
+            entry.active_agents.insert(agent_id);
+            tracing::info!(
+                port = entry.process.port,
+                active_agents = entry.active_agents.len(),
+                "Reusing existing running localharness process for save_dir={}",
+                key.display()
+            );
+            return Ok((entry.process.port, entry.process.api_key.clone(), true));
+        }
+
+        if let Some(mut old_entry) = harnesses.remove(&key) {
+            tracing::warn!(
+                "Terminating stale localharness process for save_dir={} before respawning",
+                key.display()
+            );
+            old_entry.process.start_kill();
+        }
+
+        let process = HarnessProcess::spawn(save_dir, None, custom_binary_path).await?;
+        let port = process.port;
+        let api_key = process.api_key.clone();
+        let mut active_agents = HashSet::new();
+        active_agents.insert(agent_id);
+
+        let entry = SharedHarnessEntry {
+            process,
+            active_agents,
+        };
+        harnesses.insert(key, entry);
+        Ok((port, api_key, false))
+    }
+}
+
+impl Drop for NativeRuntime {
+    fn drop(&mut self) {
+        match self.harnesses.try_lock() {
+            Ok(mut harnesses) => {
+                for (_path, mut entry) in harnesses.drain() {
+                    entry.process.start_kill();
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "NativeRuntime::drop: harnesses lock contended");
+            }
+        }
     }
 }
 
@@ -208,6 +299,12 @@ fn spawn_ws_sink_task(
 ) {
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            let is_session_end = matches!(
+                event.event,
+                Some(proto::localharness::input_event::Event::SessionEndRequest(
+                    true
+                ))
+            );
             match serde_json::to_string(&event) {
                 Ok(json_str) => {
                     if let Err(e) = ws_sink.send(Message::Text(json_str.into())).await {
@@ -218,6 +315,12 @@ fn spawn_ws_sink_task(
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to serialize InputEvent");
                 }
+            }
+            if is_session_end {
+                if let Err(e) = ws_sink.close().await {
+                    tracing::debug!(error = %e, "WebSocket close frame error on session end");
+                }
+                break;
             }
         }
     });
@@ -274,6 +377,11 @@ fn spawn_ws_reader_task(
                     break;
                 }
             };
+
+            if msg.is_close() {
+                tracing::debug!(agent_id = %agent_id, "Harness WebSocket closed gracefully");
+                break;
+            }
 
             let Ok(text) = msg.to_text() else { continue };
 
@@ -485,12 +593,32 @@ impl Runtime for NativeRuntime {
             }
 
             let save_dir = config.save_dir.clone().unwrap_or_else(std::env::temp_dir);
-            let process =
-                HarnessProcess::spawn(&save_dir, None, custom_binary_path.as_deref()).await?;
-            let port = process.port;
-            let api_key = process.api_key.clone();
+            let (mut port, mut api_key, reused) = self
+                .get_or_spawn_harness(&save_dir, custom_binary_path.as_deref(), agent_id, false)
+                .await?;
 
-            let mut ws = connect_to_harness(port, &api_key).await?;
+            let mut ws = match connect_to_harness(port, &api_key).await {
+                Ok(ws) => ws,
+                Err(e) if reused => {
+                    tracing::warn!(
+                        error = %e,
+                        port,
+                        "Failed to connect to reused localharness process; respawning a fresh instance"
+                    );
+                    let (new_port, new_key, _) = self
+                        .get_or_spawn_harness(
+                            &save_dir,
+                            custom_binary_path.as_deref(),
+                            agent_id,
+                            true,
+                        )
+                        .await?;
+                    port = new_port;
+                    api_key = new_key;
+                    connect_to_harness(port, &api_key).await?
+                }
+                Err(e) => return Err(e),
+            };
             let (initial_cascade_id, initial_usage) =
                 initialize_harness(&mut ws, &config, hook_runner.as_ref(), &policies).await?;
 
@@ -521,7 +649,7 @@ impl Runtime for NativeRuntime {
                 produced_output: Arc::new(AtomicBool::new(false)),
                 turn_activity: Arc::new(AtomicBool::new(false)),
                 connected: Arc::new(AtomicBool::new(true)),
-                process: tokio::sync::Mutex::new(Some(process)),
+                save_dir,
             });
 
             spawn_session_io_tasks(agent_id, ws, &session, event_rx);
@@ -635,6 +763,7 @@ impl Runtime for NativeRuntime {
 
     fn shutdown_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
         let sessions_map = Arc::clone(&self.sessions);
+        let harnesses_map = Arc::clone(&self.harnesses);
         async move {
             let session = {
                 let mut sessions = sessions_map.write().map_err(|e| Error::BackendError {
@@ -655,14 +784,17 @@ impl Runtime for NativeRuntime {
                 {
                     tracing::debug!(error = %e, "Harness already disconnected on shutdown");
                 }
+                s.connected.store(false, Ordering::Release);
 
-                let taken_proc = s.process.lock().await.take();
-                if let Some(mut proc) = taken_proc {
-                    if let Err(e) = proc.child.kill().await {
-                        tracing::debug!(error = %e, "Process already terminated on shutdown");
-                    }
-                    if let Err(e) = proc.child.wait().await {
-                        tracing::debug!(error = %e, "Error waiting for process on shutdown");
+                {
+                    let mut harnesses = harnesses_map.lock().await;
+                    if let Some(entry) = harnesses.get_mut(&s.save_dir) {
+                        entry.active_agents.remove(&agent_id);
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            remaining = entry.active_agents.len(),
+                            "Deregistered agent from shared localharness"
+                        );
                     }
                 }
 
@@ -695,34 +827,19 @@ impl Runtime for NativeRuntime {
                     }) {
                         tracing::debug!(error = %e, "Harness channel closed on try_shutdown");
                     }
+                    s.connected.store(false, Ordering::Release);
 
-                    match s.process.try_lock() {
-                        Ok(mut proc_opt) => {
-                            if let Some(mut proc) = proc_opt.take() {
-                                if let Err(e) = proc.child.start_kill() {
-                                    tracing::debug!(error = %e, "Process already killed on try_shutdown");
-                                }
-                                match tokio::runtime::Handle::try_current() {
-                                    Ok(handle) => {
-                                        handle.spawn(async move {
-                                            match proc.child.wait().await {
-                                                Ok(status) => {
-                                                    tracing::debug!(?status, "Child process reaped in try_shutdown");
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!(error = %e, "Error reaping child process in try_shutdown");
-                                                }
-                                            }
-                                        });
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(error = %e, "No active tokio runtime to spawn child reap task");
-                                    }
-                                }
+                    match self.harnesses.try_lock() {
+                        Ok(mut harnesses) => {
+                            if let Some(entry) = harnesses.get_mut(&s.save_dir) {
+                                entry.active_agents.remove(&agent_id);
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "Process lock contention on try_shutdown");
+                            tracing::debug!(
+                                error = %e,
+                                "try_shutdown: harnesses lock contended removing active agent"
+                            );
                         }
                     }
 
@@ -1034,51 +1151,4 @@ impl Runtime for NativeRuntime {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::content::{Audio, Content, Document, Image, Video};
-
-    #[tokio::test]
-    async fn test_native_runtime_creation_and_empty_counts() {
-        let runtime = NativeRuntime::default();
-        assert_eq!(runtime.active_agent_count().await.unwrap(), 0);
-        assert!(runtime.shutdown_agent(999).await.is_ok());
-    }
-
-    #[test]
-    fn test_to_usage_metadata() {
-        let proto_usage = proto::localharness::UsageMetadata {
-            prompt_token_count: 100,
-            candidates_token_count: 50,
-            total_token_count: 150,
-            cached_content_token_count: 20,
-            thoughts_token_count: 10,
-            ..Default::default()
-        };
-        let usage = to_usage_metadata(&proto_usage);
-        assert_eq!(usage.prompt_token_count, Some(100));
-        assert_eq!(usage.candidates_token_count, Some(50));
-        assert_eq!(usage.total_token_count, Some(150));
-        assert_eq!(usage.cached_content_token_count, Some(20));
-        assert_eq!(usage.thoughts_token_count, Some(10));
-    }
-
-    #[test]
-    fn test_to_proto_user_input_multimodal() {
-        use crate::content::ContentPrimitive;
-        let content = Content::Multi {
-            parts: vec![
-                ContentPrimitive::Text {
-                    text: "Explain this content".to_string(),
-                },
-                ContentPrimitive::Image(Image::png(vec![1, 2, 3])),
-                ContentPrimitive::Audio(Audio::mp3(vec![4, 5, 6])),
-                ContentPrimitive::Document(Document::pdf(vec![7, 8, 9])),
-                ContentPrimitive::Video(Video::mp4(vec![10, 11, 12])),
-            ],
-        };
-
-        let proto_input = to_proto_user_input(&content);
-        assert_eq!(proto_input.parts.len(), 5);
-    }
-}
+mod mod_tests;

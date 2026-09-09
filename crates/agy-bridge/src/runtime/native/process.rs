@@ -235,12 +235,39 @@ impl HarnessProcess {
             _stdin: stdin,
         })
     }
+
+    /// Check whether the child process is still running.
+    pub(crate) fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(e) => {
+                tracing::debug!(error = %e, "is_alive: error checking child process status");
+                false
+            }
+        }
+    }
+
+    /// Terminate the child process and asynchronously wait for it to exit.
+    pub(crate) async fn kill(&mut self) {
+        if let Err(e) = self.child.kill().await {
+            tracing::debug!(error = %e, "Process already terminated");
+        }
+        if let Err(e) = self.child.wait().await {
+            tracing::debug!(error = %e, "Error waiting for child process on termination");
+        }
+    }
+
+    /// Send kill signal to the child process without waiting.
+    pub(crate) fn start_kill(&mut self) {
+        if let Err(e) = self.child.start_kill() {
+            tracing::debug!(error = %e, "Process already killed or failed to kill");
+        }
+    }
 }
 
 impl Drop for HarnessProcess {
     fn drop(&mut self) {
-        if let Err(e) = self.child.start_kill() {
-            tracing::debug!(error = %e, "Process already killed or failed to kill in drop");
-        }
+        self.start_kill();
     }
 }

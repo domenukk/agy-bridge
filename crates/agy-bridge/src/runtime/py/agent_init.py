@@ -1505,7 +1505,11 @@ def _setup_base_url_routing(local_config):
 
             def _patched_build(self):
                 config = _original_build(self)
-                url = getattr(self, "_agy_base_url", None)
+                url = (
+                    getattr(self, "_agy_base_url", None)
+                    or LocalConnectionStrategy._agy_base_url_var.get()
+                    or os.environ.get("GEMINI_API_BASE_URL")
+                )
                 if url:
                     try:
                         if config.HasField("gemini_config"):
@@ -1517,7 +1521,11 @@ def _setup_base_url_routing(local_config):
                         for m in config.models:
                             if m.HasField("gemini_api_endpoint"):
                                 m.gemini_api_endpoint.base_url = url
-                                if not m.gemini_api_endpoint.api_key:
+                                if (
+                                    not m.gemini_api_endpoint.api_key
+                                    or m.gemini_api_endpoint.api_key
+                                    == _PROXY_AUTH_SENTINEL
+                                ):
                                     m.gemini_api_endpoint.api_key = _PROXY_AUTH_SENTINEL
                                 logger.info(
                                     "Injected base_url=%s into model %s",

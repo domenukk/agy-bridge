@@ -1,13 +1,15 @@
 //! Session state for an active agent in the native runtime.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32},
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32},
+    },
 };
 
 use tokio::sync::{Notify, mpsc};
 
-use super::process::HarnessProcess;
 use crate::{
     proto,
     streaming::ChatResponseWriter,
@@ -36,5 +38,6 @@ pub(crate) struct NativeAgentSession {
     /// `false` once the harness WebSocket has closed. A disconnected session
     /// can no longer run turns; `chat` rejects new turns instead of hanging.
     pub(crate) connected: Arc<AtomicBool>,
-    pub(crate) process: tokio::sync::Mutex<Option<HarnessProcess>>,
+    /// Storage directory associated with this session's localharness process.
+    pub(crate) save_dir: PathBuf,
 }

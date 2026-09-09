@@ -401,21 +401,19 @@ impl AgentConfig {
             .and_then(|g| g.models.default.api_key.clone())
             .or_else(|| self.gemini.as_ref().and_then(|g| g.api_key.clone()))
             .or_else(|| self.api_key.clone())
-            // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
-            .or_else(|| std::env::var(super::ENV_GEMINI_API_KEY).ok())
+            .or_else(|| crate::env_var(super::ENV_GEMINI_API_KEY))
     }
 
     /// Resolve the effective base URL using the priority chain:
     ///
     /// 1. Explicit `GeminiConfig` base URL (`gemini.base_url`)
-    /// 2. `$GEMINI_API_BASE_URL` environment variable
+    /// 2. `$GEMINI_API_BASE_URL` environment variable or `.env` fallback
     #[must_use]
     pub fn effective_base_url(&self) -> Option<String> {
         self.gemini
             .as_ref()
             .and_then(|g| g.base_url.clone())
-            // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
-            .or_else(|| std::env::var(super::ENV_GEMINI_API_BASE_URL).ok())
+            .or_else(|| crate::env_var(super::ENV_GEMINI_API_BASE_URL))
     }
 
     /// Returns the names of all explicitly registered custom tools.

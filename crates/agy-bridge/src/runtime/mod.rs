@@ -705,6 +705,16 @@ impl crate::agent::Runtime for PythonRuntime {
                     "_backend_log_level".to_owned(),
                     serde_json::Value::String(self.config.backend_log_level.as_str().to_owned()),
                 );
+                if let Some(base_url) = config.effective_base_url() {
+                    let gemini_obj = map
+                        .entry("gemini_config")
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    if let serde_json::Value::Object(gmap) = gemini_obj
+                        && !gmap.contains_key("base_url")
+                    {
+                        gmap.insert("base_url".to_owned(), serde_json::Value::String(base_url));
+                    }
+                }
             }
             serde_json::to_string(&val).map_err(|e| Error::BackendError {
                 message: format!("Failed to re-serialize config JSON: {e}"),

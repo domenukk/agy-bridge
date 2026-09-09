@@ -22,22 +22,28 @@ pub(crate) fn dispatch_hook_by_name(
     hook_point: &str,
     context_json: &str,
 ) -> Result<String, crate::error::Error> {
-    match hook_point {
-        "pre_turn" => return handle_pre_turn(hook_runner, context_json),
-        "post_turn" => handle_post_turn(hook_runner, context_json)?,
-        "pre_tool_call_decide" => return handle_pre_tool_call_decide(hook_runner, context_json),
-        "post_tool_call" => handle_post_tool_call(hook_runner, context_json)?,
-        "on_compaction" => handle_on_compaction(hook_runner, context_json)?,
-        "on_session_start" => handle_on_session_start(agent_id, hook_runner, context_json)?,
-        "on_session_end" => handle_on_session_end(hook_runner, context_json)?,
-        "on_tool_error" => return handle_on_tool_error(agent_id, hook_runner, context_json),
-        "on_interaction" => return handle_on_interaction(hook_runner, context_json),
-        "stop" => return handle_stop(hook_runner, context_json),
-        _ => {
-            return Err(crate::error::Error::BackendError {
-                message: format!("Unknown hook point: {hook_point}"),
-            });
+    let point: crate::hooks::HookPoint = hook_point
+        .parse()
+        .map_err(|message| crate::error::Error::BackendError { message })?;
+    match point {
+        crate::hooks::HookPoint::PreTurn => return handle_pre_turn(hook_runner, context_json),
+        crate::hooks::HookPoint::PostTurn => handle_post_turn(hook_runner, context_json)?,
+        crate::hooks::HookPoint::PreToolCallDecide => {
+            return handle_pre_tool_call_decide(hook_runner, context_json);
         }
+        crate::hooks::HookPoint::PostToolCall => handle_post_tool_call(hook_runner, context_json)?,
+        crate::hooks::HookPoint::OnCompaction => handle_on_compaction(hook_runner, context_json)?,
+        crate::hooks::HookPoint::OnSessionStart => {
+            handle_on_session_start(agent_id, hook_runner, context_json)?;
+        }
+        crate::hooks::HookPoint::OnSessionEnd => handle_on_session_end(hook_runner, context_json)?,
+        crate::hooks::HookPoint::OnToolError => {
+            return handle_on_tool_error(agent_id, hook_runner, context_json);
+        }
+        crate::hooks::HookPoint::OnInteraction => {
+            return handle_on_interaction(hook_runner, context_json);
+        }
+        crate::hooks::HookPoint::Stop => return handle_stop(hook_runner, context_json),
     }
     Ok(String::new())
 }
