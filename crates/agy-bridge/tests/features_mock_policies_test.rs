@@ -56,7 +56,8 @@ fn policy_allow_all_permits_tool() {
             .policies([PolicyRule::AllowAll])
             .build();
 
-        let agent = BRIDGE.agent(config).tools(registry).await.expect("agent");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).tools(registry).await.expect("agent");
 
         agent.chat_text("go").await.expect("chat");
 
@@ -100,7 +101,8 @@ fn policy_deny_specific_blocks_tool() {
             .policies([PolicyRule::deny("counting_tool"), PolicyRule::AllowAll])
             .build();
 
-        let agent = BRIDGE.agent(config).tools(registry).await.expect("agent");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).tools(registry).await.expect("agent");
 
         let _result = agent.chat_text("go").await;
 
@@ -142,7 +144,8 @@ fn policy_allow_specific_plus_deny_all() {
             .policies([PolicyRule::allow("add_numbers"), PolicyRule::DenyAll])
             .build();
 
-        let agent = BRIDGE.agent(config).tools(registry).await.expect("agent");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).tools(registry).await.expect("agent");
 
         let text = agent.chat_text("add").await.expect("chat");
         assert!(
@@ -183,7 +186,8 @@ fn policy_deny_all_blocks_tool() {
             .policies([PolicyRule::DenyAll])
             .build();
 
-        let agent = BRIDGE.agent(config).tools(registry).await.expect("agent");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).tools(registry).await.expect("agent");
 
         let _result = agent.chat_text("run the tool").await;
 
@@ -244,7 +248,8 @@ fn policy_ask_user_handler_allows() {
             ])
             .build();
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(config)
             .tools(registry)
             .policy_handler(AlwaysAllowHandler)
@@ -306,7 +311,8 @@ fn policy_ask_user_handler_denies() {
             ])
             .build();
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(config)
             .tools(registry)
             .policy_handler(AlwaysDenyHandler)

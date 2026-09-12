@@ -533,6 +533,7 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
 
         let inter_agent_delay = config.inter_agent_delay;
         let stream_limits = streaming::StreamLimits::from_config(config);
+        let shutdown_timeout = config.shutdown_timeout;
         let event_loop_obj = event_loop.clone().unbind();
         let run_fut =
             pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), async move {
@@ -541,6 +542,7 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                     cmd_rx,
                     inter_agent_delay,
                     stream_limits,
+                    shutdown_timeout,
                 )
                 .await
             });
@@ -705,12 +707,25 @@ impl crate::agent::Runtime for PythonRuntime {
                     "_backend_log_level".to_owned(),
                     serde_json::Value::String(self.config.backend_log_level.as_str().to_owned()),
                 );
+                if let Some(api_key) = config.effective_api_key() {
+                    if map.get("api_key").is_none_or(serde_json::Value::is_null) {
+                        map.insert(
+                            "api_key".to_owned(),
+                            serde_json::Value::String(api_key.clone()),
+                        );
+                    }
+                    if let Some(serde_json::Value::Object(gmap)) = map.get_mut("gemini_config")
+                        && gmap.get("api_key").is_none_or(serde_json::Value::is_null)
+                    {
+                        gmap.insert("api_key".to_owned(), serde_json::Value::String(api_key));
+                    }
+                }
                 if let Some(base_url) = config.effective_base_url() {
                     let gemini_obj = map
                         .entry("gemini_config")
                         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                     if let serde_json::Value::Object(gmap) = gemini_obj
-                        && !gmap.contains_key("base_url")
+                        && gmap.get("base_url").is_none_or(serde_json::Value::is_null)
                     {
                         gmap.insert("base_url".to_owned(), serde_json::Value::String(base_url));
                     }

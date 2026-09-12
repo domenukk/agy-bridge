@@ -131,6 +131,19 @@ impl ChatResponseWriter {
         }
     }
 
+    /// Return true if all receiver channels on the paired [`ChatResponseHandle`]
+    /// have been dropped (i.e. the caller dropped the handle without draining).
+    #[cfg(feature = "native")]
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.text_tx.is_closed()
+            && self.thought_tx.is_closed()
+            && self.tool_call_tx.is_closed()
+            && self.error_tx.is_closed()
+            && self.event_tx.is_closed()
+            && self.step_tx.is_closed()
+            && self.chunk_tx.is_closed()
+    }
+
     /// Send a text token.
     ///
     /// # Errors

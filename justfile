@@ -1,3 +1,32 @@
+# agy-bridge task runner.
+#
+# This file is the single source of truth for every lint/format/test command.
+# CI (.github/workflows/ci.yml) invokes these recipes rather than re-spelling
+# the commands, so the two cannot drift.
+#
+# ── Environment variables ─────────────────────────────────────────────────
+#
+#   AGY_BRIDGE_SKIP_LIVE_TESTS       Set to any value to skip every test that
+#                                    talks to the real Gemini API. Required for
+#                                    an offline/CI run — without it the live
+#                                    tests call `common::api_key()`, which
+#                                    *panics* when no key is configured.
+#                                    `just test-offline` sets it for you.
+#   GEMINI_API_KEY                   Key used by the live tests. Read from the
+#                                    environment or from ./.env.
+#   GEMINI_API_BASE_URL              Proxy mode; stands in for GEMINI_API_KEY.
+#   AGY_BRIDGE_MAX_CONCURRENT_TESTS  How many live tests may hit the API at
+#                                    once (default: see tests/common/mod.rs).
+#   AGY_BRIDGE_TEST_TIMEOUT_SECS     Per-test wall-clock timeout for the
+#                                    mock-server tests (default 120).
+#   RUST_TEST_THREADS                libtest parallelism. Defaulted to 4 in
+#                                    .cargo/config.toml so a test binary cannot
+#                                    hold one bridge per CPU core.
+#   RUST_LOG                         tracing filter for `test-live-logged`.
+#
+# NOTE: even `test-offline` needs network access on a cold build — the crate's
+# build.rs downloads the `localharness` wheel from PyPI for the native backend.
+
 # Default recipe: format, lint, and test
 default: fmt lint test
 
@@ -20,7 +49,7 @@ fmt-markdown:
 
 # Format Python files with black
 fmt-python:
-    black .
+    uv run black .
 
 # Format the justfile itself
 fmt-just:
@@ -55,24 +84,40 @@ lint-just:
 
 # Lint code hygiene (suppression patterns, structural issues)
 lint-hygiene:
-    python3 scripts/lint_hygiene.py
+    uv run python3 scripts/lint_hygiene.py
 
 # ── Test ──────────────────────────────────────────────────────────────
 
-# Run all tests (Rust + Python)
-test: test-rust test-native test-python
+# Run all tests (Rust python backend + native backend + default features + Python)
+test: test-rust test-native test-default test-python
 
 # Run Rust tests for python backend
 test-rust:
-    cargo test --no-default-features --features python
+    cargo test -p agy-bridge --no-default-features --features python
 
 # Run Rust tests for native pure-Rust backend
 test-native:
-    cargo test --no-default-features --features native
+    cargo test -p agy-bridge --no-default-features --features native
+
+# Run the whole workspace with the crates' DEFAULT feature set.
+#
+# This is the feature set downstream users get, and it is the only recipe that
+# also builds/executes the doctests in README.md (which is included as crate
+# rustdoc). `test-native` deliberately does not cover it: it pins `-p
+# agy-bridge --no-default-features`.
+test-default:
+    cargo test --workspace
 
 # Run Python tests for the embedded agent_init helpers
 test-python:
-    python3 -m pytest crates/agy-bridge/tests/python -q
+    uv run pytest crates/agy-bridge/tests/python -q
+
+# Run the full suite offline: no API key, no calls to the real Gemini API.
+#
+# Every live test short-circuits on AGY_BRIDGE_SKIP_LIVE_TESTS; the mock-server
+# tests run for real against local TCP listeners.
+test-offline:
+    AGY_BRIDGE_SKIP_LIVE_TESTS=1 {{ just_executable() }} test
 
 # Run tests with the bridge's tracing logs enabled, teeing everything to a
 # timestamped file under test-logs/ so failures can be diagnosed after the fact.
@@ -84,9 +129,10 @@ test-live-logged:
     mkdir -p test-logs
     log="test-logs/live-$(date +%Y%m%d-%H%M%S).log"
     echo "Logging to ${log}"
-    # Runs MULTI-THREADED (libtest default): concurrent multi-bridge/multi-agent
-    # use is safe (see .cargo/config.toml). Live *API* concurrency is bounded by
-    # the semaphore in tests/common/mod.rs, not by serializing the harness.
+    # Runs MULTI-THREADED, but bounded: RUST_TEST_THREADS is defaulted in
+    # .cargo/config.toml so concurrent multi-bridge/multi-agent use cannot
+    # scale with the core count. Live *API* concurrency is bounded separately
+    # by the semaphore in tests/common/mod.rs.
     # Override the API-concurrency limit with AGY_BRIDGE_MAX_CONCURRENT_TESTS.
     RUST_LOG="${RUST_LOG:-agy_bridge=debug}" cargo test --tests -- --nocapture 2>&1 | tee "${log}"
 

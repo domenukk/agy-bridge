@@ -51,7 +51,8 @@ fn hooks_pre_and_post_turn_fire() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "hooks"))
             .tools(registry)
             .hooks(hooks)
@@ -100,7 +101,8 @@ fn hooks_pre_tool_call_decide_denies() {
         let mut registry = ToolRegistry::new();
         registry.register(counting_tool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "gate"))
             .tools(registry)
             .hooks(hooks)
@@ -147,7 +149,8 @@ fn hooks_post_tool_call_fires() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "post_hook"))
             .tools(registry)
             .hooks(hooks)
@@ -194,7 +197,8 @@ fn hooks_on_tool_error_fires() {
         let mut registry = ToolRegistry::new();
         registry.register(AlwaysFailTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "err_hook"))
             .tools(registry)
             .hooks(hooks)
@@ -254,7 +258,8 @@ fn hooks_multiple_combined() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "combined"))
             .tools(registry)
             .hooks(hooks)
@@ -306,7 +311,8 @@ fn hooks_transform_tool_input_observed() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "transform"))
             .tools(registry)
             .hooks(hooks)
@@ -357,7 +363,8 @@ fn hooks_session_start_and_end_fire() {
                 e2.lock().unwrap().push("end".into());
             });
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "session"))
             .hooks(hooks)
             .await

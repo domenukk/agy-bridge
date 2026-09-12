@@ -1,4 +1,4 @@
-use super::*;
+use super::{events::to_usage_metadata, *};
 use crate::content::{Audio, Content, Document, Image, Video};
 
 #[tokio::test]

@@ -54,9 +54,7 @@ pub fn test_runtime() -> tokio::runtime::Runtime {
 }
 
 pub fn create_bridge() -> agy_bridge::AgyBridge {
-    agy_bridge::AgyBridge::builder()
-        .build()
-        .expect("Failed to create bridge")
+    agy_bridge_test_support::shared_bridge()
 }
 
 /// Install a tracing subscriber so the bridge's structured logs surface in the
@@ -95,7 +93,7 @@ pub fn init_test_logging() {
 /// This is high enough to exercise real concurrency, but low enough to stay
 /// within Gemini API tokens-per-minute (TPM) limits.  Override with the
 /// `AGY_BRIDGE_MAX_CONCURRENT_TESTS` environment variable.
-const DEFAULT_MAX_CONCURRENT: usize = 3;
+const DEFAULT_MAX_CONCURRENT: usize = 1;
 
 /// Maximum random stagger delay (in milliseconds) added before each test
 /// starts its first API call.  Spreads initial bursts to avoid TPM spikes.
@@ -251,7 +249,7 @@ where
     std::thread::sleep(stagger);
 
     let start = std::time::Instant::now();
-    let budget = std::time::Duration::from_mins(5);
+    let budget = std::time::Duration::from_mins(8);
     let mut sleep_duration = std::time::Duration::from_secs(5);
     let mut attempt = 1;
 

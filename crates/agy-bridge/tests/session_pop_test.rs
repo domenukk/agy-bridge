@@ -64,7 +64,8 @@ fn first_turn_carries_only_itself() {
         let server =
             MockGeminiServer::start(vec![MockResponse::Text("ONE_MODEL_REPLY".into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "history-baseline"))
             .await
             .expect("agent");
@@ -101,7 +102,8 @@ fn history_accumulates_cumulatively_on_the_wire() {
         ])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "history-cumulative"))
             .await
             .expect("agent");

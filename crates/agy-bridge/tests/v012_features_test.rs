@@ -293,10 +293,17 @@ fn init_py_sys_path(py: pyo3::Python<'_>) {
     }
 }
 
+#[cfg(feature = "python")]
+static PYTHON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 #[cfg(feature = "python")]
 fn test_python_sdk_v012_budget_and_behavior_parity() {
     use pyo3::types::{PyAnyMethods, PyDictMethods};
+
+    let _guard = PYTHON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     pyo3::Python::initialize();
     pyo3::Python::attach(|py| {
@@ -363,6 +370,10 @@ fn test_python_sdk_v012_budget_and_behavior_parity() {
 #[cfg(feature = "python")]
 fn test_python_sdk_v012_subagents_and_config_parity() {
     use pyo3::types::{PyAnyMethods, PyDictMethods};
+
+    let _guard = PYTHON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     pyo3::Python::initialize();
     pyo3::Python::attach(|py| {

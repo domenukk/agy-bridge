@@ -131,9 +131,7 @@ impl Error {
                 http_code_is_retryable(se.http_code)
             }
             Self::BackendError { message } | Self::Stream(StreamError { message, .. }) => {
-                message.contains("RESOURCE_EXHAUSTED")
-                    || message.contains("429")
-                    || message.contains("503")
+                message_indicates_quota(message)
             }
             _ => false,
         }
@@ -152,13 +150,39 @@ impl Error {
                 http_code_is_quota(se.http_code)
             }
             Self::BackendError { message } | Self::Stream(StreamError { message, .. }) => {
-                message.contains("RESOURCE_EXHAUSTED")
-                    || message.contains("429")
-                    || message.contains("503")
+                message_indicates_quota(message)
             }
             _ => false,
         }
     }
+}
+
+/// Whether an untyped backend/stream message reports a quota condition.
+///
+/// Used only when no structured HTTP status is available.
+fn message_indicates_quota(message: &str) -> bool {
+    message.contains("RESOURCE_EXHAUSTED")
+        || message_mentions_status(message, "429")
+        || message_mentions_status(message, "503")
+}
+
+/// Whether `message` mentions `code` as a standalone number.
+///
+/// A bare `message.contains("429")` also matches a port, a token count, or a
+/// path like `/tmp/run-14290/`, so require that the match is not adjacent to
+/// another digit.
+fn message_mentions_status(message: &str, code: &str) -> bool {
+    message.match_indices(code).any(|(idx, _)| {
+        let no_digit_before = message[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_digit());
+        let no_digit_after = message[idx + code.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        no_digit_before && no_digit_after
+    })
 }
 
 /// Whether an HTTP status code denotes a quota / rate-limit condition.
@@ -180,15 +204,10 @@ pub const fn http_code_is_retryable(code: u16) -> bool {
     code == HTTP_TOO_MANY_REQUESTS || matches!(code, HTTP_SERVER_ERROR_MIN..=HTTP_SERVER_ERROR_MAX)
 }
 
-/// Converts a Python exception into the most specific [`Error`] variant.
-///
-/// Checks for Antigravity SDK errors (connection, validation), Pydantic
-/// validation errors, and Python `ImportError` before falling back to
-/// [`Error::BackendError`] with a formatted traceback.
-///
-/// This impl is always compiled because `pyo3` is a mandatory dependency of
-/// the bridge crate — the entire runtime requires it. If you depend on
-/// `agy-bridge` as a library, `pyo3` will be linked transitively.
+/// Converts an I/O failure into [`Error::Io`], preserving the
+/// [`ErrorKind`](std::io::ErrorKind) so callers can distinguish
+/// `NotFound` (e.g. a missing `localharness` binary) from a transient
+/// failure.
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Self::Io {

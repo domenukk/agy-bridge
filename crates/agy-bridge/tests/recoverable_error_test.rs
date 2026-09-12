@@ -38,7 +38,8 @@ fn empty_candidate_then_text_recovers() {
         ])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "recoverable"))
             .await
             .expect("agent");
@@ -105,7 +106,8 @@ fn multiple_empty_candidates_then_text_recovers() {
         ])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "multi-empty"))
             .await
             .expect("agent");
@@ -165,7 +167,8 @@ fn streaming_handle_survives_empty_candidate() {
         ])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "stream-recover"))
             .await
             .expect("agent");
@@ -234,11 +237,12 @@ fn healthy_agent_unaffected_by_sibling_empty_candidate() {
         ])
         .await;
 
-        let healthy_agent = BRIDGE
+        let bridge = shared_bridge();
+        let healthy_agent = bridge
             .agent(agent_config(&healthy_server.base_url(), "healthy"))
             .await
             .expect("healthy agent");
-        let recovering_agent = BRIDGE
+        let recovering_agent = bridge
             .agent(agent_config(
                 &empty_then_text_server.base_url(),
                 "recovering",
@@ -300,7 +304,8 @@ fn http_503_returns_err() {
         }])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "test-503"))
             .await
             .expect("agent");
@@ -353,7 +358,8 @@ fn http_503_then_recovery_returns_ok() {
         ])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "test-503-recovery"))
             .await
             .expect("agent");
@@ -403,7 +409,8 @@ fn http_429_returns_err() {
         }])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "test-429"))
             .await
             .expect("agent");

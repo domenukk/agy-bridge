@@ -12,7 +12,7 @@ via [PyO3](https://pyo3.rs).
 
 ## Installation
 
-### Option 1: Python Backend (Default)
+### Option 1: Native Backend (Pure Rust, default)
 
 Add `agy-bridge` to your `Cargo.toml`:
 
@@ -22,22 +22,29 @@ agy-bridge = "0.16"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Install the Python SDK:
+This is the `native` feature, enabled by default. It talks to the
+`localharness` binary directly over WebSocket + protobuf and needs no
+Python interpreter.
+
+### Option 2: Python Backend
+
+Drives the Python SDK in-process via `PyO3`. Choose this if you need features
+the native harness does not implement yet (triggers, initial history):
+
+```toml
+[dependencies]
+agy-bridge = { version = "0.16", default-features = false, features = ["python"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Install the Python SDK alongside it:
 
 ```bash
 pip install google-antigravity watchfiles
 ```
 
-### Option 2: Native Backend (Pure Rust)
-
-For environments without Python, use the standalone native backend powered
-by the `localharness` binary:
-
-```toml
-[dependencies]
-agy-bridge = { version = "0.16", default-features = false, features = ["native"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-```
+> `watchfiles` is only needed for file-change triggers; timer triggers
+> work without it.
 
 ### API Key Setup
 
@@ -46,9 +53,6 @@ Set your API key (or put it in a `.env` file):
 ```bash
 export GEMINI_API_KEY="your-key-here"
 ```
-
-> `watchfiles` is only needed for file-change triggers; timer triggers
-> work without it.
 
 ## Quick Start
 
@@ -351,17 +355,17 @@ let shell_config = RunCommandConfig::builder()
     .build();
 
 let config = AgentConfig::builder()
-    .behavior(AgentBehavior::Autonomous)
     .session_continuation_mode(SessionContinuationMode::CreateOrResume)
-    .budget(budget)
+    .budget_config(budget)
     .capabilities(
         CapabilitiesConfig::builder()
+            .agent_behavior(AgentBehavior::Autonomous)
             .run_command_config(shell_config)
             .build(),
     )
     .build();
 
-assert!(config.budget.is_some());
+assert!(config.budget_config.is_some());
 ```
 
 ### Policies

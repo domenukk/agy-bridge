@@ -405,6 +405,58 @@ async fn emit_tool_call_stream_events(
     }
 }
 
+async fn run_tool_pre_check(
+    agent_id: AgentId,
+    tool_name: &str,
+    args_json: &str,
+    hr_opt: Option<&Arc<Hooks>>,
+) -> Result<serde_json::Value, String> {
+    let tool_name_owned = tool_name.to_string();
+    let args_json_owned = args_json.to_string();
+    let hr_clone = hr_opt.cloned();
+
+    let pre_check = tokio::task::spawn_blocking(move || {
+        match crate::runtime::bridge_state::check_tool_execution_allowed(
+            agent_id,
+            &tool_name_owned,
+            &args_json_owned,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "[POLICY_DENIED] Execution of tool '{tool_name_owned}' was blocked by agent policy rules. Do NOT retry this tool call with the same arguments."
+                ));
+            }
+            Err(e) => {
+                return Err(e.to_string());
+            }
+        }
+
+        let mut args_val: serde_json::Value =
+            serde_json::from_str(&args_json_owned).unwrap_or(serde_json::Value::Null);
+
+        if let Some(hr) = hr_clone {
+            let ctx = PreToolCallDecideContext::new(&tool_name_owned, args_val.clone());
+            let res = hr.run_pre_tool_call_decide(&ctx);
+            if !res.allow {
+                return Err(res.message);
+            }
+            args_val = hr.run_transform_tool_input(&ctx);
+        }
+
+        Ok(args_val)
+    })
+    .await;
+
+    match pre_check {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!(error = %e, "pre_check panicked in spawn_blocking");
+            Err(format!("Internal error in tool pre-check: {e}"))
+        }
+    }
+}
+
 async fn execute_custom_tool(
     agent_id: AgentId,
     tool_name: &str,
@@ -414,53 +466,22 @@ async fn execute_custom_tool(
     tool_state: llm_tool::SharedState,
     conv_id: Option<&String>,
 ) -> (String, String) {
-    match crate::runtime::bridge_state::check_tool_execution_allowed(agent_id, tool_name, args_json)
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                String::new(),
-                format!(
-                    "[POLICY_DENIED] Execution of tool '{tool_name}' was blocked by agent policy rules. Do NOT retry this tool call with the same arguments."
-                ),
-            );
-        }
-        Err(e) => {
-            return (String::new(), e.to_string());
-        }
-    }
+    let args_val = match run_tool_pre_check(agent_id, tool_name, args_json, hr_opt).await {
+        Ok(val) => val,
+        Err(msg) => return (String::new(), msg),
+    };
 
     let mut tool_ctx = ToolContext::new().with_shared_state(tool_state);
     if let Some(id) = conv_id {
         tool_ctx = tool_ctx.with_conversation_id(id);
     }
 
-    let mut args_val: serde_json::Value =
-        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
-
-    if let Some(hr) = hr_opt {
-        let ctx = PreToolCallDecideContext::new(tool_name, args_val.clone());
-        let res = hr.run_pre_tool_call_decide(&ctx);
-        if !res.allow {
-            return (String::new(), res.message);
-        }
-        args_val = hr.run_transform_tool_input(&ctx);
-    }
-
     match reg.dispatch(tool_name, args_val.clone(), &tool_ctx).await {
         Ok(out) => {
             crate::runtime::bridge_state::clear_last_tool_error(agent_id);
             let content_str = out.content().to_string();
-            if let Some(hr) = hr_opt {
-                let ctx = PostToolCallContext {
-                    tool_name: tool_name.to_string(),
-                    tool_args: args_val,
-                    result: content_str.clone(),
-                    metadata: serde_json::to_value(out.metadata())
-                        .unwrap_or(serde_json::Value::Null),
-                };
-                hr.run_post_tool_call(&ctx);
-            }
+            let metadata = serde_json::to_value(out.metadata()).unwrap_or(serde_json::Value::Null);
+            crate::runtime::bridge_state::record_last_tool_output(agent_id, args_val, metadata);
             let response_json = match serde_json::from_str::<serde_json::Value>(&content_str) {
                 Ok(val) => {
                     if val.is_object() {
@@ -478,18 +499,8 @@ async fn execute_custom_tool(
         }
         Err(err) => {
             crate::runtime::bridge_state::record_last_tool_error(agent_id, &err);
-            if let Some(hr) = hr_opt {
-                let metadata = crate::runtime::bridge_state::take_last_tool_error(agent_id)
-                    .unwrap_or(serde_json::Value::Null);
-                let ctx = OnToolErrorContext {
-                    tool_name: tool_name.to_string(),
-                    tool_args: args_val,
-                    error: err.to_string(),
-                    metadata,
-                };
-                hr.run_on_tool_error(&ctx);
-            }
-            (String::new(), err.to_string())
+            let err_str = err.to_string();
+            (String::new(), err_str)
         }
     }
 }
@@ -658,6 +669,7 @@ fn dispatch_pre_tool_hook(
 }
 
 fn dispatch_post_tool_hook(
+    agent_id: AgentId,
     hr: &crate::hooks::Hooks,
     req: &proto::localharness::CallHookRequest,
 ) -> proto::localharness::call_hook_response::Result {
@@ -667,11 +679,13 @@ fn dispatch_post_tool_hook(
         }
         _ => (String::new(), String::new()),
     };
+    let (tool_args, metadata) = crate::runtime::bridge_state::take_last_tool_output(agent_id)
+        .unwrap_or((serde_json::Value::Null, serde_json::Value::Null));
     let ctx = PostToolCallContext {
         tool_name,
-        tool_args: serde_json::Value::Null,
+        tool_args,
         result,
-        metadata: serde_json::Value::Null,
+        metadata,
     };
     hr.run_post_tool_call(&ctx);
     proto::localharness::call_hook_response::Result::EmptyResult(
@@ -809,15 +823,16 @@ pub(crate) async fn handle_call_hook_request(
         }
     };
 
+    let request_id = req.request_id.clone();
     let hook_result = if let Some(hr) = hr_opt {
         let turn = turn_count_clone.load(Ordering::Relaxed);
-        match req.r#type {
+        match tokio::task::spawn_blocking(move || match req.r#type {
             1 => Some(dispatch_on_session_start_hook(agent_id, &hr)),
             2 => Some(dispatch_on_session_end_hook(agent_id, &hr)),
             3 => Some(dispatch_pre_turn_hook(&hr, &req, turn)),
             4 => Some(dispatch_post_turn_hook(&hr, &req, turn)),
             5 => Some(dispatch_pre_tool_hook(&hr, &req)),
-            6 => Some(dispatch_post_tool_hook(&hr, &req)),
+            6 => Some(dispatch_post_tool_hook(agent_id, &hr, &req)),
             7 => Some(dispatch_on_tool_error_hook(agent_id, &hr, &req)),
             9 => Some(dispatch_stop_hook(&hr, &req)),
             _ => {
@@ -834,6 +849,18 @@ pub(crate) async fn handle_call_hook_request(
                     )
                 }
             }
+        })
+        .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!(error = %e, "Hook execution panicked in spawn_blocking");
+                Some(
+                    proto::localharness::call_hook_response::Result::EmptyResult(
+                        proto::localharness::EmptyResult {},
+                    ),
+                )
+            }
         }
     } else {
         Some(
@@ -846,7 +873,7 @@ pub(crate) async fn handle_call_hook_request(
     let hook_resp = proto::localharness::InputEvent {
         event: Some(proto::localharness::input_event::Event::CallHookResponse(
             proto::localharness::CallHookResponse {
-                request_id: req.request_id,
+                request_id,
                 result: hook_result,
             },
         )),
@@ -874,14 +901,23 @@ pub(crate) async fn handle_policy_decision_request(
     };
 
     if let Some(ph) = ph_opt {
-        let tool_name = req.tool_args.as_ref().map_or("", |a| a.tool_name.as_str());
+        let tool_name = req
+            .tool_args
+            .as_ref()
+            .map_or_else(String::new, |a| a.tool_name.clone());
         let args_str = req
             .tool_args
             .as_ref()
             .map_or("{}", |a| a.arguments_json.as_str());
         let args_val: serde_json::Value =
             serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
-        if !ph.confirm(tool_name, &args_val) {
+        let allowed = tokio::task::spawn_blocking(move || ph.confirm(&tool_name, &args_val))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Policy confirmation panicked in spawn_blocking");
+                false
+            });
+        if !allowed {
             outcome = proto::localharness::PolicyEvaluationOutcome::Deny as i32;
             deny_reason = "Denied by user policy".to_string();
         }

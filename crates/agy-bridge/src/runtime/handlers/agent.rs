@@ -18,12 +18,19 @@ const DISPATCH_RUST_POLICY_CONFIRM_ATTR: &str = "dispatch_rust_policy_confirm";
 const SET_AGENT_CONVERSATION_ID_ATTR: &str = "set_agent_conversation_id";
 
 /// Prepares the `_agy_bridge_globals` module and registers the Rust tool registry.
+///
+/// Idempotent: if `init_agent` is already compiled into `_agy_bridge_globals`,
+/// returns immediately without re-compiling `PYTHON_AGENT_INIT_SCRIPT`.
 fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
     let sys = py.import("sys")?;
     let sys_modules = sys.getattr("modules")?;
 
     let agy_bridge_globals = if sys_modules.contains(AGY_BRIDGE_GLOBALS_MODULE)? {
-        sys_modules.get_item(AGY_BRIDGE_GLOBALS_MODULE)?
+        let existing = sys_modules.get_item(AGY_BRIDGE_GLOBALS_MODULE)?;
+        if existing.hasattr("init_agent")? {
+            return Ok(());
+        }
+        existing
     } else {
         let types = py.import("types")?;
         let module = types
@@ -50,31 +57,49 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
     agy_bridge_globals.setattr(SET_AGENT_CONVERSATION_ID_ATTR, set_conv_id_func)?;
 
     globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;
+
+    let c_script = CString::new(PYTHON_AGENT_INIT_SCRIPT).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Python init script contains null byte: {e}"
+        ))
+    })?;
+    py.run(c_script.as_c_str(), Some(&globals_module.dict()), None)?;
+
+    py.run(
+        pyo3::ffi::c_str!(
+            r#"
+def _extract(tools_dict):
+    import json
+    result = []
+    for name, fn in tools_dict.items():
+        desc = getattr(fn, '__doc__', None) or ''
+        schema = getattr(fn, 'input_schema', None) or {}
+        result.append({'name': name, 'description': desc, 'parameter_schema': schema})
+    return json.dumps(result)
+"#
+        ),
+        Some(&globals_module.dict()),
+        None,
+    )?;
+
     Ok(())
 }
 
-/// Executes the Python initialization script and creates the context and agent coroutine.
+/// Executes the cached `init_agent` function and creates the context and agent coroutine.
 fn init_agent_instance(
     py: Python<'_>,
     config_json: &str,
     next_id: u64,
     event_loop: &Py<PyAny>,
 ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-    let globals = pyo3::types::PyDict::new(py);
-    let c_script = CString::new(PYTHON_AGENT_INIT_SCRIPT).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "Python init script contains null byte: {e}"
-        ))
-    })?;
-    py.run(c_script.as_c_str(), Some(&globals), None)?;
+    let sys = py.import("sys")?;
+    let globals_mod = sys
+        .getattr("modules")?
+        .get_item(AGY_BRIDGE_GLOBALS_MODULE)?;
+    let init_agent_fn = globals_mod.getattr("init_agent")?;
 
     let agent_mod = crate::runtime::py_scripts::import_serialized(py, "google.antigravity.agent")?;
     let agent_cls = agent_mod.getattr("Agent")?;
-    let init_agent_fn = globals.get_item("init_agent")?.ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "init_agent function not found in globals after running PYTHON_AGENT_INIT_SCRIPT",
-        )
-    })?;
 
     let val = init_agent_fn.call1((config_json, next_id, agent_cls, event_loop.bind(py)))?;
     let agent_ctx = val.get_item(0)?;
@@ -87,7 +112,7 @@ fn init_agent_instance(
 /// Initialize a Python agent via the SDK, run `__aenter__`, and register it.
 pub(in crate::runtime) async fn handle_create_agent(
     registry: AgentRegistry,
-    event_loop: Py<PyAny>,
+    event_loop: std::sync::Arc<Py<PyAny>>,
     next_id: u64,
     config_json: String,
     reply: oneshot::Sender<Result<(AgentId, Vec<RawToolInfo>), Error>>,
@@ -134,7 +159,13 @@ pub(in crate::runtime) async fn handle_create_agent(
             let tool_defs = extract_tool_definitions(&agent_instance_py);
             match registry.lock() {
                 Ok(mut guard) => {
-                    guard.insert(aid, (ctx_py, agent_instance_py));
+                    guard.insert(
+                        aid,
+                        (
+                            std::sync::Arc::new(ctx_py),
+                            std::sync::Arc::new(agent_instance_py),
+                        ),
+                    );
                     if let Err(e) = reply.send(Ok((aid, tool_defs))) {
                         tracing::warn!(error = ?e, "CreateAgent reply receiver dropped");
                     }
@@ -204,38 +235,18 @@ fn extract_tool_definitions(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
             }
         };
 
-        // Extract tool info from each callable in the dict by running
-        // a small Python helper that reads __name__, __doc__, input_schema.
-        let ns = pyo3::types::PyDict::new(py);
+        // Use cached _extract helper compiled in _agy_bridge_globals.
         let extract_fn = match py
-            .run(
-                pyo3::ffi::c_str!(
-                    r#"
-def _extract(tools_dict):
-    import json
-    result = []
-    for name, fn in tools_dict.items():
-        desc = getattr(fn, '__doc__', None) or ''
-        schema = getattr(fn, 'input_schema', None) or {}
-        result.append({'name': name, 'description': desc, 'parameter_schema': schema})
-    return json.dumps(result)
-"#
-                ),
-                None,
-                Some(&ns),
-            )
-            .and_then(|()| {
-                ns.get_item("_extract")?.ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "_extract function not found after running helper script",
-                    )
-                })
-            }) {
+            .import("sys")
+            .and_then(|sys| sys.getattr("modules"))
+            .and_then(|mods| mods.get_item(AGY_BRIDGE_GLOBALS_MODULE))
+            .and_then(|g| g.getattr("_extract"))
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "Failed to define _extract helper — falling back to names only"
+                    "Failed to retrieve _extract helper — falling back to names only"
                 );
                 return extract_tool_names_fallback(agent_py);
             }

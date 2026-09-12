@@ -46,7 +46,8 @@ fn image_input_encoded_as_base64_inline() {
     rt.block_on(async {
         let server = MockGeminiServer::start(vec![MockResponse::Text("I see it.".into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "vision"))
             .await
             .expect("agent");

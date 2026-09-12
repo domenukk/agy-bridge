@@ -85,29 +85,14 @@ pub fn canonicalize_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
-/// Check whether `candidate` falls under any workspace root.
+/// Resolve `path` as far as the filesystem allows, without requiring it to
+/// exist.
 ///
-/// When the candidate path exists on disk, both it and each workspace root
-/// are resolved through [`canonicalize_path`] (which follows symlinks).
-/// If canonicalization fails for either side (e.g. the path does not exist
-/// yet), the function falls back to [`normalize_path`] for that operand and
-/// logs a warning.
-///
-/// # Examples
-///
-/// ```
-/// use std::path::PathBuf;
-///
-/// let ws = [PathBuf::from("/workspace")];
-/// assert!(agy_bridge::policies::is_path_in_workspace(
-///     "/workspace/src/main.rs",
-///     &ws
-/// ));
-/// assert!(!agy_bridge::policies::is_path_in_workspace(
-///     "/workspace/../etc/passwd",
-///     &ws
-/// ));
-/// ```
+/// Tries [`canonicalize_path`] first. If that fails (typically because the
+/// path does not exist yet), walks up to the nearest existing ancestor,
+/// canonicalizes that, and re-appends the missing trailing components. This
+/// keeps `..` from escaping the workspace while still allowing checks against
+/// paths the agent is about to create.
 fn resolve_path_preserving_symlinks(path: &Path) -> PathBuf {
     match canonicalize_path(path) {
         Ok(p) => return p,
@@ -138,6 +123,29 @@ fn resolve_path_preserving_symlinks(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Check whether `candidate` falls under any workspace root.
+///
+/// When the candidate path exists on disk, both it and each workspace root
+/// are resolved through [`canonicalize_path`] (which follows symlinks).
+/// If canonicalization fails for either side (e.g. the path does not exist
+/// yet), the function falls back to [`normalize_path`] for that operand and
+/// logs a warning.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// let ws = [PathBuf::from("/workspace")];
+/// assert!(agy_bridge::policies::is_path_in_workspace(
+///     "/workspace/src/main.rs",
+///     &ws
+/// ));
+/// assert!(!agy_bridge::policies::is_path_in_workspace(
+///     "/workspace/../etc/passwd",
+///     &ws
+/// ));
+/// ```
 #[must_use]
 pub fn is_path_in_workspace(candidate: impl AsRef<Path>, workspaces: &[PathBuf]) -> bool {
     let candidate_path = candidate.as_ref();

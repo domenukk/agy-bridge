@@ -15,14 +15,12 @@ use crate::error::Error;
 fn lock_agent_instance(
     registry: &AgentRegistry,
     agent_id: AgentId,
-) -> Option<(Py<PyAny>, Py<PyAny>)> {
+) -> Option<super::super::command_loop::RegisteredAgentPair> {
     let guard = registry.lock().unwrap_or_else(|e| {
         tracing::error!(agent_id = ?agent_id, error = %e, "Agent registry mutex poisoned, recovering");
         e.into_inner()
     });
-    guard
-        .get(&agent_id)
-        .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py))))
+    guard.get(&agent_id).cloned()
 }
 
 /// Extract conversation history from the agent's conversation object.

@@ -76,7 +76,8 @@ for line in sys.stdin:
             .mcp_servers([mcp])
             .build();
 
-        let agent = BRIDGE.agent(config).await.expect("agent with MCP");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).await.expect("agent with MCP");
 
         // If we get here, MCP handshake succeeded.
         let text = agent.chat_text("hello").await.expect("chat");
@@ -153,7 +154,8 @@ for line in sys.stdin:
             .mcp_servers([mcp])
             .build();
 
-        let agent = BRIDGE.agent(config).await.expect("agent with MCP tool");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).await.expect("agent with MCP tool");
 
         let text = agent.chat_text("echo test").await.expect("chat");
         eprintln!("MCP tool response: {text}");
@@ -194,7 +196,8 @@ fn capabilities_custom_tools_only_works() {
             .policies([PolicyRule::AllowAll])
             .build();
 
-        let agent = BRIDGE.agent(config).await.expect("agent");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).await.expect("agent");
         let text = agent.chat_text("hello").await.expect("chat");
         assert!(
             text.contains("Just text"),
@@ -224,7 +227,8 @@ fn capabilities_read_only_agent() {
             .policies([PolicyRule::AllowAll])
             .build();
 
-        let agent = BRIDGE.agent(config).await.expect("agent");
+        let bridge = shared_bridge();
+        let agent = bridge.agent(config).await.expect("agent");
         let text = agent.chat_text("hello").await.expect("chat");
         assert!(
             text.contains("Read-only"),
@@ -290,7 +294,8 @@ fn combined_tools_hooks_policies() {
             ])
             .build();
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(config)
             .tools(registry)
             .hooks(hooks)
@@ -371,7 +376,8 @@ for line in sys.stdin:
             .mcp_servers([mcp])
             .build();
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(config)
             .tools(registry)
             .await

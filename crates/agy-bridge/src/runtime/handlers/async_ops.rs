@@ -20,10 +20,12 @@ fn lock_registry(
 ///
 /// Returns `None` if the agent is not present; never fails on a poisoned mutex
 /// (recovers via [`lock_registry`]).
-fn clone_agent_refs(registry: &AgentRegistry, agent_id: AgentId) -> Option<(Py<PyAny>, Py<PyAny>)> {
+fn clone_agent_refs(
+    registry: &AgentRegistry,
+    agent_id: AgentId,
+) -> Option<super::super::command_loop::RegisteredAgentPair> {
     let lock = lock_registry(registry);
-    lock.get(&agent_id)
-        .map(|(c, a)| Python::attach(|py| (c.clone_ref(py), a.clone_ref(py))))
+    lock.get(&agent_id).cloned()
 }
 
 /// Generic async-op executor that factors out the shared registry-lookup →

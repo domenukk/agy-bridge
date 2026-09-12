@@ -297,10 +297,17 @@ fn init_py_sys_path(py: pyo3::Python<'_>) {
     }
 }
 
+#[cfg(feature = "python")]
+static PYTHON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 #[cfg(feature = "python")]
 fn test_python_sdk_v016_run_command_config() {
     use pyo3::types::{PyAnyMethods, PyDictMethods};
+
+    let _guard = PYTHON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     pyo3::Python::initialize();
     pyo3::Python::attach(|py| {
@@ -349,6 +356,10 @@ fn test_python_sdk_v016_run_command_config() {
 #[cfg(feature = "python")]
 fn test_python_sdk_v016_enums() {
     use pyo3::types::PyAnyMethods;
+
+    let _guard = PYTHON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     pyo3::Python::initialize();
     pyo3::Python::attach(|py| {
@@ -416,6 +427,10 @@ fn test_python_sdk_v016_enums() {
 #[cfg(feature = "python")]
 fn test_python_sdk_v016_stop_hook() {
     use pyo3::types::{PyAnyMethods, PyDictMethods};
+
+    let _guard = PYTHON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     pyo3::Python::initialize();
     pyo3::Python::attach(|py| {

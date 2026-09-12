@@ -1,0 +1,37 @@
+# Dev-only Python environment for this repository.
+#
+# The Rust crate is the product; this file exists purely so that `uv run` has a
+# project to resolve against. It pins the tools the justfile shells out to
+# (`black`, `pytest`) and the SDK that the `python` backend needs at runtime,
+# so `just lint`/`just test` behave the same locally and in CI.
+[project]
+name = "agy-bridge-devtools"
+version = "0.0.0"
+description = "Dev-only tooling environment for the agy-bridge repository"
+requires-python = ">=3.11"
+dependencies = [
+  # Needed by `cargo test --features python`: the embedded interpreter imports
+  # `google.antigravity.*`, and the SDK pulls in `watchfiles` for triggers.
+  "google-antigravity",
+  "watchfiles",
+]
+
+[dependency-groups]
+dev = ["black>=24", "pytest>=8"]
+
+[tool.uv]
+# Not an installable package — just an environment.
+package = false
+# PyO3's `auto-initialize` links against the interpreter found at build time.
+# Letting uv download its own (possibly statically linked) CPython would give
+# the Rust build and `uv run pytest` two different interpreters.
+python-preference = "only-system"
+
+[tool.black]
+# The only Python we own lives in the crate; keep black off vendored trees.
+extend-exclude = '''
+/(
+    \.venv
+  | target
+)/
+'''

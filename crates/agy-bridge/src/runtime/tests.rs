@@ -193,6 +193,8 @@ fn test_ask_user_policy_custom_tool_gating() {
             tool_state: llm_tool::SharedState::new(),
             conversation_id: Arc::new(std::sync::Mutex::new(None)),
             last_tool_error: std::sync::Mutex::new(None),
+            #[cfg(feature = "native")]
+            last_tool_output: std::sync::Mutex::new(None),
         },
     );
 
@@ -356,6 +358,8 @@ fn conversation_id_updates_are_visible_through_shared_arc() {
         tool_state: llm_tool::SharedState::new(),
         conversation_id: Arc::clone(&shared),
         last_tool_error: std::sync::Mutex::new(None),
+        #[cfg(feature = "native")]
+        last_tool_output: std::sync::Mutex::new(None),
     };
 
     // Initially unset: a dispatch would build a context without an ID.

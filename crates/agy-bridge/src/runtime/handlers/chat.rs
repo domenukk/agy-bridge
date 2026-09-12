@@ -7,33 +7,71 @@ use tokio::sync::oneshot;
 use super::super::{AgentId, command_loop::lookup_agent_instance, py_scripts::decode_prompt_py};
 use crate::{error::Error, types::UsageMetadata};
 
-/// Dispatch a `Chat` command: look up the agent, spawn the streaming handler.
-pub(in crate::runtime) async fn dispatch_chat_command(
+/// Rate limiter for successive chat commands across agents.
+#[derive(Clone)]
+pub(in crate::runtime) struct ChatRateLimiter {
+    delay: Duration,
+    next_allowed: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl ChatRateLimiter {
+    pub(in crate::runtime) fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            next_allowed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    async fn wait(&self) {
+        if self.delay.is_zero() {
+            return;
+        }
+        let target = {
+            let mut next = self.next_allowed.lock().unwrap_or_else(|poisoned| {
+                tracing::error!("ChatRateLimiter mutex poisoned; recovering");
+                poisoned.into_inner()
+            });
+            let now = tokio::time::Instant::now();
+            let target = match *next {
+                Some(t) if t > now => t,
+                _ => now,
+            };
+            *next = Some(target + self.delay);
+            target
+        };
+        tokio::time::sleep_until(target).await;
+    }
+}
+
+/// Dispatch a `Chat` command: look up the agent, returning the streaming handler future.
+pub(in crate::runtime) fn dispatch_chat_command(
     registry: &super::super::command_loop::AgentRegistry,
     agent_id: AgentId,
     prompt: String,
     reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
-    active_tasks: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
-    inter_agent_delay: Duration,
+    rate_limiter: ChatRateLimiter,
     stream_limits: super::super::streaming::StreamLimits,
-) {
+    active_chats: super::super::command_loop::ActiveChatWriters,
+) -> Option<futures::future::BoxFuture<'static, ()>> {
     let Some((_ctx, agent_instance)) = lookup_agent_instance(registry, agent_id) else {
         if let Err(e) = reply.send(Err(Error::BackendError {
             message: format!("Agent ID {agent_id} not found in registry"),
         })) {
             tracing::warn!(error = ?e, "Chat reply receiver dropped (agent not found)");
         }
-        return;
+        return None;
     };
 
-    let agent_instance = Python::attach(|py| agent_instance.clone_ref(py));
-    let chat_fut = handle_chat(agent_instance, agent_id, prompt, reply, stream_limits);
-    active_tasks.push(Box::pin(chat_fut));
-    // Small delay between successive chat commands to avoid burst requests.
-    // Set to Duration::ZERO via the builder to disable entirely.
-    if !inter_agent_delay.is_zero() {
-        tokio::time::sleep(inter_agent_delay).await;
-    }
+    let chat_fut = handle_chat(
+        agent_instance,
+        agent_id,
+        prompt,
+        reply,
+        rate_limiter,
+        stream_limits,
+        active_chats,
+    );
+    Some(Box::pin(chat_fut))
 }
 
 /// Obtain the async step iterator from the agent's conversation.
@@ -207,13 +245,18 @@ fn apply_response_metadata(
 /// iterator on the Rust side, forwarding each chunk through the
 /// [`ChatResponseWriter`] channels for true streaming.
 pub(crate) async fn handle_chat(
-    agent_instance: Py<PyAny>,
+    agent_instance: std::sync::Arc<Py<PyAny>>,
     agent_id: AgentId,
     prompt: String,
     reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
+    rate_limiter: ChatRateLimiter,
     stream_limits: super::super::streaming::StreamLimits,
+    active_chats: super::super::command_loop::ActiveChatWriters,
 ) {
     tracing::info!(agent_id = ?agent_id, "Live-SDK: Chat command received");
+
+    // Enforce inter-agent delay asynchronously without blocking the command loop.
+    rate_limiter.wait().await;
 
     // Phase 1: Start the chat in Python and get the response object.
     let start_fut = match prepare_chat_start(&agent_instance, &prompt) {
@@ -252,6 +295,8 @@ pub(crate) async fn handle_chat(
 
     // Phase 3: Send the handle to the caller so it can start consuming immediately.
     let (writer, handle) = crate::streaming::channel_with_buffer(stream_limits.channel_buffer);
+    let writer = std::sync::Arc::new(writer);
+    super::super::command_loop::register_active_chat(&active_chats, &writer);
     if let Err(e) = reply.send(Ok(handle)) {
         tracing::warn!(error = ?e, "Chat reply receiver dropped");
         return;

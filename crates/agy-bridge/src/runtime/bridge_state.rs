@@ -73,6 +73,79 @@ pub(crate) struct AgentBridgeState {
     ///
     /// Cleared on the next successful dispatch to avoid surfacing a stale error.
     pub(crate) last_tool_error: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Cached `(tool_args, metadata)` from the most recent successful custom
+    /// tool call on this agent.
+    ///
+    /// When a Rust tool returns `Ok(ToolOutput)` in the native backend, its
+    /// arguments and structured metadata are stored here so that the
+    /// subsequent `PostTool` hook request from `localharness` can enrich
+    /// [`PostToolCallContext`](crate::hooks::PostToolCallContext) with the full
+    /// structured metadata and arguments.
+    #[cfg(feature = "native")]
+    pub(crate) last_tool_output: std::sync::Mutex<Option<(serde_json::Value, serde_json::Value)>>,
+}
+
+/// Cache `(tool_args, metadata)` from a successful custom tool call in the
+/// agent's [`last_tool_output`](AgentBridgeState::last_tool_output) slot.
+#[cfg(feature = "native")]
+pub(crate) fn record_last_tool_output(
+    agent_id: u64,
+    tool_args: serde_json::Value,
+    metadata: serde_json::Value,
+) {
+    with_last_tool_output_slot(agent_id, "record", |slot| {
+        *slot = Some((tool_args, metadata));
+    });
+}
+
+/// Remove and return the agent's cached
+/// [`last_tool_output`](AgentBridgeState::last_tool_output), if present.
+#[cfg(feature = "native")]
+pub(crate) fn take_last_tool_output(
+    agent_id: u64,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let mut taken = None;
+    with_last_tool_output_slot(agent_id, "take", |slot| taken = slot.take());
+    taken
+}
+
+#[cfg(feature = "native")]
+fn with_last_tool_output_slot(
+    agent_id: u64,
+    op: &str,
+    f: impl FnOnce(&mut Option<(serde_json::Value, serde_json::Value)>),
+) {
+    let map = match bridge_state().read() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                op,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned — cannot access last_tool_output slot"
+            );
+            return;
+        }
+    };
+    let Some(entry) = map.get(&agent_id) else {
+        tracing::debug!(
+            agent_id,
+            op,
+            "No bridge state entry for last_tool_output access"
+        );
+        return;
+    };
+    match entry.last_tool_output.lock() {
+        Ok(mut slot) => f(&mut slot),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                op,
+                error = %e,
+                "last_tool_output mutex poisoned — structured output metadata unavailable"
+            );
+        }
+    }
 }
 
 /// Serialize a [`ToolError`](llm_tool::ToolError) and cache it in the agent's

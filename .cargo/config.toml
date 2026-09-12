@@ -1,0 +1,18 @@
+# Repository-local cargo configuration.
+#
+# `test-live-logged` in the justfile points here for the thread-count
+# rationale, so this file has to actually exist and actually bound the
+# parallelism.
+#
+# Why bound libtest at all: several integration-test binaries build a real
+# `AgyBridge` per test. With the `native` backend that means a real
+# `localharness` child process; with the `python` backend a real embedded
+# interpreter. libtest defaults to one thread per logical CPU, so on a 16-core
+# machine a single test binary could hold 16 harnesses alive at once and blow
+# through the suite's memory budget.
+#
+# `force = false` (the default) means an explicit `RUST_TEST_THREADS` in the
+# environment — or `cargo test -- --test-threads=N` — still wins, so this is a
+# sane default and not a straitjacket.
+[env]
+RUST_TEST_THREADS = { value = "4", force = false }

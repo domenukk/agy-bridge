@@ -183,9 +183,10 @@ pub trait Runtime: Send + Sync {
 /// Wraps the agent's lifecycle: creation, chat, and shutdown.
 ///
 /// Call [`shutdown()`](Self::shutdown) for a clean, error-reported shutdown.
-/// If the handle is dropped without calling `shutdown()`, a best-effort
-/// background shutdown is spawned via [`tokio::spawn`] — the Python agent
-/// will be cleaned up, but errors are only logged, not returned.
+/// If the handle is dropped without calling `shutdown()`, `Drop` makes a
+/// synchronous best-effort [`Runtime::try_shutdown_agent`] call — the backend
+/// agent is cleaned up asynchronously, but errors are only logged, never
+/// returned, and the caller cannot wait for completion.
 ///
 /// Most methods take `&self` — interior mutability is used where needed
 /// so multiple concurrent operations can share a single handle.
@@ -349,6 +350,8 @@ impl<R: Runtime> AgentHandle<R> {
             tool_state: llm_tool::SharedState::new(),
             conversation_id: Arc::clone(&conversation_id),
             last_tool_error: std::sync::Mutex::new(None),
+            #[cfg(feature = "native")]
+            last_tool_output: std::sync::Mutex::new(None),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
             Ok(mut map) => {
@@ -387,15 +390,19 @@ impl<R: Runtime> AgentHandle<R> {
     ///
     /// Returns a [`Error`] on chat failure (Python error, timeout, etc.).
     pub async fn chat(&self, content: impl Into<Content>) -> Result<ChatResponseHandle, Error> {
-        if !self.is_started() {
-            return Err(Error::AgentNotStarted);
-        }
         self.chat_once(&content.into()).await
     }
 
     /// Perform a single (non-retrying) chat turn, recording the streaming
     /// shared state for later `get_last_structured_output()` access.
+    ///
+    /// This is the single choke point for every chat path, so the
+    /// "agent is alive" guard lives here rather than in each public entry
+    /// point.
     async fn chat_once(&self, content: &Content) -> Result<ChatResponseHandle, Error> {
+        if !self.is_started() {
+            return Err(Error::AgentNotStarted);
+        }
         let handle = self.runtime.chat(self.id, content).await?;
         match self.last_shared_state.lock() {
             Ok(mut guard) => {

@@ -349,3 +349,39 @@ fn os_threads_multiple_bridges_multiple_configs_concurrent() {
         });
     }
 }
+
+/// Verifies that an `AgentHandle` remains fully functional even if its creating
+/// `AgyBridge` object is explicitly dropped before `chat()` or `shutdown()`.
+///
+/// Because `AgentHandle` holds an `Arc<Runtime>`, dropping the bridge decrements
+/// the refcount but does not kill the underlying runtime or child harness process
+/// until the agent itself is dropped or shut down.
+#[test]
+fn bridge_dropped_before_agent_chat_lifecycle() {
+    let rt = multi_thread_rt();
+    rt.block_on(async {
+        let server = MockServer::start("bridge-drop").await;
+        let url = server.base_url();
+
+        let agent = {
+            let bridge = agy_bridge::AgyBridge::builder()
+                .inter_agent_delay(std::time::Duration::ZERO)
+                .build()
+                .expect("build bridge");
+            bridge
+                .agent(agent_config(&url, "survivor-agent"))
+                .await
+                .expect("create agent")
+            // `bridge` is dropped right here at the end of the block
+        };
+
+        // Agent chats successfully despite its parent bridge being dropped
+        let response = agent
+            .chat_text("surviving turn")
+            .await
+            .expect("chat after bridge drop");
+        assert!(response.contains("mock:bridge-drop"));
+
+        agent.shutdown().await.expect("shutdown agent");
+    });
+}

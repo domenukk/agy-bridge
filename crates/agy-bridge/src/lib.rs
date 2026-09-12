@@ -112,27 +112,31 @@ pub mod prelude {
 
 use std::sync::Arc;
 
-/// Load environment variables from a `.env` file into the process environment.
+/// Load environment variables from the nearest `.env` file into an
+/// in-process cache.
 ///
 /// 1. Walks upward from `CARGO_MANIFEST_DIR` (if set) or the current working
 ///    directory to find the nearest `.env` file.
 /// 2. Parses each `KEY=VALUE` line (skipping blanks and `#`-comments).
-/// 3. For every key that is **not** already present in the process
-///    environment, calls [`std::env::set_var`] to inject it.
-/// 4. Returns a [`HashMap`](std::collections::HashMap) of the newly-set
-///    key/value pairs (keys that were already set are omitted).
+/// 3. Retains every key that is **not** already present in the process
+///    environment (real environment variables always win).
+/// 4. Returns that [`HashMap`](std::collections::HashMap) of overlay values.
 ///
-/// Results are cached via [`OnceLock`](std::sync::OnceLock) — the file is
-/// read and environment variables are set at most once. Subsequent calls
-/// return a clone of the cached map without re-reading the file or
-/// modifying the environment.
+/// Results are cached via [`OnceLock`](std::sync::OnceLock), so the file is
+/// read at most once and subsequent calls are free.
 ///
-/// # Safety
+/// # This does not modify the process environment
 ///
-/// This function calls [`std::env::set_var`], which is **not** thread-safe.
-/// It **must** be called during single-threaded startup, before any
-/// additional threads are spawned (including the Tokio runtime). Calling it
-/// after threads exist is undefined behaviour.
+/// Values are only an *overlay*: they are visible through [`env_var`], and
+/// nowhere else. [`std::env::var`] will not see them, and neither will
+/// anything that reads the environment directly — including the embedded
+/// Python SDK and the spawned `localharness` child process. Anything that
+/// must reach a child process has to be passed explicitly (for example via
+/// [`AgentConfig`](config::AgentConfig)'s `api_key` / `base_url` fields,
+/// which are resolved through [`env_var`]).
+///
+/// Not calling [`std::env::set_var`] is deliberate: it is `unsafe` in
+/// Rust 2024 and unsound once any other thread exists.
 ///
 /// # Example
 ///
@@ -252,6 +256,14 @@ pub struct AgyBridge<R: agent::Runtime + 'static = DefaultRuntime> {
     runtime: Arc<R>,
 }
 
+impl<R: agent::Runtime + 'static> Clone for AgyBridge<R> {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+}
+
 /// Builder for constructing an [`AgyBridge`] instance.
 ///
 /// Created via [`AgyBridge::builder()`]. All settings have sensible defaults;
@@ -262,6 +274,8 @@ pub struct AgyBridgeBuilder {
 
 impl AgyBridgeBuilder {
     /// Set the mpsc channel buffer size for the command channel.
+    ///
+    /// Python backend only — the native backend has no command channel.
     #[must_use]
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.config.channel_capacity = capacity;
@@ -269,6 +283,8 @@ impl AgyBridgeBuilder {
     }
 
     /// Set the timeout for joining the Python thread on shutdown.
+    ///
+    /// Python backend only.
     #[must_use]
     pub fn shutdown_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.config.shutdown_timeout = timeout;
@@ -276,6 +292,8 @@ impl AgyBridgeBuilder {
     }
 
     /// Set the delay between successive chat commands to prevent burst requests.
+    ///
+    /// Python backend only.
     #[must_use]
     pub fn inter_agent_delay(mut self, delay: std::time::Duration) -> Self {
         self.config.inter_agent_delay = delay;
@@ -286,6 +304,8 @@ impl AgyBridgeBuilder {
     ///
     /// Defaults to [`BackendLogLevel::Warn`]. Set to [`BackendLogLevel::Info`]
     /// or [`BackendLogLevel::Debug`] for verbose protocol-level diagnostics.
+    ///
+    /// Python backend only.
     #[must_use]
     pub fn backend_log_level(mut self, level: runtime::BackendLogLevel) -> Self {
         self.config.backend_log_level = level;
@@ -307,6 +327,8 @@ impl AgyBridgeBuilder {
     ///
     /// Defaults to `3` — enough to catch deterministically-bad model output
     /// without cutting off transient hiccups.
+    ///
+    /// Python backend only.
     #[must_use]
     pub fn max_consecutive_model_errors(mut self, limit: u32) -> Self {
         self.config.max_consecutive_model_errors = Some(limit);
@@ -318,6 +340,8 @@ impl AgyBridgeBuilder {
     ///
     /// Defaults to `500` — a generous ceiling to avoid false positives on
     /// legitimate long chains of thought.
+    ///
+    /// Python backend only.
     #[must_use]
     pub fn max_consecutive_empty_steps(mut self, limit: u32) -> Self {
         self.config.max_consecutive_empty_steps = Some(limit);
@@ -328,13 +352,18 @@ impl AgyBridgeBuilder {
     ///
     /// Each chat call creates ~7 channels of this size. Defaults to `256` —
     /// large enough to avoid backpressure under normal workloads.
+    ///
+    /// Python backend only.
     #[must_use]
     pub fn streaming_channel_buffer(mut self, size: usize) -> Self {
         self.config.streaming_channel_buffer = Some(size);
         self
     }
 
-    /// Set an explicit path to the `localharness` binary (native backend).
+    /// Set an explicit path to the `localharness` binary.
+    ///
+    /// Native backend only — the Python backend locates the harness through
+    /// the SDK.
     #[must_use]
     pub fn harness_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.config.harness_binary_path = Some(path.into());
@@ -356,10 +385,17 @@ impl AgyBridgeBuilder {
     #[cfg(feature = "native")]
     /// Build the [`AgyBridge`] with the native local harness runtime.
     ///
+    /// The native backend only consumes
+    /// [`harness_path`](Self::harness_path); every other builder setting
+    /// configures the Python command loop and is ignored here. Setting one
+    /// of those to a non-default value logs a warning rather than failing,
+    /// so the same builder chain still works against both backends.
+    ///
     /// # Errors
     ///
     /// Returns an error if runtime initialization fails.
     pub fn build_native(self) -> Result<AgyBridge<runtime::NativeRuntime>, error::Error> {
+        warn_ignored_by_native(&self.config);
         Ok(AgyBridge {
             runtime: Arc::new(runtime::NativeRuntime::new(self.config)),
         })
@@ -379,6 +415,46 @@ impl AgyBridgeBuilder {
         {
             self.build_python()
         }
+    }
+}
+
+/// Warn about builder settings that the native backend cannot honour.
+///
+/// These knobs configure the Python command loop and its streaming
+/// plumbing; the native backend has neither. Accepting them silently made
+/// `AgyBridge::builder().inter_agent_delay(..).build()` a no-op on the
+/// default backend, which is indistinguishable from it working.
+#[cfg(feature = "native")]
+fn warn_ignored_by_native(config: &runtime::RuntimeConfig) {
+    let defaults = runtime::RuntimeConfig::default();
+    let mut ignored: Vec<&'static str> = Vec::new();
+    if config.channel_capacity != defaults.channel_capacity {
+        ignored.push("channel_capacity");
+    }
+    if config.shutdown_timeout != defaults.shutdown_timeout {
+        ignored.push("shutdown_timeout");
+    }
+    if config.inter_agent_delay != defaults.inter_agent_delay {
+        ignored.push("inter_agent_delay");
+    }
+    if config.backend_log_level != defaults.backend_log_level {
+        ignored.push("backend_log_level");
+    }
+    if config.max_consecutive_model_errors.is_some() {
+        ignored.push("max_consecutive_model_errors");
+    }
+    if config.max_consecutive_empty_steps.is_some() {
+        ignored.push("max_consecutive_empty_steps");
+    }
+    if config.streaming_channel_buffer.is_some() {
+        ignored.push("streaming_channel_buffer");
+    }
+    if !ignored.is_empty() {
+        tracing::warn!(
+            settings = ?ignored,
+            "These builder settings only apply to the Python backend and are \
+             ignored by the native backend"
+        );
     }
 }
 

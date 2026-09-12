@@ -41,3 +41,30 @@ pub(crate) struct NativeAgentSession {
     /// Storage directory associated with this session's localharness process.
     pub(crate) save_dir: PathBuf,
 }
+
+impl NativeAgentSession {
+    pub(crate) fn new(
+        event_tx: mpsc::Sender<proto::localharness::InputEvent>,
+        initial_usage: UsageMetadata,
+        save_dir: PathBuf,
+    ) -> Self {
+        Self {
+            event_tx,
+            history: Arc::new(Mutex::new(Vec::new())),
+            total_usage: Arc::new(Mutex::new(initial_usage)),
+            last_turn_usage: Arc::new(Mutex::new(UsageMetadata::default())),
+            last_response_text: Arc::new(Mutex::new(None)),
+            compaction_indices: Arc::new(Mutex::new(Vec::new())),
+            turn_count: Arc::new(AtomicU32::new(0)),
+            is_idle: Arc::new(AtomicBool::new(true)),
+            idle_notify: Arc::new(Notify::new()),
+            wakeup_notify: Arc::new(Notify::new()),
+            active_writer: Arc::new(tokio::sync::Mutex::new(None)),
+            last_error: Arc::new(Mutex::new(None)),
+            produced_output: Arc::new(AtomicBool::new(false)),
+            turn_activity: Arc::new(AtomicBool::new(false)),
+            connected: Arc::new(AtomicBool::new(true)),
+            save_dir,
+        }
+    }
+}

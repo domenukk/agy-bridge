@@ -236,7 +236,18 @@ pub struct AgentConfig {
     /// and generation parameters such as `thinking_level`.
     ///
     /// Serializes as `"gemini_config"` to match the Python SDK field name.
-    #[serde(default, rename = "gemini_config")]
+    ///
+    /// Omitted entirely when `None` rather than serialized as `null`: the
+    /// runtime injects a resolved `api_key` / `base_url` into this object
+    /// when the caller did not supply one, and a JSON `null` is neither a
+    /// missing key (so `entry().or_insert_with()` would not replace it) nor
+    /// an object (so `get_mut` would not match) — which silently defeated
+    /// that injection.
+    #[serde(
+        default,
+        rename = "gemini_config",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[builder(setter(strip_option))]
     pub gemini: Option<GeminiConfig>,
     /// Optional initial conversation history to inject after agent creation.
@@ -1003,13 +1014,12 @@ mod tests {
     fn effective_api_key_none_without_any_key() {
         // Build a config with no API key set at any level.
         // We can't safely manipulate env vars in multi-threaded tests,
-        // so we test the chain up to the env-var fallback: if all config
-        // keys are None and the env var isn't set, the result is None.
+        // so we test the chain up to the env-var / .env fallback: if all config
+        // keys are None and GEMINI_API_KEY isn't set in env or .env, the result is None.
         // If GEMINI_API_KEY happens to be set, we verify it's returned.
         let config = AgentConfig::builder().build();
         let result = config.effective_api_key();
-        // NOLINT: .ok() is intentional — env var not set returns None, which is the expected fallback
-        match std::env::var("GEMINI_API_KEY").ok() {
+        match crate::env_var(crate::config::ENV_GEMINI_API_KEY) {
             Some(env_key) => assert_eq!(result.as_deref(), Some(env_key.as_str())),
             None => assert!(result.is_none()),
         }

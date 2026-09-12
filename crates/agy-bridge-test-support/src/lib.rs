@@ -12,7 +12,7 @@
 use std::{
     fmt::Write as _,
     sync::{
-        Arc, LazyLock,
+        Arc, Mutex, PoisonError, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -27,13 +27,107 @@ use tokio::{
     net::TcpListener,
 };
 
-/// A process-wide bridge shared across tests to avoid repeated Python init.
-pub static BRIDGE: LazyLock<agy_bridge::AgyBridge> = LazyLock::new(|| {
-    agy_bridge::AgyBridge::builder()
+/// Environment variable overriding the per-test wall-clock timeout applied by
+/// [`run_test`], in whole seconds.
+pub const ENV_TEST_TIMEOUT_SECS: &str = "AGY_BRIDGE_TEST_TIMEOUT_SECS";
+
+/// Default per-test wall-clock timeout, in seconds.
+///
+/// Generous enough for a cold `localharness` spawn or a cold Python SDK import
+/// on a loaded CI runner, tight enough that a deadlock fails the job instead of
+/// burning the runner's own timeout.
+const DEFAULT_TEST_TIMEOUT_SECS: u64 = 120;
+
+/// The bridge shared by every test in a process, handed out as `Arc` clones.
+///
+/// # Why not a `LazyLock` static
+///
+/// Rust never drops statics. The bridge owns the runtime, and the runtime's
+/// `Drop` is the only thing that kills the `localharness` children the native
+/// backend spawns — so a `static` fixture guarantees those children outlive the
+/// test binary, leaving the harness's voluntary exit-on-stdin-EOF as the sole
+/// safety net.
+///
+/// Caching a [`Weak`] instead keeps the deduplication property that matters for
+/// memory (all tests overlapping in time share exactly one bridge, one runtime,
+/// one harness) while restoring deterministic teardown: when the last
+/// [`AgyBridge`](agy_bridge::AgyBridge) clone *and* the last
+/// [`AgentHandle`](agy_bridge::Agent) built from it go away, the runtime drops
+/// and reaps its children. A later caller simply builds a fresh one.
+///
+/// Callers should bind the result for the duration of the test
+/// (`let bridge = shared_bridge();`) rather than calling this per statement.
+///
+/// # Panics
+///
+/// Panics if the bridge cannot be constructed.
+#[must_use]
+pub fn shared_bridge() -> agy_bridge::AgyBridge {
+    static CACHE: Mutex<Weak<agy_bridge::DefaultRuntime>> = Mutex::new(Weak::new());
+
+    // A poisoned fixture lock means some other test panicked while holding it;
+    // the cached `Weak` is still perfectly valid, so recover rather than
+    // cascading the panic into every remaining test.
+    let mut cached = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(runtime) = cached.upgrade() {
+        return agy_bridge::AgyBridge::new(runtime);
+    }
+
+    let bridge = agy_bridge::AgyBridge::builder()
         .inter_agent_delay(std::time::Duration::ZERO)
         .build()
-        .expect("shared AgyBridge")
-});
+        .expect("shared AgyBridge");
+    *cached = Arc::downgrade(bridge.runtime());
+    bridge
+}
+
+/// The per-test wall-clock timeout, honouring [`ENV_TEST_TIMEOUT_SECS`].
+fn test_timeout() -> std::time::Duration {
+    let secs = match std::env::var(ENV_TEST_TIMEOUT_SECS) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(0) => {
+                eprintln!(
+                    "[test-support] {ENV_TEST_TIMEOUT_SECS}=0 is not a usable timeout; \
+                     falling back to {DEFAULT_TEST_TIMEOUT_SECS}s"
+                );
+                DEFAULT_TEST_TIMEOUT_SECS
+            }
+            Ok(n) => n,
+            Err(parse_err) => {
+                eprintln!(
+                    "[test-support] {ENV_TEST_TIMEOUT_SECS} is not a number ({parse_err}); \
+                     falling back to {DEFAULT_TEST_TIMEOUT_SECS}s"
+                );
+                DEFAULT_TEST_TIMEOUT_SECS
+            }
+        },
+        // Unset is the normal case, not an error.
+        Err(_unset) => DEFAULT_TEST_TIMEOUT_SECS,
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Drive a mock-server test to completion on a fresh runtime, under a
+/// wall-clock timeout.
+///
+/// Use this instead of `multi_thread_rt().block_on(...)`: a hung await on a
+/// mock server (or a deadlocked bridge) then fails the test with a clear
+/// message instead of hanging until the CI runner is killed. Override the
+/// budget with [`ENV_TEST_TIMEOUT_SECS`].
+///
+/// # Panics
+///
+/// Panics if `future` has not completed within the timeout.
+pub fn run_test<F: std::future::Future<Output = ()>>(future: F) {
+    let timeout = test_timeout();
+    let runtime = multi_thread_rt();
+    if let Err(elapsed) = runtime.block_on(tokio::time::timeout(timeout, future)) {
+        panic!(
+            "test exceeded its {timeout:?} budget ({elapsed}) — likely a hang; \
+             override with {ENV_TEST_TIMEOUT_SECS}"
+        );
+    }
+}
 
 // ─── Tool Definitions ────────────────────────────────────────────────────────
 

@@ -25,7 +25,8 @@ fn chat_text_returns_predefined_text_verbatim() {
         let expected = "The capital of France is Paris.";
         let server = MockGeminiServer::start(vec![MockResponse::Text(expected.into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "geo"))
             .await
             .expect("agent");
@@ -54,7 +55,8 @@ fn predefined_unicode_text_round_trip() {
         let expected = "café ☕ 日本語 🚀 — ok";
         let server = MockGeminiServer::start(vec![MockResponse::Text(expected.into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "unicode"))
             .await
             .expect("agent");
@@ -82,7 +84,8 @@ fn system_instruction_and_prompt_forwarded_to_backend() {
     rt.block_on(async {
         let server = MockGeminiServer::start(vec![MockResponse::Text("ack".into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "SYSTEM_MARKER_XYZ"))
             .await
             .expect("agent");
@@ -117,7 +120,8 @@ fn multi_turn_conversation_forwards_history() {
         ])
         .await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "chat_history"))
             .await
             .expect("agent");
@@ -157,7 +161,8 @@ fn streaming_text_chunks_assemble_to_predefined_text() {
         let expected = "Streamed hello world.";
         let server = MockGeminiServer::start(vec![MockResponse::Text(expected.into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "streaming"))
             .await
             .expect("agent");
@@ -188,7 +193,8 @@ fn usage_metadata_surfaced_from_predefined_response() {
     rt.block_on(async {
         let server = MockGeminiServer::start(vec![MockResponse::Text("counted".into())]).await;
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "usage"))
             .await
             .expect("agent");
@@ -225,11 +231,12 @@ fn two_agents_receive_independent_predefined_text() {
         let server_b =
             MockGeminiServer::start(vec![MockResponse::Text("BETA_RESPONSE".into())]).await;
 
-        let agent_a = BRIDGE
+        let bridge = shared_bridge();
+        let agent_a = bridge
             .agent(agent_config(&server_a.base_url(), "agent_a"))
             .await
             .expect("agent a");
-        let agent_b = BRIDGE
+        let agent_b = bridge
             .agent(agent_config(&server_b.base_url(), "agent_b"))
             .await
             .expect("agent b");

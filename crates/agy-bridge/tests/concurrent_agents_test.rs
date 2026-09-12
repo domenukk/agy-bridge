@@ -64,6 +64,7 @@ fn json_response(status: u16, body: &str) -> String {
     format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json\r\n\
+         Connection: close\r\n\
          Content-Length: {}\r\n\
          \r\n\
          {}",
@@ -77,6 +78,7 @@ fn sse_response(json_body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/event-stream\r\n\
+         Connection: close\r\n\
          Content-Length: {}\r\n\
          \r\n\
          {}",
@@ -153,6 +155,14 @@ struct MockConcurrentServer {
 
 impl MockConcurrentServer {
     async fn start() -> Self {
+        Self::start_internal(None).await
+    }
+
+    async fn start_with_barrier(barrier: Arc<tokio::sync::Barrier>) -> Self {
+        Self::start_internal(Some(barrier)).await
+    }
+
+    async fn start_internal(barrier: Option<Arc<tokio::sync::Barrier>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock server");
@@ -167,6 +177,7 @@ impl MockConcurrentServer {
                     break;
                 };
                 let count = Arc::clone(&count);
+                let barrier = barrier.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = tokio::io::split(stream);
                     let mut buf_reader = BufReader::new(reader);
@@ -180,6 +191,9 @@ impl MockConcurrentServer {
                         json_response(200, &model_list_json())
                     } else {
                         count.fetch_add(1, Ordering::SeqCst);
+                        if let Some(ref b) = barrier {
+                            b.wait().await;
+                        }
                         sse_response(&generate_content_json())
                     };
 
@@ -289,5 +303,70 @@ fn multiple_concurrent_agents_no_deadlock() {
             "Expected exactly {} API requests, got {total_requests}",
             num_agents * num_turns
         );
+    });
+}
+
+#[test]
+fn test_simultaneous_turns_across_agents_barrier() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        // Barrier requires exactly 2 concurrent in-flight requests to trip
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let server = MockConcurrentServer::start_with_barrier(barrier).await;
+        let base_url = server.base_url();
+
+        let bridge = Arc::new(
+            agy_bridge::AgyBridge::builder()
+                .inter_agent_delay(std::time::Duration::ZERO)
+                .build()
+                .expect("AgyBridge"),
+        );
+
+        let make_agent = |i: usize| {
+            let base_url = base_url.clone();
+            let bridge = Arc::clone(&bridge);
+            async move {
+                let gemini = agy_bridge::config::GeminiConfig {
+                    api_key: Some(format!("key-{i}")),
+                    base_url: Some(base_url),
+                    models: agy_bridge::config::ModelConfig::default(),
+                };
+                let config = agy_bridge::config::AgentConfig::builder()
+                    .system_instructions(format!("Agent {i}"))
+                    .gemini(gemini)
+                    .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
+                    .retry_config(agy_bridge::config::RetryConfig::no_retries())
+                    .build();
+                bridge.agent(config).await.expect("create agent")
+            }
+        };
+
+        let agent1 = make_agent(1).await;
+        let agent2 = make_agent(2).await;
+
+        // Execute turns simultaneously across both agents.
+        // If the harness serialized requests, agent 1 would wait for server response,
+        // but server is waiting for agent 2 to arrive at the barrier, causing a deadlock!
+        let turn1 = agent1.chat_text("Simultaneous turn from Agent 1");
+        let turn2 = agent2.chat_text("Simultaneous turn from Agent 2");
+
+        let (res1, res2) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join(turn1, turn2),
+        )
+        .await
+        .expect(
+            "Deadlock or serialization detected: both turns were not in flight simultaneously!",
+        );
+
+        assert_eq!(res1.unwrap(), "Mock concurrent response");
+        assert_eq!(res2.unwrap(), "Mock concurrent response");
+
+        agent1.shutdown().await.expect("shutdown agent1");
+        agent2.shutdown().await.expect("shutdown agent2");
     });
 }

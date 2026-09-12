@@ -2,14 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
+
+# Every job below runs the *justfile* recipes rather than re-spelling the
+# commands. The justfile is the single source of truth; if a command needs to
+# change, it changes there and CI follows automatically.
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   lint-and-hygiene:
     name: Lint & Hygiene
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,10 +36,16 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-antigravity watchfiles black pytest
+      # `just lint-hygiene` and `just fmt-python` shell out to `uv run`, so uv
+      # has to exist and the project has to be synced against the interpreter
+      # setup-python just installed.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync Python environment
+        run: uv sync --python "$(which python)"
 
       - name: Install just and taplo
         uses: taiki-e/install-action@v2
@@ -45,6 +58,7 @@ jobs:
   test-python:
     name: Test Python Backend
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,21 +71,38 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-antigravity watchfiles pytest
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
-      - name: Run Python backend tests
+      # PyO3's `auto-initialize` resolves the interpreter from PATH, so the
+      # synced venv must be the one on PATH — otherwise `cargo test --features
+      # python` and `uv run pytest` would use two different interpreters and
+      # only one of them would have the antigravity SDK.
+      - name: Sync Python environment
+        run: |
+          uv sync --python "$(which python)"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Run Rust tests (python backend)
         env:
           AGY_BRIDGE_SKIP_LIVE_TESTS: "1"
-        run: |
-          cargo test --no-default-features --features python
-          python -m pytest crates/agy-bridge/tests/python -q
+        run: just test-rust
+
+      - name: Run Python helper tests
+        run: just test-python
 
   test-native-standalone:
     name: Test Native Backend (Pure Rust - No Python SDK)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -79,8 +110,21 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # Deliberately no Python/uv setup here: this job proves the native
+      # backend builds and passes with no Python SDK on the machine.
       - name: Run Native backend tests without Python SDK installed
         env:
           AGY_BRIDGE_SKIP_LIVE_TESTS: "1"
-        run: |
-          cargo test --no-default-features --features native
+        run: just test-native
+
+      # The default feature set (`native`) is what downstream users get, and
+      # it is the only configuration that exercises the README doctests.
+      - name: Run default-feature workspace tests
+        env:
+          AGY_BRIDGE_SKIP_LIVE_TESTS: "1"
+        run: just test-default

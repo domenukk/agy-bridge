@@ -34,7 +34,8 @@ fn tool_single_round_trip() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "calc"))
             .tools(registry)
             .await
@@ -70,7 +71,8 @@ fn tool_multi_sequential_calls() {
         registry.register(AddTool);
         registry.register(LookupTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "multi"))
             .tools(registry)
             .await
@@ -101,7 +103,8 @@ fn tool_error_propagated() {
         let mut registry = ToolRegistry::new();
         registry.register(AlwaysFailTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "err"))
             .tools(registry)
             .await
@@ -132,7 +135,8 @@ fn tool_output_in_function_response() {
         let mut registry = ToolRegistry::new();
         registry.register(LookupTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "verify"))
             .tools(registry)
             .await
@@ -169,7 +173,8 @@ fn tool_call_via_streaming_handle() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "stream"))
             .tools(registry)
             .await
@@ -211,12 +216,13 @@ fn concurrent_agents_different_tools() {
         let mut reg_lookup = ToolRegistry::new();
         reg_lookup.register(LookupTool);
 
-        let a1 = BRIDGE
+        let bridge = shared_bridge();
+        let a1 = bridge
             .agent(agent_config(&server_add.base_url(), "adder"))
             .tools(reg_add)
             .await
             .expect("adder");
-        let a2 = BRIDGE
+        let a2 = bridge
             .agent(agent_config(&server_lookup.base_url(), "looker"))
             .tools(reg_lookup)
             .await
@@ -273,7 +279,8 @@ fn llm_tool_proc_macro_round_trip() {
         let mut registry = ToolRegistry::new();
         registry.register(Multiply);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "proc_macro"))
             .tools(registry)
             .await
@@ -312,7 +319,8 @@ fn receive_chunks_surfaces_tool_call_and_text() {
         let mut registry = ToolRegistry::new();
         registry.register(AddTool);
 
-        let agent = BRIDGE
+        let bridge = shared_bridge();
+        let agent = bridge
             .agent(agent_config(&server.base_url(), "chunks"))
             .tools(registry)
             .await
