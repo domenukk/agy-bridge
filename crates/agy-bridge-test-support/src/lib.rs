@@ -618,6 +618,15 @@ pub fn agent_config(base_url: &str, system: &str) -> agy_bridge::config::AgentCo
         })
         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
         .policies([PolicyRule::AllowAll])
+        .retry_config(agy_bridge::config::RetryConfig {
+            api_retry: Some(agy_bridge::config::ModelAPIRetryConfig {
+                max_retries: Some(2),
+                initial_sleep_duration_ms: Some(50),
+                exponential_multiplier: Some(1.0),
+                jitter_range: Some(0.0),
+            }),
+            model_output_retry: None,
+        })
         .build()
 }
 

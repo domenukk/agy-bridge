@@ -14,22 +14,180 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.16";
+const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.17";
 
 // NOLINT: main returns Result for feature-conditional compilation
 #[allow(clippy::unnecessary_wraps)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let current_exe = std::env::current_exe()?;
+    if let Some(dir) = current_exe.parent()
+        && dir.join("payload.dat").exists()
+    {
+        if dir.join("record_pid").exists() {
+            std::fs::write(dir.join("harness.pid"), format!("{}\n", std::process::id()))?;
+        }
+        let payload = std::fs::read(dir.join("payload.dat"))?;
+        let mut stdout = std::io::stdout().lock();
+        std::io::Write::write_all(&mut stdout, &payload)?;
+        std::io::Write::flush(&mut stdout)?;
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
+
     println!("cargo:rerun-if-changed=proto/content.proto");
     println!("cargo:rerun-if-changed=proto/localharness.proto");
     println!("cargo:rerun-if-env-changed=ANTIGRAVITY_HARNESS_PATH");
+    println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
     println!("cargo:rustc-env=TARGET_ANTIGRAVITY_SDK_VERSION={TARGET_ANTIGRAVITY_SDK_VERSION}");
+
+    #[cfg(feature = "python")]
+    configure_python_dll_search_path();
 
     #[cfg(feature = "native")]
     {
+        emit_mock_harness_bin(&current_exe)?;
         compile_protos()?;
         resolve_or_download_binary()?;
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "python")]
+fn discover_windows_python_base_prefix() -> Option<std::path::PathBuf> {
+    let mut candidate_python_bins: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(pyo3_py) = std::env::var_os("PYO3_PYTHON") {
+        candidate_python_bins.push(std::path::PathBuf::from(pyo3_py));
+    }
+
+    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from)
+    {
+        let mut current = manifest_dir;
+        loop {
+            let venv = current.join(".venv");
+            if venv.is_dir() {
+                let pyvenv_cfg = venv.join("pyvenv.cfg");
+                if let Result::Ok(cfg_text) = std::fs::read_to_string(&pyvenv_cfg) {
+                    for line in cfg_text.lines() {
+                        if let Some((key, val)) = line.split_once('=')
+                            && key.trim() == "home"
+                        {
+                            let home_dir = std::path::PathBuf::from(val.trim());
+                            if home_dir.is_dir() {
+                                return Some(home_dir);
+                            }
+                        }
+                    }
+                }
+                let venv_py = venv.join("Scripts").join("python.exe");
+                if venv_py.is_file() {
+                    candidate_python_bins.push(venv_py);
+                }
+            }
+            if !current.pop() {
+                break;
+            }
+        }
+    }
+
+    candidate_python_bins.push(std::path::PathBuf::from("python"));
+    for py_bin in candidate_python_bins {
+        let output_res = std::process::Command::new(&py_bin)
+            .args(["-c", "import sys; print(sys.base_prefix)"])
+            .output();
+        if let Result::Ok(out) = output_res
+            && out.status.success()
+        {
+            let parsed = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            if parsed.is_dir() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "python")]
+fn configure_python_dll_search_path() {
+    if !std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") {
+        return;
+    }
+
+    let Some(base_prefix) = discover_windows_python_base_prefix() else {
+        return;
+    };
+
+    println!("cargo:rustc-link-search=native={}", base_prefix.display());
+
+    let Some(out_dir) = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from) else {
+        return;
+    };
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+
+    let mut target_dirs = vec![out_dir.clone()];
+    // OUT_DIR is target/<profile>/build/<crate>-<hash>/out -> 3 levels up is target/<profile>
+    if let Some(profile_dir) = out_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        target_dirs.push(profile_dir.to_path_buf());
+        target_dirs.push(profile_dir.join("deps"));
+    }
+
+    let pyvenv_content = format!(
+        "home = {}\ninclude-system-site-packages = false\n",
+        base_prefix.display()
+    );
+
+    if let Result::Ok(entries) = std::fs::read_dir(&base_prefix) {
+        let dll_files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+            })
+            .collect();
+
+        for dest_dir in &target_dirs {
+            if !dest_dir.is_dir() {
+                continue;
+            }
+            for dll in &dll_files {
+                if let Some(fname) = dll.file_name() {
+                    let dest_dll = dest_dir.join(fname);
+                    if !dest_dll.exists() {
+                        // NOLINT: best-effort DLL staging into target directory
+                        let _ = std::fs::copy(dll, &dest_dll);
+                    }
+                }
+            }
+            let cfg_dest = dest_dir.join("pyvenv.cfg");
+            // NOLINT: best-effort pyvenv.cfg staging into target directory
+            let _ = std::fs::write(&cfg_dest, &pyvenv_content);
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+fn emit_mock_harness_bin(current_exe: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let is_windows = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows");
+    let mock_bin_name = if is_windows {
+        "mock_localharness.exe"
+    } else {
+        "mock_localharness"
+    };
+    let mock_bin_path = out_dir.join(mock_bin_name);
+    std::fs::copy(current_exe, &mock_bin_path)?;
+    #[cfg(unix)]
+    set_executable_permission(&mock_bin_path)?;
+    println!(
+        "cargo:rustc-env=AGY_BRIDGE_MOCK_HARNESS_BIN={}",
+        mock_bin_path.display()
+    );
     Ok(())
 }
 
@@ -97,6 +255,19 @@ fn find_venv_candidate(bin_name: &str) -> Option<PathBuf> {
     loop {
         let venv = current.join(".venv");
         if venv.is_dir() {
+            // Windows venv layout: .venv/Lib/site-packages/...
+            let win_candidate = venv
+                .join("Lib")
+                .join("site-packages")
+                .join("google")
+                .join("antigravity")
+                .join("bin")
+                .join(bin_name);
+            if win_candidate.is_file() {
+                return Some(win_candidate);
+            }
+
+            // Unix venv layout: .venv/lib/python3.X/site-packages/...
             let lib_dir = venv.join("lib");
             // NOLINT: lib directory may not exist or may be unreadable
             if let Ok(entries) = std::fs::read_dir(&lib_dir) {
@@ -125,6 +296,7 @@ fn find_venv_candidate(bin_name: &str) -> Option<PathBuf> {
 fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     const ENV_HARNESS_PATH: &str = "ANTIGRAVITY_HARNESS_PATH";
     const ENV_HOME: &str = "HOME";
+    const ENV_USERPROFILE: &str = "USERPROFILE";
     const GEMINI_CACHE_DIR: &str = ".gemini";
     const ANTIGRAVITY_DIR: &str = "antigravity";
     const BIN_DIR: &str = "bin";
@@ -163,51 +335,57 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Check workspace .venv
-    if let Some(venv_bin) = find_venv_candidate(bin_name)
-        && std::fs::copy(&venv_bin, &target_bin_path).is_ok()
-    {
+    if let Some(venv_bin) = find_venv_candidate(bin_name) {
         #[cfg(unix)]
-        set_executable_permission(&target_bin_path)?;
-        write_version_stamp(&out_dir)?;
-        println!(
-            "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
-            target_bin_path.display()
-        );
+        set_executable_permission(&venv_bin)?;
+        println!("cargo:rustc-env=NATIVE_HARNESS_PATH={}", venv_bin.display());
         return Ok(());
     }
 
-    // 4. Check ~/.gemini/antigravity/bin cache
-    if let Some(home) = env::var_os(ENV_HOME).map(PathBuf::from) {
-        let candidate = home
-            .join(GEMINI_CACHE_DIR)
-            .join(ANTIGRAVITY_DIR)
-            .join(BIN_DIR)
-            .join(bin_name);
-        if candidate.is_file() && std::fs::copy(&candidate, &target_bin_path).is_ok() {
+    // 4. Check ~/.gemini/antigravity/bin cache (version-stamped)
+    let home_cache_dir = env::var_os(ENV_HOME)
+        .or_else(|| env::var_os(ENV_USERPROFILE))
+        .map(PathBuf::from)
+        .map(|home| {
+            home.join(GEMINI_CACHE_DIR)
+                .join(ANTIGRAVITY_DIR)
+                .join(BIN_DIR)
+        });
+
+    if let Some(ref cache_dir) = home_cache_dir {
+        let candidate = cache_dir.join(bin_name);
+        if is_cached_binary_valid(cache_dir, &candidate) {
             #[cfg(unix)]
-            set_executable_permission(&target_bin_path)?;
-            write_version_stamp(&out_dir)?;
+            set_executable_permission(&candidate)?;
             println!(
                 "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
-                target_bin_path.display()
+                candidate.display()
             );
             return Ok(());
         }
     }
 
-    // 5. Download from PyPI wheel
+    // 5. Download from PyPI wheel (into shared home cache if writable, else OUT_DIR)
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
+
+    let (dest_dir, dest_bin_path) = if let Some(ref cache_dir) = home_cache_dir
+        && std::fs::create_dir_all(cache_dir).is_ok()
+    {
+        (cache_dir.clone(), cache_dir.join(bin_name))
+    } else {
+        (out_dir.clone(), target_bin_path)
+    };
 
     println!(
         "cargo:warning=Downloading local proxy binary from PyPI for {target_os}-{target_arch} v{TARGET_ANTIGRAVITY_SDK_VERSION}..."
     );
-    download_and_extract_wheel(&target_os, &target_arch, &target_bin_path)?;
-    write_version_stamp(&out_dir)?;
+    download_and_extract_wheel(&target_os, &target_arch, &dest_bin_path)?;
+    write_version_stamp(&dest_dir)?;
 
     println!(
         "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
-        target_bin_path.display()
+        dest_bin_path.display()
     );
     Ok(())
 }
@@ -274,7 +452,7 @@ fn download_and_extract_wheel(
     let mut found = false;
     for i in 0..zip_archive.len() {
         let mut file = zip_archive.by_index(i)?;
-        let name = file.name().to_string();
+        let name = file.name().replace('\\', "/");
         if name.ends_with("google/antigravity/bin/localharness")
             || name.ends_with("google/antigravity/bin/localharness.exe")
         {

@@ -195,7 +195,7 @@ def run_pattern_checks() -> bool:
     all_exts_set = {e for _, e in all_dirs_exts}
     for path in source_files(list(all_dirs_set), all_exts_set):
         try:
-            lines = path.read_text(errors="replace").splitlines()
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for lineno, line in enumerate(lines, start=1):
@@ -207,10 +207,10 @@ def run_pattern_checks() -> bool:
         print(f"=== {check.name} ===")
         files = source_files(check.dirs, check.exts)
         for path in files:
-            if check.exclude_path and check.exclude_path.search(str(path)):
+            if check.exclude_path and check.exclude_path.search(path.as_posix()):
                 continue
             try:
-                lines = path.read_text(errors="replace").splitlines()
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
             for lineno, line in enumerate(lines, start=1):
@@ -247,7 +247,7 @@ def run_pattern_checks() -> bool:
     for (path, lineno), consumed in sorted(nolint_locations.items()):
         if not consumed:
             try:
-                lines = path.read_text(errors="replace").splitlines()
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                 line_text = lines[lineno - 1].strip() if lineno <= len(lines) else "???"
             except OSError:
                 line_text = "???"
@@ -269,7 +269,7 @@ def run_bare_nolint_check() -> bool:
     hits: list[str] = []
     for path in source_files(ALL_DIRS, ALL_EXTS):
         try:
-            content = path.read_text(errors="replace")
+            content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for lineno, line in enumerate(content.splitlines(), start=1):
@@ -291,7 +291,7 @@ def run_long_file_check() -> bool:
 
     for path in source_files(ALL_DIRS, ALL_EXTS):
         try:
-            line_count = sum(1 for _ in path.open(errors="replace"))
+            line_count = sum(1 for _ in path.open(encoding="utf-8", errors="replace"))
         except OSError:
             continue
         if line_count > MAX_FILE_LINES:
@@ -315,6 +315,11 @@ def run_long_file_check() -> bool:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     failed = run_pattern_checks()
     failed = run_bare_nolint_check() or failed
     failed = run_long_file_check() or failed

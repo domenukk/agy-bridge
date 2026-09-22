@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
   # Needed by `cargo test --features python`: the embedded interpreter imports
   # `google.antigravity.*`, and the SDK pulls in `watchfiles` for triggers.
-  "google-antigravity",
+  "google-antigravity>=0.1.17",
   "watchfiles",
 ]
 
@@ -23,9 +23,9 @@ dev = ["black>=24", "pytest>=8"]
 # Not an installable package — just an environment.
 package = false
 # PyO3's `auto-initialize` links against the interpreter found at build time.
-# Letting uv download its own (possibly statically linked) CPython would give
-# the Rust build and `uv run pytest` two different interpreters.
-python-preference = "only-system"
+# Preferring system Python keeps CI aligned with actions/setup-python while
+# still allowing uv-managed Python on Windows developer machines.
+python-preference = "system"
 
 [tool.black]
 # The only Python we own lives in the crate; keep black off vendored trees.

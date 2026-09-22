@@ -281,10 +281,16 @@ fn init_py_sys_path(py: pyo3::Python<'_>) {
         .expect("extract minor");
     let py_version = format!("{major}.{minor}");
 
-    let site_packages = venv
+    let unix_site_packages = venv
         .join("lib")
         .join(format!("python{py_version}"))
         .join("site-packages");
+    let win_site_packages = venv.join("Lib").join("site-packages");
+    let site_packages = if unix_site_packages.is_dir() {
+        unix_site_packages
+    } else {
+        win_site_packages
+    };
 
     if site_packages.is_dir() {
         let path = sys.getattr("path").expect("get sys.path");

@@ -221,11 +221,11 @@ fn rust_tool_definition_serde_roundtrip() {
     let schema = schemars::schema_for!(FlashParams);
     let schema_value = serde_json::to_value(&schema).expect("schema to Value");
 
-    let tool = agy_bridge::tools::ToolDefinition {
-        name: "flash_device".to_string(),
-        description: "Flashes a build image onto a device.".to_string(),
-        parameter_schema: schema_value,
-    };
+    let tool = agy_bridge::tools::ToolDefinition::new(
+        "flash_device",
+        "Flashes a build image onto a device.",
+        schema_value,
+    );
 
     let json_str = serde_json::to_string(&tool).expect("serialize ToolDefinition");
     eprintln!("Serialized tool def: {json_str}");

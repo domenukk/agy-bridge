@@ -550,6 +550,19 @@ impl Step {
     }
 }
 
+/// OS command sandbox status reported by the harness.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TypedBuilder, Default)]
+#[builder(field_defaults(default))]
+pub struct SandboxStatus {
+    /// Whether the sandbox actually enforces isolation.
+    #[builder(default)]
+    pub available: bool,
+    /// Human-readable explanation when available is false; None when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option, into))]
+    pub unavailable_reason: Option<String>,
+}
+
 #[cfg(feature = "python")]
 macro_rules! impl_from_py_object {
     ($($t:ty),+) => {
@@ -586,7 +599,8 @@ impl_from_py_object!(
     UsageMetadata,
     MessageRole,
     ConversationMessage,
-    Step
+    Step,
+    SandboxStatus
 );
 
 #[cfg(test)]

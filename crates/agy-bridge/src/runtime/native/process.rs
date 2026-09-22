@@ -58,7 +58,10 @@ pub(crate) fn find_harness_binary() -> Result<PathBuf, Error> {
     }
 
     // 3. User home cache (~/.gemini/antigravity/bin/localharness)
-    if let Some(home) = std::env::var_os(ENV_HOME).map(PathBuf::from) {
+    if let Some(home) = std::env::var_os(ENV_HOME)
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    {
         let candidate = home
             .join(GEMINI_CACHE_DIR)
             .join(ANTIGRAVITY_DIR)
@@ -105,6 +108,7 @@ async fn send_handshake_config(
         }),
         // NOLINT: empty environment map fallback when not provided
         env: env_vars.cloned().unwrap_or_default(),
+        use_interactions_api: false,
     };
 
     let mut encoded = Vec::new();
@@ -199,6 +203,12 @@ impl HarnessProcess {
         for (k, v) in crate::load_dotenv() {
             cmd.env(k, v);
         }
+        #[cfg(windows)]
+        if std::env::var_os("USERPROFILE").is_none() {
+            let fallback =
+                std::env::var_os(ENV_HOME).map_or_else(std::env::temp_dir, PathBuf::from);
+            cmd.env("USERPROFILE", fallback);
+        }
         let mut attempts = 0u32;
         let mut child = loop {
             match cmd
@@ -211,7 +221,8 @@ impl HarnessProcess {
                 Err(e)
                     if attempts < MAX_SPAWN_ATTEMPTS
                         && (e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                            || e.raw_os_error() == Some(26)) =>
+                            || e.raw_os_error() == Some(26)
+                            || e.raw_os_error() == Some(32)) =>
                 {
                     attempts += 1;
                     tracing::warn!(

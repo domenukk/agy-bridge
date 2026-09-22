@@ -20,6 +20,7 @@ enum AgentBehavior {
   AGENT_BEHAVIOR_UNSPECIFIED = 0;
   AGENT_BEHAVIOR_AUTONOMOUS = 1;
   AGENT_BEHAVIOR_INTERACTIVE = 2;
+  AGENT_BEHAVIOR_MINIMAL = 3;
 }
 
 enum ModelType {
@@ -48,6 +49,7 @@ message InputConfig {
   string bind_address = 3;
   antigravity.localharness.ClientInfo client_info = 4;
   map<string, string> env = 5;
+  bool use_interactions_api = 6;
 }
 
 message InitializeConversationEvent {
@@ -89,14 +91,27 @@ message HarnessConfig {
   antigravity.localharness.PolicyConfig policy_config = 21;
   antigravity.localharness.AgentBehavior agent_behavior = 22;
   antigravity.localharness.BudgetConfig budget_config = 23;
+  antigravity.localharness.CompactionConfig compaction_config = 24;
 }
 
 message BudgetConfig {
+  enum BudgetScope {
+    BUDGET_SCOPE_UNSPECIFIED = 0;
+    BUDGET_SCOPE_LIFETIME = 1;
+    BUDGET_SCOPE_FORWARD_LOOKING = 2;
+  }
   int32 max_model_calls = 1;
   int32 max_tool_calls = 2;
   int64 max_input_tokens = 3;
   int64 max_output_tokens = 4;
   int64 max_total_tokens = 5;
+  antigravity.localharness.BudgetConfig.BudgetScope scope = 6;
+}
+
+message CompactionConfig {
+  uint32 token_threshold = 1;
+  uint32 checkpoint_interval_tokens = 2;
+  uint32 max_context_tokens = 3;
 }
 
 message ModelAPIRetryConfig {
@@ -143,6 +158,7 @@ message VertexEndpoint {
   string project = 3;
   string location = 4;
   antigravity.localharness.GeminiModelOptions options = 5;
+  string api_key = 6;
 }
 
 message ModelConfig {
@@ -222,6 +238,16 @@ message HarnessSideTools {
   antigravity.localharness.SearchWebToolConfig search_web = 12;
   antigravity.localharness.ReadUrlContentToolConfig read_url_content = 14;
   antigravity.localharness.ToolSearchConfig tool_search_config = 15;
+  antigravity.localharness.ManageTaskToolConfig manage_task = 16;
+  antigravity.localharness.ScheduleToolConfig schedule = 17;
+}
+
+message ManageTaskToolConfig {
+  bool enabled = 1;
+}
+
+message ScheduleToolConfig {
+  bool enabled = 1;
 }
 
 message FindToolConfig {
@@ -231,6 +257,8 @@ message FindToolConfig {
 message RunCommandToolConfig {
   bool enabled = 1;
   uint32 max_timeout_ms = 2;
+  bool enable_daemon_commands = 3;
+  bool enable_sandbox = 4;
 }
 
 message SubagentsConfig {
@@ -303,11 +331,17 @@ message OutputEvent {
   }
 }
 
+message SandboxStatus {
+  bool available = 1;
+  string unavailable_reason = 2;
+}
+
 message InitializeConversationResponse {
   string cascade_id = 1;
   repeated antigravity.localharness.StepUpdate history = 2;
   antigravity.localharness.UsageMetadata cumulative_usage = 3;
   repeated antigravity.localharness.TrajectoryUsageEntry trajectory_usage = 4;
+  antigravity.localharness.SandboxStatus sandbox_status = 5;
 }
 
 message StepUpdate {
@@ -421,6 +455,7 @@ message ActionViewFile {
   string file_path = 1;
   uint32 start_line = 2;
   uint32 end_line = 3;
+  int32 content_offset = 4;
 }
 
 message ActionCreateFile {
@@ -482,7 +517,7 @@ message MultipleChoice {
 
 message InputEvent {
   oneof event {
-    antigravity.localharness.UserInput user_input = 1;
+    antigravity.localharness.UserInput user_input = 7;
     antigravity.localharness.ToolConfirmation tool_confirmation = 2;
     antigravity.localharness.ToolResponse tool_response = 3;
     antigravity.localharness.UserQuestionsResponse question_response = 4;
@@ -559,6 +594,7 @@ message ToolCall {
   string name = 2;
   string arguments_json = 3;
   genai.Struct arguments = 4;
+  string trajectory_id = 6;
 }
 
 message ToolResponse {
@@ -765,6 +801,7 @@ message PreToolResult {
   antigravity.localharness.PreToolResult.Decision decision = 1;
   string reason = 2;
   string modified_arguments_json = 3;
+  genai.Struct modified_args = 4;
 }
 
 message PreTurnResult {
@@ -816,7 +853,13 @@ message ToolOutputTruncation {
 }
 
 message PolicyConfig {
+  enum WorkspaceContainment {
+    WORKSPACE_CONTAINMENT_UNSPECIFIED = 0;
+    WORKSPACE_CONTAINMENT_ENABLED = 1;
+    WORKSPACE_CONTAINMENT_DISABLED = 2;
+  }
   repeated antigravity.localharness.PolicyRule rules = 1;
+  antigravity.localharness.PolicyConfig.WorkspaceContainment workspace_containment = 2;
 }
 
 message PolicyRule {

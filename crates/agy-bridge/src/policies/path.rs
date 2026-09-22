@@ -75,14 +75,22 @@ pub fn normalize_path(path: &std::path::Path) -> PathBuf {
 /// # Examples
 ///
 /// ```
-/// use std::path::Path;
-///
-/// let canon =
-///     agy_bridge::policies::canonicalize_path(Path::new("/tmp")).expect("/tmp must exist");
+/// let temp = std::env::temp_dir();
+/// let canon = agy_bridge::policies::canonicalize_path(&temp).expect("temp_dir must exist");
 /// assert!(canon.is_absolute());
 /// ```
 pub fn canonicalize_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(path)
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        if let Some(s) = canonical.to_str()
+            && let Some(stripped) = s.strip_prefix(r"\\?\")
+            && stripped.as_bytes().get(1) == Some(&b':')
+        {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
 }
 
 /// Resolve `path` as far as the filesystem allows, without requiring it to
@@ -208,7 +216,15 @@ mod tests {
         let real_file = dir.path().join("real.txt");
         std::fs::write(&real_file, b"data").unwrap();
         let link = dir.path().join("link.txt");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_file(&real_file, &link) {
+            if e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create file symlink: {e}");
+        }
         let resolved = canonicalize_path(&link).unwrap();
         let expected = canonicalize_path(&real_file).unwrap();
         assert_eq!(resolved, expected);
@@ -240,14 +256,21 @@ mod tests {
         assert_eq!(result, PathBuf::from("/usr/local/bin"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlink_traversal_blocked_even_for_non_existent_target_file() {
         let workspace_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
 
         let symlink_in_ws = workspace_dir.path().join("escaped_dir");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside_dir.path(), &symlink_in_ws).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_dir(outside_dir.path(), &symlink_in_ws) {
+            if e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create dir symlink: {e}");
+        }
 
         // Non-existent target file inside the symlinked outside directory
         let candidate = symlink_in_ws.join("new_file.txt");

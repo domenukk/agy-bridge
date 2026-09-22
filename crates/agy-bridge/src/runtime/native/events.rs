@@ -650,6 +650,7 @@ fn dispatch_pre_tool_hook(
                 decision: 2,
                 reason: res.message,
                 modified_arguments_json: String::new(),
+                modified_args: None,
             },
         );
     }
@@ -664,6 +665,7 @@ fn dispatch_pre_tool_hook(
             decision: 1,
             reason: res.message,
             modified_arguments_json,
+            modified_args: None,
         },
     )
 }

@@ -322,3 +322,40 @@ pub(in crate::runtime) fn handle_get_active_agent_count(
         tracing::warn!(error = ?e, "active_agent_count reply receiver dropped");
     }
 }
+
+/// Return the OS command sandbox status reported by the harness.
+///
+/// Queries `agent.sandbox_status` from the Python SDK. Returns `None`
+/// if the agent is not initialized or the harness did not report a status.
+pub(in crate::runtime) fn handle_get_sandbox_status(
+    registry: &AgentRegistry,
+    agent_id: AgentId,
+    reply: oneshot::Sender<Result<Option<crate::types::SandboxStatus>, Error>>,
+) {
+    let Some((_ctx, agent_instance)) = lock_agent_instance(registry, agent_id) else {
+        if let Err(e) = reply.send(Err(Error::BackendError {
+            message: format!("Agent ID {agent_id} not found in registry"),
+        })) {
+            tracing::warn!(agent_id = ?agent_id, error = ?e, "get_sandbox_status reply receiver dropped (not found)");
+        }
+        return;
+    };
+
+    let result = Python::attach(|py| -> Result<Option<crate::types::SandboxStatus>, Error> {
+        let agent_bound = agent_instance.bind(py);
+        if !agent_bound.hasattr("sandbox_status")? {
+            return Ok(None);
+        }
+        let status_py = agent_bound.getattr("sandbox_status")?;
+        if status_py.is_none() {
+            return Ok(None);
+        }
+        let status_dict = super::super::py_scripts::to_dict_py(&status_py)?;
+        let status = status_dict.extract::<crate::types::SandboxStatus>()?;
+        Ok(Some(status))
+    });
+
+    if let Err(e) = reply.send(result) {
+        tracing::warn!(agent_id = ?agent_id, error = ?e, "get_sandbox_status reply receiver dropped");
+    }
+}

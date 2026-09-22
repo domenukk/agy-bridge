@@ -257,6 +257,13 @@ def test_serialize_session_ctx_workspace_fallback():
     assert out["session"]["agent_id"] == 3
 
 
+def test_serialize_session_ctx_windows_workspace_fallback():
+    cfg = {"workspaces": ["C:\\Users\\user\\my-workspace\\"]}
+    out = json.loads(agent_init._serialize_session_ctx(cfg, 3))
+    assert out["session"]["session_id"] == "my-workspace"
+    assert out["session"]["agent_id"] == 3
+
+
 def test_serialize_session_ctx_default_fallback():
     out = json.loads(agent_init._serialize_session_ctx({}, 1))
     assert out["session"]["session_id"] == "default_session"
@@ -531,7 +538,80 @@ def test_serialize_stop_args_populated():
     assert data["error_message"] == ""
 
 
+def _ensure_antigravity_types_module():
+    try:
+        from google.antigravity import types as _types
+
+        return _types
+    except ImportError:
+        import types as py_types
+
+        google_mod = sys.modules.setdefault("google", py_types.ModuleType("google"))
+        agy_mod = sys.modules.setdefault(
+            "google.antigravity", py_types.ModuleType("google.antigravity")
+        )
+        types_mod = sys.modules.setdefault(
+            "google.antigravity.types", py_types.ModuleType("google.antigravity.types")
+        )
+        google_mod.antigravity = agy_mod
+        agy_mod.types = types_mod
+
+        class AgentBehavior:
+            AUTONOMOUS = "autonomous"
+
+            def __init__(self, val):
+                self.value = val
+
+        class RunCommandConfig:
+            def __init__(
+                self,
+                enable_daemons=False,
+                timeout_seconds=None,
+                enable_sandbox=False,
+            ):
+                self.enable_daemons = enable_daemons
+                self.timeout_seconds = timeout_seconds
+                self.enable_sandbox = enable_sandbox
+
+        class SubagentCapabilities:
+            def __init__(
+                self,
+                agent_behavior=None,
+                allowed_subagents=None,
+                enabled_tools=None,
+                disabled_tools=None,
+                run_command_config=None,
+            ):
+                self.agent_behavior = agent_behavior
+                self.allowed_subagents = allowed_subagents
+                self.enabled_tools = enabled_tools
+                self.disabled_tools = disabled_tools
+                self.run_command_config = run_command_config
+
+        class SubagentConfig:
+            def __init__(
+                self,
+                name,
+                description="",
+                system_instructions=None,
+                capabilities=None,
+                tools=None,
+            ):
+                self.name = name
+                self.description = description
+                self.system_instructions = system_instructions
+                self.capabilities = capabilities
+                self.tools = tools or []
+
+        types_mod.AgentBehavior = AgentBehavior
+        types_mod.RunCommandConfig = RunCommandConfig
+        types_mod.SubagentCapabilities = SubagentCapabilities
+        types_mod.SubagentConfig = SubagentConfig
+        return types_mod
+
+
 def test_normalize_capabilities_with_run_command_config():
+    types = _ensure_antigravity_types_module()
     config = {
         "capabilities": {
             "run_command_config": {
@@ -543,7 +623,6 @@ def test_normalize_capabilities_with_run_command_config():
     }
     agent_init._normalize_capabilities(config)
     cap = config["capabilities"]
-    from google.antigravity import types
 
     assert isinstance(cap["run_command_config"], types.RunCommandConfig)
     assert cap["run_command_config"].enable_daemons is True
@@ -552,6 +631,7 @@ def test_normalize_capabilities_with_run_command_config():
 
 
 def test_wire_subagents_with_run_command_config():
+    types = _ensure_antigravity_types_module()
     config = {
         "subagents": [
             {
@@ -570,7 +650,6 @@ def test_wire_subagents_with_run_command_config():
     }
     agent_init._wire_subagents(config)
     sub = config["subagents"][0]
-    from google.antigravity import types
 
     assert isinstance(sub, types.SubagentConfig)
     assert sub.capabilities is not None
@@ -578,3 +657,123 @@ def test_wire_subagents_with_run_command_config():
     assert sub.capabilities.run_command_config.enable_daemons is False
     assert sub.capabilities.run_command_config.timeout_seconds == 15.0
     assert sub.capabilities.run_command_config.enable_sandbox is True
+
+
+def test_munge_config_model_strongly_typed_model_target():
+    types = _ensure_antigravity_types_module()
+    if not hasattr(types, "ModelTarget"):
+        return
+    cfg = {
+        "model": "gemini-3-flash-preview",
+        "gemini_config": {
+            "api_key": "top-key",
+            "models": {
+                "default": {
+                    "name": "gemini-3-flash-preview",
+                    "api_key": "override-key",
+                    "generation": {
+                        "thinking_level": "HIGH",
+                        "service_tier": "FLEX",
+                    },
+                },
+                "image_generation": {
+                    "name": "imagen-3",
+                },
+            },
+        },
+    }
+    agent_init._munge_config_model(cfg, custom_base_url="http://127.0.0.1:8642")
+    assert cfg["api_key"] == "top-key"
+    assert "model" not in cfg
+    assert isinstance(cfg["models"], list)
+    assert len(cfg["models"]) == 2
+    default_target, img_target = cfg["models"]
+    assert isinstance(default_target, types.ModelTarget)
+    assert default_target.name == "gemini-3-flash-preview"
+    assert default_target.types == [types.ModelType.TEXT]
+    assert default_target.endpoint.api_key == "override-key"
+    assert default_target.endpoint.base_url == "http://127.0.0.1:8642"
+    assert default_target.endpoint.options.thinking_level == types.ThinkingLevel.HIGH
+    assert default_target.endpoint.options.service_tier == types.ServiceTier.FLEX
+    assert isinstance(img_target, types.ModelTarget)
+    assert img_target.name == "imagen-3"
+    assert img_target.types == [types.ModelType.IMAGE]
+    assert img_target.endpoint.api_key == "top-key"
+    assert img_target.endpoint.base_url == "http://127.0.0.1:8642"
+
+    from google.antigravity.connections.local.local_connection_config import (
+        LocalAgentConfig,
+    )
+
+    lac = LocalAgentConfig(**cfg)
+    assert len(lac.models) == 2
+    assert lac.models[0].name == "gemini-3-flash-preview"
+    assert lac.models[1].name == "imagen-3"
+
+
+def test_wire_capabilities_minimal_and_truncation():
+    types = _ensure_antigravity_types_module()
+    if not hasattr(types, "CapabilitiesConfig"):
+        return
+    cfg = {
+        "capabilities": {
+            "agent_behavior": "minimal",
+            "enabled_tools": ["view_file", "read_url_content"],
+            "image_model": "imagen-3",
+            "tool_output_truncation_config": {
+                "max_tokens": 8192,
+            },
+        }
+    }
+    agent_init._wire_capabilities(cfg)
+    cap = cfg["capabilities"]
+    assert isinstance(cap, types.CapabilitiesConfig)
+    assert cap.agent_behavior == types.AgentBehavior.MINIMAL
+    assert cap.enabled_tools == [
+        types.BuiltinTools.VIEW_FILE,
+        types.BuiltinTools.READ_URL_CONTENT,
+    ]
+    assert isinstance(
+        cap.tool_output_truncation_config, types.ToolOutputTruncationConfig
+    )
+    assert cap.tool_output_truncation_config.max_tokens == 8192
+
+
+def test_wire_compaction_budget_retry_and_instructions():
+    types = _ensure_antigravity_types_module()
+    if not hasattr(types, "CompactionConfig"):
+        return
+    cfg = {
+        "compaction_config": {"token_threshold": 50000},
+        "budget_config": {
+            "max_tokens": 100000,
+            "max_model_calls": 10,
+            "scope": "FORWARD_LOOKING",
+        },
+        "retry_config": {
+            "api_retry": {
+                "max_retries": 15,
+                "initial_sleep_duration_ms": 1000,
+                "exponential_multiplier": 2.0,
+                "jitter_range": 0.2,
+            },
+            "model_output_retry": {"max_retries": 5},
+        },
+        "system_instructions": {
+            "text": "Be concise and accurate.",
+        },
+    }
+    agent_init._wire_compaction_config(cfg)
+    agent_init._wire_budget_config(cfg)
+    agent_init._wire_retry_config(cfg)
+    agent_init._wire_system_instructions(cfg)
+
+    assert isinstance(cfg["compaction_config"], types.CompactionConfig)
+    assert cfg["compaction_config"].token_threshold == 50000
+    assert isinstance(cfg["budget_config"], types.BudgetConfig)
+    assert cfg["budget_config"].scope == types.BudgetScope.FORWARD_LOOKING
+    assert isinstance(cfg["retry_config"], types.RetryConfig)
+    assert cfg["retry_config"].api_retry.max_retries == 15
+    assert cfg["retry_config"].model_output_retry.max_retries == 5
+    assert isinstance(cfg["system_instructions"], types.CustomSystemInstructions)
+    assert cfg["system_instructions"].text == "Be concise and accurate."

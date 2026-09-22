@@ -270,6 +270,10 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub budget_config: Option<super::budget::BudgetConfig>,
+    /// Optional configuration for conversation trajectory compaction and context limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub compaction_config: Option<super::compaction::CompactionConfig>,
     /// Custom subagent definitions available to this agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<super::subagents::SubagentConfig>>| v.into_iter().map(Into::into).collect()))]
@@ -367,6 +371,15 @@ pub struct ModelAPIRetryConfig {
     pub jitter_range: Option<f64>,
 }
 
+/// Configuration for model output retry behavior.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TypedBuilder)]
+pub struct ModelOutputRetryConfig {
+    /// The maximum number of retries for empty or invalid model outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub max_retries: Option<u32>,
+}
+
 /// Configuration for model and API retry behavior.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TypedBuilder)]
 pub struct RetryConfig {
@@ -374,6 +387,10 @@ pub struct RetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(into, strip_option))]
     pub api_retry: Option<ModelAPIRetryConfig>,
+    /// Retry configuration for model outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub model_output_retry: Option<ModelOutputRetryConfig>,
 }
 
 impl RetryConfig {
@@ -387,6 +404,27 @@ impl RetryConfig {
                 exponential_multiplier: None,
                 jitter_range: None,
             }),
+            model_output_retry: Some(ModelOutputRetryConfig {
+                max_retries: Some(0),
+            }),
+        }
+    }
+
+    /// Optimized for evaluation suites, automated benchmarks, and load testing.
+    ///
+    /// Uses unbounded retry tolerance (`u32::MAX` attempts, `1000ms` initial sleep)
+    /// for transient API errors (429 rate limits, 503 service throttling) while
+    /// relying on the default model output retry behavior.
+    #[must_use]
+    pub const fn benchmark() -> Self {
+        Self {
+            api_retry: Some(ModelAPIRetryConfig {
+                max_retries: Some(u32::MAX),
+                initial_sleep_duration_ms: Some(1000),
+                exponential_multiplier: None,
+                jitter_range: None,
+            }),
+            model_output_retry: None,
         }
     }
 }
@@ -398,6 +436,35 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// Returns a copy of this configuration with lightweight presets applied
+    /// (`BuiltinTools::minimal()`, `AgentBehavior::Minimal`, `enable_subagents = false`),
+    /// preserving any caller-provided capability overrides.
+    #[must_use]
+    pub fn lightweight(mut self) -> Self {
+        let caps = match self.capabilities.take() {
+            None => super::CapabilitiesConfig::minimal(),
+            Some(mut user_caps) => {
+                if user_caps.enabled_tools.is_none() {
+                    if let Some(disabled) = user_caps.disabled_tools.take() {
+                        user_caps.enabled_tools = Some(
+                            super::BuiltinTools::minimal()
+                                .iter()
+                                .copied()
+                                .filter(|t| !disabled.contains(t))
+                                .collect(),
+                        );
+                    } else {
+                        user_caps.enabled_tools = Some(super::BuiltinTools::minimal().to_vec());
+                    }
+                }
+                user_caps.agent_behavior = super::AgentBehavior::Minimal;
+                user_caps.enable_subagents = false;
+                user_caps
+            }
+        };
+        self.capabilities = Some(caps);
+        self
+    }
     /// Resolve the effective API key using the same priority chain as the
     /// Python SDK's `LocalAgentConfig` → `_build_harness_config`:
     ///
@@ -650,12 +717,11 @@ mod tests {
                 ..CapabilitiesConfig::default()
             }),
             workspaces: vec![PathBuf::from("/a"), PathBuf::from("/b")],
-            tools: vec![crate::tools::ToolDefinition {
-                name: "custom_tool".to_owned(),
-                description: "A custom tool".to_owned(),
-                parameter_schema: serde_json::to_value(schemars::schema_for!(CustomToolParams))
-                    .unwrap(),
-            }],
+            tools: vec![crate::tools::ToolDefinition::new(
+                "custom_tool",
+                "A custom tool",
+                serde_json::to_value(schemars::schema_for!(CustomToolParams)).unwrap(),
+            )],
             policies: vec![PolicyRule::DenyAll],
             triggers: vec![TriggerEntry {
                 name: "poll".to_owned(),
@@ -727,11 +793,11 @@ mod tests {
         // Audit 3: Verify that an AgentConfig can carry both custom tool
         // definitions (for the ToolRegistry) AND SDK built-in tools
         // (via CapabilitiesConfig.enabled_tools) at the same time.
-        let custom_tool = crate::tools::ToolDefinition {
-            name: "my_custom_tool".to_owned(),
-            description: "Does something custom".to_owned(),
-            parameter_schema: serde_json::json!({"type": "object", "properties": {}}),
-        };
+        let custom_tool = crate::tools::ToolDefinition::new(
+            "my_custom_tool",
+            "Does something custom",
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
         let config = AgentConfig {
             tools: vec![custom_tool],
             capabilities: Some(CapabilitiesConfig {
@@ -764,11 +830,11 @@ mod tests {
     fn agent_config_custom_tools_only_no_builtins() {
         // Verify custom_tools_only() + custom tools is valid.
         let config = AgentConfig {
-            tools: vec![crate::tools::ToolDefinition {
-                name: "fetch_data".to_owned(),
-                description: "Fetches data".to_owned(),
-                parameter_schema: serde_json::json!({"type": "object"}),
-            }],
+            tools: vec![crate::tools::ToolDefinition::new(
+                "fetch_data",
+                "Fetches data",
+                serde_json::json!({"type": "object"}),
+            )],
             capabilities: Some(CapabilitiesConfig::custom_tools_only()),
             ..AgentConfig::default()
         };

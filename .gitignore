@@ -10,3 +10,6 @@ PROJECT.md
 
 # Test run logs (just test-live-logged)
 test-logs/
+
+Cargo.lock
+uv.lock

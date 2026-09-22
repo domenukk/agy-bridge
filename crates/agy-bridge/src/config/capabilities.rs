@@ -117,6 +117,40 @@ impl BuiltinTools {
         &[]
     }
 
+    /// Returns the minimal set of software engineering tools.
+    ///
+    /// Includes `RunCommand`, `ViewFile`, `CreateFile`, `EditFile`, `ListDir`, and `SearchDir`.
+    #[must_use]
+    pub const fn minimal() -> &'static [Self] {
+        &[
+            Self::RunCommand,
+            Self::ViewFile,
+            Self::CreateFile,
+            Self::EditFile,
+            Self::ListDir,
+            Self::SearchDir,
+        ]
+    }
+
+    /// Returns the default set of builtin tools for autonomous agents (all except `AskQuestion`).
+    #[must_use]
+    pub const fn default_tools() -> &'static [Self] {
+        &[
+            Self::ListDir,
+            Self::SearchDir,
+            Self::FindFile,
+            Self::ViewFile,
+            Self::CreateFile,
+            Self::EditFile,
+            Self::RunCommand,
+            Self::StartSubagent,
+            Self::GenerateImage,
+            Self::SearchWeb,
+            Self::ReadUrlContent,
+            Self::Finish,
+        ]
+    }
+
     #[must_use]
     /// Returns the Python SDK tool name string (e.g. `"list_directory"`).
     pub const fn as_sdk_name(&self) -> &'static str {
@@ -175,6 +209,9 @@ pub enum AgentBehavior {
     /// Interactive execution requiring step confirmations.
     #[serde(alias = "INTERACTIVE", alias = "interactive")]
     Interactive,
+    /// Minimal execution pruning prompt overhead for small-context models.
+    #[serde(alias = "MINIMAL", alias = "minimal")]
+    Minimal,
 }
 
 impl std::fmt::Display for AgentBehavior {
@@ -182,6 +219,7 @@ impl std::fmt::Display for AgentBehavior {
         match self {
             Self::Autonomous => f.write_str("autonomous"),
             Self::Interactive => f.write_str("interactive"),
+            Self::Minimal => f.write_str("minimal"),
         }
     }
 }
@@ -252,6 +290,10 @@ pub struct CapabilitiesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(into, strip_option))]
     pub run_command_config: Option<RunCommandConfig>,
+    /// Configuration for truncating large tool outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub tool_output_truncation_config: Option<super::truncation::ToolOutputTruncationConfig>,
 }
 
 /// Configuration for the builtin `run_command` tool.
@@ -304,6 +346,20 @@ impl CapabilitiesConfig {
     pub fn custom_tools_only() -> Self {
         Self {
             enabled_tools: Some(vec![]),
+            ..Self::default()
+        }
+    }
+
+    /// Create a capabilities config for lightweight/small-context models.
+    ///
+    /// Uses [`BuiltinTools::minimal()`], [`AgentBehavior::Minimal`], and disables subagents.
+    #[must_use]
+    pub fn minimal() -> Self {
+        Self {
+            enabled_tools: Some(BuiltinTools::minimal().to_vec()),
+            disabled_tools: None,
+            enable_subagents: false,
+            agent_behavior: AgentBehavior::Minimal,
             ..Self::default()
         }
     }

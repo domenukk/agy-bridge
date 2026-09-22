@@ -83,11 +83,11 @@ mod tests {
 
     #[test]
     fn test_build_available_tools_custom_and_builtins() {
-        let custom_tool = ToolDefinition {
-            name: "calculate".to_string(),
-            description: "Math calculation".to_string(),
-            parameter_schema: serde_json::json!({"type": "object"}),
-        };
+        let custom_tool = ToolDefinition::new(
+            "calculate",
+            "Math calculation",
+            serde_json::json!({"type": "object"}),
+        );
         let config = AgentConfig::builder().tools(vec![custom_tool]).build();
         let tools = build_available_tools(&config);
         assert_eq!(tools.len(), BuiltinTools::all_tools().len() + 1);

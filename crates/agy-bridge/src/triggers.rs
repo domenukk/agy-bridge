@@ -85,7 +85,7 @@ impl TriggerConfig {
             "on_file_change path must not be empty"
         );
         assert!(
-            path.is_absolute(),
+            path.has_root(),
             "on_file_change path must be absolute, got: {}",
             path.display()
         );
@@ -112,7 +112,7 @@ impl TriggerConfig {
                 message: "on_file_change path must not be empty".to_owned(),
             });
         }
-        if !path.is_absolute() {
+        if !path.has_root() {
             return Err(Error::InvalidConfig {
                 message: format!(
                     "on_file_change path must be absolute, got: {}",

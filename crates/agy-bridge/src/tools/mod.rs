@@ -15,8 +15,8 @@ pub use llm_tool::md_tmpl;
 pub use llm_tool::{
     EmptyParams, Json, JsonSchema, PromptDefinition, PromptOutput, PromptRegistry, RegistryItem,
     ResourceDefinition, ResourceOutput, ResourceRegistry, RustPrompt, RustResource, RustTool,
-    SharedState, ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry, definition_of,
-    llm_prompt, llm_resource, llm_tool,
+    SharedState, ToolContext, ToolDefinition, ToolEffect, ToolError, ToolOutput, ToolRegistry,
+    definition_of, llm_prompt, llm_resource, llm_tool,
 };
 
 // ── Available tool discovery types ──────────────────────────────────

@@ -4,8 +4,8 @@
 #![cfg(feature = "native")]
 
 use std::{
-    fs::{self, Permissions},
-    os::unix::fs::PermissionsExt,
+    fs,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -15,10 +15,37 @@ use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+fn compiled_mock_harness_template() -> &'static Path {
+    Path::new(env!("AGY_BRIDGE_MOCK_HARNESS_BIN"))
+}
+
+fn is_pid_alive(pid_str: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", pid_str])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid_str}"), "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("run tasklist");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.split_whitespace().any(|tok| tok == pid_str)
+    }
+}
+
 struct MockHarness {
     _dir: tempfile::TempDir,
-    bin_path: std::path::PathBuf,
-    pid_file: std::path::PathBuf,
+    bin_path: PathBuf,
+    pid_file: PathBuf,
 }
 
 impl MockHarness {
@@ -27,7 +54,11 @@ impl MockHarness {
             .prefix(&format!("mock_harness_{prefix}_"))
             .tempdir()
             .expect("create mock tempdir");
-        let bin_path = dir.path().join("mock_localharness");
+        #[cfg(windows)]
+        let bin_name = "mock_localharness.exe";
+        #[cfg(not(windows))]
+        let bin_name = "mock_localharness";
+        let bin_path = dir.path().join(bin_name);
         let payload_path = dir.path().join("payload.dat");
         let pid_file = dir.path().join("harness.pid");
 
@@ -46,22 +77,10 @@ impl MockHarness {
         frame.extend_from_slice(&out_bytes);
 
         fs::write(&payload_path, &frame).expect("write mock payload");
-
-        let script_content = if record_pid {
-            format!(
-                "#!/bin/sh\necho $$ > '{}'\ncat '{}'\nexec sleep 30\n",
-                pid_file.display(),
-                payload_path.display()
-            )
-        } else {
-            format!(
-                "#!/bin/sh\ncat '{}'\nexec sleep 30\n",
-                payload_path.display()
-            )
-        };
-
-        fs::write(&bin_path, script_content).expect("write mock binary");
-        fs::set_permissions(&bin_path, Permissions::from_mode(0o755)).expect("set executable");
+        if record_pid {
+            fs::write(dir.path().join("record_pid"), b"1").expect("write record_pid marker");
+        }
+        fs::copy(compiled_mock_harness_template(), &bin_path).expect("copy mock binary");
 
         Self {
             _dir: dir,
@@ -290,12 +309,7 @@ async fn test_native_harness_killed_when_last_agent_shuts_down() {
     let pid_str = mock.read_pid();
 
     // Verify child process is alive before shutdown
-    let alive_before = std::process::Command::new("kill")
-        .args(["-0", &pid_str])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("run kill -0")
-        .success();
+    let alive_before = is_pid_alive(&pid_str);
     assert!(
         alive_before,
         "harness child process should be alive before shutdown"
@@ -310,12 +324,7 @@ async fn test_native_harness_killed_when_last_agent_shuts_down() {
     );
 
     // Verify child process has exited and been reaped
-    let alive_after = std::process::Command::new("kill")
-        .args(["-0", &pid_str])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("run kill -0")
-        .success();
+    let alive_after = is_pid_alive(&pid_str);
     assert!(
         !alive_after,
         "harness child process PID {pid_str} should have exited and been reaped"
@@ -451,12 +460,7 @@ async fn test_native_harness_killed_when_agent_handle_dropped() {
     let mut exited = false;
     for _ in 0..20 {
         if bridge.runtime().active_harness_count().await == 0 {
-            let alive = std::process::Command::new("kill")
-                .args(["-0", &pid_str])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("run kill -0")
-                .success();
+            let alive = is_pid_alive(&pid_str);
             if !alive {
                 exited = true;
                 break;

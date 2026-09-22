@@ -169,6 +169,17 @@ pub trait Runtime: Send + Sync {
         async move { Ok(true) }
     }
 
+    /// Return the OS command sandbox status reported by the harness, if any.
+    ///
+    /// Default implementation returns `Ok(None)`.
+    fn sandbox_status(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Option<crate::types::SandboxStatus>, Error>> + Send
+    {
+        async move { Ok(None) }
+    }
+
     /// Best-effort synchronous shutdown signal, called from [`Drop`].
     ///
     /// Unlike [`shutdown_agent`](Self::shutdown_agent), this is sync and
@@ -571,6 +582,19 @@ impl<R: Runtime> AgentHandle<R> {
     /// Returns [`Error`] if the operation fails.
     pub async fn clear_history(&self) -> Result<(), Error> {
         self.runtime.clear_history(self.id).await
+    }
+
+    /// Return the OS command sandbox status reported by the harness, if any.
+    ///
+    /// When `enable_sandbox` was requested on `RunCommandConfig` but
+    /// `sandbox_status.available` is `false`, `run_command` executes unsandboxed.
+    /// Returns `None` before the session starts or when the harness did not report a status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the query fails.
+    pub async fn sandbox_status(&self) -> Result<Option<crate::types::SandboxStatus>, Error> {
+        self.runtime.sandbox_status(self.id).await
     }
 
     /// Return the text of the last model response, if any.

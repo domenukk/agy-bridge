@@ -216,6 +216,13 @@ pub(crate) enum PyCommand {
         agent_id: AgentId,
         reply: oneshot::Sender<Result<bool, Error>>,
     },
+    /// Query the OS command sandbox status reported by the harness.
+    ///
+    /// Constructed by `impl Runtime for PythonRuntime::sandbox_status()`.
+    GetSandboxStatus {
+        agent_id: AgentId,
+        reply: oneshot::Sender<Result<Option<crate::types::SandboxStatus>, Error>>,
+    },
 }
 
 /// Manages a dedicated Python thread with an asyncio event loop.
@@ -254,17 +261,32 @@ impl PythonRuntime {
     /// Returns `Error::BackendError` if the thread fails to spawn or
     /// Python initialization fails.
     pub fn new(config: RuntimeConfig) -> Result<Self, Error> {
+        ensure_python_initialized()?;
+
         let (cmd_tx, cmd_rx) = mpsc::channel(config.channel_capacity);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
 
         let thread_config = config.clone();
         let thread = std::thread::Builder::new()
             .name("agy-bridge-python-runtime".into())
             .spawn(move || {
-                python_thread_main(cmd_rx, &thread_config);
+                python_thread_main(cmd_rx, &thread_config, &startup_tx);
             })
             .map_err(|e| Error::BackendError {
                 message: format!("Failed to spawn Python runtime thread: {e}"),
             })?;
+
+        match startup_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(Error::BackendError {
+                    message: format!(
+                        "Python runtime thread failed to signal startup readiness: {e}"
+                    ),
+                });
+            }
+        }
 
         Ok(Self {
             cmd_tx: Some(cmd_tx),
@@ -436,9 +458,50 @@ impl Drop for PythonRuntime {
     }
 }
 
+/// Initialize `CPython` and import `threading`/`asyncio` on a dedicated bootstrap
+/// thread so that `threading.main_thread()` is never an `agy-bridge-python-runtime`
+/// worker thread (preventing `ProactorEventLoop` on Windows from calling
+/// `signal.set_wakeup_fd` on non-main threads).
+#[cfg(feature = "python")]
+fn ensure_python_initialized() -> Result<(), Error> {
+    static PYTHON_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let res = PYTHON_INIT.get_or_init(|| {
+        let handle = std::thread::Builder::new()
+            .name("agy-bridge-py-init".into())
+            .spawn(|| -> Result<(), String> {
+                Python::initialize();
+                Python::attach(|py| -> Result<(), String> {
+                    let threading = py.import("threading").map_err(|e| e.to_string())?;
+                    let current = threading
+                        .call_method0("current_thread")
+                        .map_err(|e| e.to_string())?;
+                    threading
+                        .setattr("_main_thread", current)
+                        .map_err(|e| e.to_string())?;
+                    py.import("asyncio").map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+            })
+            .map_err(|e| format!("Failed to spawn Python init thread: {e}"))?;
+        handle
+            .join()
+            .map_err(|panic_err| format!("Python init thread panicked: {panic_err:?}"))?
+    });
+    match res {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(Error::BackendError {
+            message: msg.clone(),
+        }),
+    }
+}
+
 /// Entry point for the dedicated Python thread.
 #[cfg(feature = "python")]
-fn python_thread_main(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) {
+fn python_thread_main(
+    cmd_rx: mpsc::Receiver<PyCommand>,
+    config: &RuntimeConfig,
+    startup_tx: &std::sync::mpsc::SyncSender<Result<(), Error>>,
+) {
     Python::initialize();
 
     // Environment variables are already loaded by load_dotenv() at bridge
@@ -455,32 +518,64 @@ fn python_thread_main(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig)
         }
     });
 
-    if let Err(e) = run_live_thread(cmd_rx, config) {
+    if let Err(e) = run_live_thread(cmd_rx, config, startup_tx.clone()) {
         tracing::error!(error = %e, "Python runtime thread failed");
+        if let Err(send_err) = startup_tx.try_send(Err(e)) {
+            tracing::debug!(error = %send_err, "Startup error channel already closed or full");
+        }
     }
 
     tracing::info!("Python runtime thread exiting");
 }
 
+#[cfg(feature = "python")]
+fn create_event_loop_with_retry(py: Python<'_>) -> Result<Bound<'_, PyAny>, Error> {
+    const MAX_EVENT_LOOP_ATTEMPTS: u32 = 5;
+    const EVENT_LOOP_RETRY_BACKOFF_MS: u64 = 50;
+
+    let asyncio = py.import("asyncio").map_err(|e| Error::BackendError {
+        message: format!("Failed to import asyncio: {e}"),
+    })?;
+    let mut loop_attempts = 0u32;
+    let event_loop = loop {
+        match asyncio.call_method0("new_event_loop") {
+            Ok(loop_obj) => break loop_obj,
+            Err(e) if loop_attempts < MAX_EVENT_LOOP_ATTEMPTS => {
+                loop_attempts += 1;
+                tracing::warn!(
+                    attempt = loop_attempts,
+                    error = %e,
+                    "asyncio.new_event_loop() failed; retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(
+                    EVENT_LOOP_RETRY_BACKOFF_MS * u64::from(loop_attempts),
+                ));
+            }
+            Err(e) => {
+                return Err(Error::BackendError {
+                    message: format!("Failed to create new asyncio event loop: {e}"),
+                });
+            }
+        }
+    };
+    asyncio
+        .call_method1("set_event_loop", (&event_loop,))
+        .map_err(|e| Error::BackendError {
+            message: format!("Failed to set asyncio event loop: {e}"),
+        })?;
+    Ok(event_loop)
+}
+
 /// Live SDK thread: creates an asyncio event loop and dispatches commands
 /// to the real Antigravity SDK via `pyo3_async_runtimes`.
 #[cfg(feature = "python")]
-fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) -> Result<(), Error> {
+fn run_live_thread(
+    cmd_rx: mpsc::Receiver<PyCommand>,
+    config: &RuntimeConfig,
+    startup_tx: std::sync::mpsc::SyncSender<Result<(), Error>>,
+) -> Result<(), Error> {
     Python::attach(|py| {
-        let asyncio = py.import("asyncio").map_err(|e| Error::BackendError {
-            message: format!("Failed to import asyncio: {e}"),
-        })?;
-        let event_loop =
-            asyncio
-                .call_method0("new_event_loop")
-                .map_err(|e| Error::BackendError {
-                    message: format!("Failed to create new asyncio event loop: {e}"),
-                })?;
-        asyncio
-            .call_method1("set_event_loop", (&event_loop,))
-            .map_err(|e| Error::BackendError {
-                message: format!("Failed to set asyncio event loop: {e}"),
-            })?;
+        let event_loop = create_event_loop_with_retry(py)?;
 
         // Register the event loop in the process-global helper module so it can
         // be resolved from any thread. It is stored both as the legacy single
@@ -543,6 +638,7 @@ fn run_live_thread(cmd_rx: mpsc::Receiver<PyCommand>, config: &RuntimeConfig) ->
                     inter_agent_delay,
                     stream_limits,
                     shutdown_timeout,
+                    startup_tx,
                 )
                 .await
             });
@@ -982,6 +1078,17 @@ impl crate::agent::Runtime for PythonRuntime {
 
     async fn is_idle(&self, agent_id: crate::agent::AgentId) -> Result<bool, Error> {
         self.send_command("is_idle", |reply| PyCommand::IsIdle {
+            agent_id: AgentId(agent_id),
+            reply,
+        })
+        .await
+    }
+
+    async fn sandbox_status(
+        &self,
+        agent_id: crate::agent::AgentId,
+    ) -> Result<Option<crate::types::SandboxStatus>, Error> {
+        self.send_command("sandbox_status", |reply| PyCommand::GetSandboxStatus {
             agent_id: AgentId(agent_id),
             reply,
         })

@@ -134,7 +134,7 @@ impl NativeRuntime {
     }
 
     fn canonical_save_dir(save_dir: &Path) -> PathBuf {
-        save_dir.canonicalize().unwrap_or_else(|e| {
+        crate::policies::path::canonicalize_path(save_dir).unwrap_or_else(|e| {
             tracing::trace!(
                 error = %e,
                 path = %save_dir.display(),
@@ -264,7 +264,15 @@ impl NativeRuntime {
         config: &AgentConfig,
         hook_runner: Option<&Arc<Hooks>>,
         policies: &PolicySet,
-    ) -> Result<(HarnessWsStream, Option<String>, UsageMetadata), Error> {
+    ) -> Result<
+        (
+            HarnessWsStream,
+            Option<String>,
+            UsageMetadata,
+            Option<crate::types::SandboxStatus>,
+        ),
+        Error,
+    > {
         let (mut port, mut api_key, was_reused) = self
             .get_or_spawn_harness(save_dir, custom_binary_path, agent_id, false)
             .await?;
@@ -286,9 +294,14 @@ impl NativeRuntime {
             Err(e) => return Err(e),
         };
 
-        let (initial_cascade_id, initial_usage) =
+        let (initial_cascade_id, initial_usage, initial_sandbox_status) =
             initialize_harness(&mut ws, config, hook_runner, policies).await?;
-        Ok((ws, initial_cascade_id, initial_usage))
+        Ok((
+            ws,
+            initial_cascade_id,
+            initial_usage,
+            initial_sandbox_status,
+        ))
     }
 
     /// Terminate all managed localharness processes and wait for exit.
@@ -492,7 +505,7 @@ impl Runtime for NativeRuntime {
             let policies = PolicySet::validated_from(config.policies.clone())?;
 
             let save_dir = config.save_dir.clone().unwrap_or_else(std::env::temp_dir);
-            let (ws, initial_cascade_id, initial_usage) = match self
+            let (ws, initial_cascade_id, initial_usage, initial_sandbox_status) = match self
                 .connect_and_init_harness(
                     &save_dir,
                     custom_binary_path.as_deref(),
@@ -522,7 +535,12 @@ impl Runtime for NativeRuntime {
             let (event_tx, event_rx) =
                 mpsc::channel::<proto::localharness::InputEvent>(EVENT_CHANNEL_BUFFER_SIZE);
 
-            let session = Arc::new(NativeAgentSession::new(event_tx, initial_usage, save_dir));
+            let session = Arc::new(NativeAgentSession::new(
+                event_tx,
+                initial_usage,
+                initial_sandbox_status,
+                save_dir,
+            ));
 
             spawn_session_io_tasks(&runtime, agent_id, ws, &session, event_rx);
 
@@ -1054,6 +1072,26 @@ impl Runtime for NativeRuntime {
             };
 
             Ok(session.is_idle.load(Ordering::SeqCst))
+        }
+    }
+
+    fn sandbox_status(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<Option<crate::types::SandboxStatus>, Error>> + Send {
+        let sessions_map = Arc::clone(&self.sessions);
+        async move {
+            let session = {
+                let sessions = sessions_map.read().map_err(|e| Error::BackendError {
+                    message: format!("Poisoned NATIVE_SESSIONS lock: {e}"),
+                })?;
+                sessions
+                    .get(&agent_id)
+                    .cloned()
+                    .ok_or(Error::AgentNotStarted)?
+            };
+
+            Ok(session.sandbox_status.clone())
         }
     }
 }

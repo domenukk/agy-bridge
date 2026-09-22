@@ -149,6 +149,7 @@ pub(crate) async fn run_async_command_loop(
     inter_agent_delay: Duration,
     stream_limits: super::streaming::StreamLimits,
     shutdown_timeout: Duration,
+    startup_tx: std::sync::mpsc::SyncSender<Result<(), crate::error::Error>>,
 ) -> PyResult<()> {
     let registry: AgentRegistry = std::sync::Arc::new(std::sync::Mutex::new(RegistryInner::new()));
     let event_loop = std::sync::Arc::new(event_loop);
@@ -156,6 +157,10 @@ pub(crate) async fn run_async_command_loop(
         futures::stream::FuturesUnordered::<futures::future::BoxFuture<'static, ()>>::new();
     let rate_limiter = chat::ChatRateLimiter::new(inter_agent_delay);
     let active_chats = ActiveChatWriters::default();
+
+    if let Err(e) = startup_tx.send(Ok(())) {
+        tracing::debug!(error = %e, "PythonRuntime startup receiver dropped before loop start");
+    }
 
     loop {
         tokio::select! {
@@ -368,6 +373,9 @@ fn dispatch_query_command(cmd: PyCommand, registry: &AgentRegistry) -> Result<()
         }
         PyCommand::IsIdle { agent_id, reply } => {
             query::handle_is_idle(registry, agent_id, reply);
+        }
+        PyCommand::GetSandboxStatus { agent_id, reply } => {
+            query::handle_get_sandbox_status(registry, agent_id, reply);
         }
         PyCommand::GetActiveAgentCount { reply } => {
             query::handle_get_active_agent_count(registry, reply);

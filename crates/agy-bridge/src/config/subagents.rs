@@ -28,6 +28,10 @@ pub struct SubagentCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     pub run_command_config: Option<RunCommandConfig>,
+    /// Configuration for truncating large tool outputs for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option))]
+    pub tool_output_truncation_config: Option<super::truncation::ToolOutputTruncationConfig>,
 }
 
 /// Configuration for defining a custom subagent available to the primary agent.

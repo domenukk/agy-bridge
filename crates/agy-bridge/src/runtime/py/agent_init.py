@@ -5,19 +5,31 @@
 # functions and inside `init_agent`), so they can be unit-tested with plain
 # pytest.
 
+from __future__ import annotations
+
 import os
+from typing import Any
+
+if os.name == "nt" and not os.environ.get("USERPROFILE"):
+    import tempfile
+
+    os.environ["USERPROFILE"] = os.environ.get("HOME") or tempfile.gettempdir()
 
 # Hook points whose callbacks must return a `HookResult` (allow/deny gate).
-RESULT_HOOK_POINTS = ("pre_turn", "pre_tool_call_decide", "on_interaction")
+RESULT_HOOK_POINTS: tuple[str, ...] = (
+    "pre_turn",
+    "pre_tool_call_decide",
+    "on_interaction",
+)
 
 # Placeholder API key used when a custom base_url (proxy/gateway) handles auth
 # itself, so no real key is required. It only needs to satisfy the SDK's
 # non-empty API-key validation; it is cleared in `_build_harness_config` before
 # the actual RPC, so its literal value is arbitrary and never sent anywhere.
-_PROXY_AUTH_SENTINEL = "__agy_proxy_auth__"
+_PROXY_AUTH_SENTINEL: str = "__agy_proxy_auth__"
 
 
-def _to_dict(obj):
+def _to_dict(obj: Any) -> Any:
     """Best-effort conversion of a pydantic-like object to a plain dict.
 
     Falls back to returning the object unchanged when it exposes neither
@@ -30,19 +42,21 @@ def _to_dict(obj):
     return obj
 
 
-def _normalize_tool_name(name):
+def _normalize_tool_name(name: Any) -> str:
     """Normalize a tool name to a plain string.
 
     Handles enum-like values (`.value`) and non-string names (`str()`).
     """
     if hasattr(name, "value"):
-        return name.value
+        return str(name.value)
     elif not isinstance(name, str):
         return str(name)
     return name
 
 
-def _serialize_post_tool_call_ctx(ctx, current_tool_call, agent_id_u64=None):
+def _serialize_post_tool_call_ctx(
+    ctx: Any, current_tool_call: Any, agent_id_u64: int | None = None
+) -> str:
     """Serialize a `post_tool_call` hook context to a JSON string."""
     import json
 
@@ -139,7 +153,9 @@ def _serialize_post_tool_call_ctx(ctx, current_tool_call, agent_id_u64=None):
     return json.dumps(payload)
 
 
-def _serialize_on_tool_error_ctx(ctx, current_tool_call, hook_logger):
+def _serialize_on_tool_error_ctx(
+    ctx: Any, current_tool_call: Any, hook_logger: Any
+) -> str:
     """Serialize an `on_tool_error` hook context to a JSON string."""
     import json
 
@@ -175,7 +191,7 @@ def _serialize_on_tool_error_ctx(ctx, current_tool_call, hook_logger):
     return json.dumps(payload)
 
 
-def _serialize_session_ctx(local_config, agent_id):
+def _serialize_session_ctx(local_config: dict[str, Any], agent_id: int) -> str:
     """Serialize an on_session_start/on_session_end payload to a JSON string.
 
     Falls back to a workspace-derived or `default_session` conversation id when
@@ -192,9 +208,8 @@ def _serialize_session_ctx(local_config, agent_id):
             and len(workspaces) > 0
             and workspaces[0]
         ):
-            import os
-
-            conversation_id = os.path.basename(str(workspaces[0]).rstrip("/"))
+            ws_str = str(workspaces[0]).rstrip("/\\").replace("\\", "/")
+            conversation_id = ws_str.rsplit("/", 1)[-1]
     if not conversation_id:
         conversation_id = "default_session"
     payload = {
@@ -206,7 +221,7 @@ def _serialize_session_ctx(local_config, agent_id):
     return json.dumps(payload)
 
 
-def _serialize_post_turn_ctx(ctx):
+def _serialize_post_turn_ctx(ctx: Any) -> str:
     """Serialize a `post_turn` hook context to a JSON string."""
     import json
 
@@ -219,7 +234,7 @@ def _serialize_post_turn_ctx(ctx):
     )
 
 
-def _serialize_pre_turn_ctx(ctx):
+def _serialize_pre_turn_ctx(ctx: Any) -> str:
     """Serialize a `pre_turn` hook context to a JSON string."""
     import json
 
@@ -232,7 +247,7 @@ def _serialize_pre_turn_ctx(ctx):
     )
 
 
-def _serialize_stop_args(ctx):
+def _serialize_stop_args(ctx: Any) -> str:
     """Serialize a `stop` hook StopArgs context to a JSON string."""
     import json
 
@@ -256,7 +271,7 @@ def _serialize_stop_args(ctx):
     return json.dumps(payload)
 
 
-def _serialize_generic_ctx(ctx):
+def _serialize_generic_ctx(ctx: Any) -> str:
     """Serialize an arbitrary hook context to a JSON string.
 
     Handles plain strings, pydantic models (`model_dump_json`), dicts, and an
@@ -274,27 +289,123 @@ def _serialize_generic_ctx(ctx):
         return json.dumps(str(ctx))
 
 
-def _munge_config_model(local_config):
-    """Normalize gemini_config into LocalAgentConfig top-level fields (model, api_key).
+def _build_model_target(
+    entry: str | dict[str, Any],
+    default_api_key: str | None = None,
+    base_url: str | None = None,
+    is_image: bool = False,
+) -> Any:
+    """Convert a serialized Rust `ModelEntry` dict or model name string into an SDK `ModelTarget`.
 
-    In SDK 0.1.10+, LocalAgentConfig expects top-level `api_key` and `model`.
-    Map `gemini_config.api_key` and `gemini_config.models.default` to top-level
-    fields and remove the obsolete `gemini_config` sub-dict.
+    Falls back to returning the plain model string when the SDK types module is
+    not installed or when `entry` is already a string without extra options.
+    """
+    if isinstance(entry, str):
+        if not is_image and not base_url:
+            return entry
+        entry = {"name": entry}
+
+    if not isinstance(entry, dict):
+        return entry
+
+    name = entry.get("name") or "gemini-3-flash-preview"
+    entry_api_key = entry.get("api_key") or default_api_key
+    gen = entry.get("generation") or {}
+
+    try:
+        from google.antigravity.types import (
+            GeminiAPIEndpoint,
+            GeminiModelOptions,
+            ModelTarget,
+            ModelType,
+            ServiceTier,
+            ThinkingLevel,
+        )
+
+        options = None
+        if isinstance(gen, dict) and (
+            gen.get("thinking_level") or gen.get("service_tier")
+        ):
+            tl_raw = gen.get("thinking_level")
+            st_raw = gen.get("service_tier")
+            tl = ThinkingLevel(str(tl_raw).lower()) if tl_raw else None
+            st = ServiceTier(str(st_raw).lower()) if st_raw else None
+            options = GeminiModelOptions(thinking_level=tl, service_tier=st)
+
+        endpoint = None
+        if base_url or entry_api_key or options is not None:
+            endpoint = GeminiAPIEndpoint(
+                base_url=base_url, api_key=entry_api_key, options=options
+            )
+
+        model_types = [ModelType.IMAGE] if is_image else [ModelType.TEXT]
+        return ModelTarget(name=name, types=model_types, endpoint=endpoint)
+    except Exception:
+        return name
+
+
+def _munge_config_model(
+    local_config: dict[str, Any], custom_base_url: str | None = None
+) -> None:
+    """Normalize gemini_config into LocalAgentConfig top-level fields (model, models, api_key).
+
+    In SDK 0.1.17+, `LocalAgentConfig` accepts `model: str | ModelTarget | None`
+    (single shorthand model) and `models: list[ModelTarget] | None` (explicit
+    multi-model list). Map `gemini_config.api_key` and `gemini_config.models`
+    (`default` and optional `image_generation`) to strongly-typed `ModelTarget`
+    objects and remove the obsolete `gemini_config` sub-dict.
     """
     if "gemini_config" in local_config:
         gemini_cfg = local_config.pop("gemini_config")
         if gemini_cfg:
-            if "api_key" in gemini_cfg and gemini_cfg["api_key"]:
-                local_config["api_key"] = gemini_cfg["api_key"]
-            if "models" in gemini_cfg and gemini_cfg["models"]:
-                if (
-                    "default" in gemini_cfg["models"]
-                    and gemini_cfg["models"]["default"]
-                ):
-                    local_config["model"] = gemini_cfg["models"]["default"]
+            top_api_key = gemini_cfg.get("api_key")
+            if top_api_key:
+                local_config["api_key"] = top_api_key
+            models = gemini_cfg.get("models")
+            if isinstance(models, dict) and models:
+                default_entry = models.get("default")
+                image_entry = models.get("image_generation")
+                if default_entry and image_entry:
+                    t_default = _build_model_target(
+                        default_entry,
+                        default_api_key=top_api_key,
+                        base_url=custom_base_url,
+                        is_image=False,
+                    )
+                    t_image = _build_model_target(
+                        image_entry,
+                        default_api_key=top_api_key,
+                        base_url=custom_base_url,
+                        is_image=True,
+                    )
+                    if not isinstance(t_default, str) and not isinstance(t_image, str):
+                        local_config["models"] = [t_default, t_image]
+                        local_config.pop("model", None)
+                    else:
+                        local_config["model"] = t_default
+                elif default_entry:
+                    if isinstance(default_entry, dict):
+                        local_config["model"] = _build_model_target(
+                            default_entry,
+                            default_api_key=top_api_key,
+                            base_url=custom_base_url,
+                            is_image=False,
+                        )
+                    else:
+                        local_config["model"] = default_entry
+                elif image_entry:
+                    t_image = _build_model_target(
+                        image_entry,
+                        default_api_key=top_api_key,
+                        base_url=custom_base_url,
+                        is_image=True,
+                    )
+                    if not isinstance(t_image, str):
+                        local_config["models"] = [t_image]
+                        local_config.pop("model", None)
 
 
-def _extract_initial_history(local_config):
+def _extract_initial_history(local_config: dict[str, Any]) -> list[dict[str, Any]]:
     """Pop and return `initial_history` from the config.
 
     Extract initial_history before passing config to the SDK.
@@ -923,11 +1034,31 @@ def _wire_tool_proxies(local_config, agent_id_u64):
         del local_config["capabilities"]
 
 
-def _normalize_capabilities(local_config):
-    """Normalize capabilities fields (agent_behavior, allowed_subagents, run_command_config, etc.)."""
+def _coerce_builtin_tool(item: Any) -> Any:
+    """Convert a string tool name into `BuiltinTools` when it matches a known builtin."""
+    if not isinstance(item, str):
+        return item
+    try:
+        from google.antigravity.types import BuiltinTools
+
+        alias_map = {
+            "read_url_content": BuiltinTools.READ_URL_CONTENT,
+            "search_web": BuiltinTools.SEARCH_WEB,
+        }
+        if item in alias_map:
+            return alias_map[item]
+        return BuiltinTools(item)
+    except Exception:
+        return item
+
+
+def _normalize_capabilities(local_config: dict[str, Any]) -> None:
+    """Normalize capabilities fields (agent_behavior, allowed_subagents, run_command_config, tool_output_truncation_config, builtin tools)."""
     if "capabilities" in local_config and local_config["capabilities"]:
         caps = local_config["capabilities"]
         if isinstance(caps, dict):
+            if "compaction_threshold" in caps and caps["compaction_threshold"] is None:
+                caps.pop("compaction_threshold", None)
             if "agent_behavior" in caps and isinstance(caps["agent_behavior"], str):
                 try:
                     from google.antigravity.types import AgentBehavior
@@ -948,9 +1079,66 @@ def _normalize_capabilities(local_config):
                     )
                 except Exception:
                     pass
+            if (
+                "tool_output_truncation" in caps
+                and "tool_output_truncation_config" not in caps
+            ):
+                caps["tool_output_truncation_config"] = caps.pop(
+                    "tool_output_truncation"
+                )
+            if "tool_output_truncation_config" in caps and isinstance(
+                caps["tool_output_truncation_config"], dict
+            ):
+                try:
+                    from google.antigravity.types import ToolOutputTruncationConfig
+
+                    caps["tool_output_truncation_config"] = ToolOutputTruncationConfig(
+                        **caps["tool_output_truncation_config"]
+                    )
+                except Exception:
+                    pass
+            if "enabled_tools" in caps and isinstance(caps["enabled_tools"], list):
+                caps["enabled_tools"] = [
+                    _coerce_builtin_tool(t) for t in caps["enabled_tools"]
+                ]
+            if "disabled_tools" in caps and isinstance(caps["disabled_tools"], list):
+                caps["disabled_tools"] = [
+                    _coerce_builtin_tool(t) for t in caps["disabled_tools"]
+                ]
 
 
-def _wire_subagents(local_config):
+def _wire_capabilities(local_config: dict[str, Any]) -> None:
+    """Convert normalized capabilities dict into a strongly-typed SDK `CapabilitiesConfig`."""
+    _normalize_capabilities(local_config)
+    if "capabilities" in local_config and isinstance(
+        local_config["capabilities"], dict
+    ):
+        try:
+            from google.antigravity.types import CapabilitiesConfig, RunCommandConfig
+
+            if hasattr(CapabilitiesConfig, "model_rebuild"):
+                CapabilitiesConfig.model_rebuild()
+            caps_dict = dict(local_config["capabilities"])
+            # Translate Rust-only `command_timeout_ms` if `run_command_config` is unset
+            cmd_timeout_ms = caps_dict.pop("command_timeout_ms", None)
+            if (
+                cmd_timeout_ms is not None
+                and caps_dict.get("run_command_config") is None
+            ):
+                caps_dict["run_command_config"] = RunCommandConfig(
+                    timeout_seconds=float(cmd_timeout_ms) / 1000.0
+                )
+            # Strip Rust-only `image_model` field so CapabilitiesConfig validation succeeds
+            caps_dict.pop("image_model", None)
+            if hasattr(CapabilitiesConfig, "model_fields"):
+                allowed_keys = set(CapabilitiesConfig.model_fields.keys())
+                caps_dict = {k: v for k, v in caps_dict.items() if k in allowed_keys}
+            local_config["capabilities"] = CapabilitiesConfig(**caps_dict)
+        except Exception:
+            pass
+
+
+def _wire_subagents(local_config: dict[str, Any]) -> None:
     """Translate serialized subagent specs into SDK SubagentConfig objects."""
     if "subagents" in local_config and local_config["subagents"]:
         try:
@@ -988,11 +1176,17 @@ def _wire_subagents(local_config):
                             rc_cfg = RunCommandConfig(**c_dict["run_command_config"])
                         except Exception:
                             pass
+                    enabled = c_dict.get("enabled_tools")
+                    if isinstance(enabled, list):
+                        enabled = [_coerce_builtin_tool(t) for t in enabled]
+                    disabled = c_dict.get("disabled_tools")
+                    if isinstance(disabled, list):
+                        disabled = [_coerce_builtin_tool(t) for t in disabled]
                     caps = SubagentCapabilities(
                         agent_behavior=beh,
                         allowed_subagents=c_dict.get("allowed_subagents"),
-                        enabled_tools=c_dict.get("enabled_tools"),
-                        disabled_tools=c_dict.get("disabled_tools"),
+                        enabled_tools=enabled,
+                        disabled_tools=disabled,
                         run_command_config=rc_cfg,
                     )
                 parsed_subagents.append(
@@ -1009,17 +1203,122 @@ def _wire_subagents(local_config):
         local_config["subagents"] = parsed_subagents
 
 
-def _wire_budget_config(local_config):
+def _wire_budget_config(local_config: dict[str, Any]) -> None:
     """Translate serialized budget config into SDK BudgetConfig object."""
-    if "budget_config" in local_config and local_config["budget_config"]:
+    if "budget_config" not in local_config:
+        return
+    bc = local_config["budget_config"]
+    if bc is None:
+        local_config.pop("budget_config", None)
+        return
+    if isinstance(bc, dict):
         try:
-            from google.antigravity.types import BudgetConfig
+            from google.antigravity.types import BudgetConfig, BudgetScope
+
+            bc_copy = dict(bc)
+            if "scope" in bc_copy and isinstance(bc_copy["scope"], str):
+                try:
+                    bc_copy["scope"] = BudgetScope(bc_copy["scope"].upper())
+                except ValueError:
+                    pass
+            local_config["budget_config"] = BudgetConfig(**bc_copy)
         except ImportError:
             return
-        if isinstance(local_config["budget_config"], dict):
-            local_config["budget_config"] = BudgetConfig(
-                **local_config["budget_config"]
+
+
+def _wire_compaction_config(local_config: dict[str, Any]) -> None:
+    """Translate serialized compaction config into SDK CompactionConfig object."""
+    if "compaction_config" not in local_config:
+        return
+    cc = local_config["compaction_config"]
+    if cc is None:
+        local_config.pop("compaction_config", None)
+        return
+    if isinstance(cc, dict):
+        try:
+            from google.antigravity.types import CompactionConfig
+
+            token_threshold = cc.get("token_threshold")
+            if token_threshold is not None and int(token_threshold) > 0:
+                local_config["compaction_config"] = CompactionConfig(
+                    token_threshold=int(token_threshold)
+                )
+            else:
+                local_config.pop("compaction_config", None)
+        except ImportError:
+            return
+
+
+def _wire_retry_config(local_config: dict[str, Any]) -> None:
+    """Translate serialized retry config into SDK RetryConfig object."""
+    if "retry_config" not in local_config:
+        return
+    rc = local_config["retry_config"]
+    if rc is None:
+        local_config.pop("retry_config", None)
+        return
+    if isinstance(rc, dict):
+        try:
+            from google.antigravity.types import (
+                ModelAPIRetryConfig,
+                ModelOutputRetryConfig,
+                RetryConfig,
             )
+
+            api_retry = rc.get("api_retry")
+            if isinstance(api_retry, dict):
+                api_retry = ModelAPIRetryConfig(**api_retry)
+            out_retry = rc.get("model_output_retry")
+            if isinstance(out_retry, dict):
+                out_retry = ModelOutputRetryConfig(**out_retry)
+            kwargs: dict[str, Any] = {}
+            if api_retry is not None:
+                kwargs["api_retry"] = api_retry
+            if out_retry is not None:
+                kwargs["model_output_retry"] = out_retry
+            local_config["retry_config"] = RetryConfig(**kwargs)
+        except ImportError:
+            return
+
+
+def _wire_system_instructions(local_config: dict[str, Any]) -> None:
+    """Translate serialized system_instructions into SDK Custom/TemplatedSystemInstructions."""
+    if "system_instructions" not in local_config:
+        return
+    si = local_config["system_instructions"]
+    if si is None:
+        local_config.pop("system_instructions", None)
+        return
+    try:
+        from google.antigravity.types import (
+            CustomSystemInstructions,
+            SystemInstructionSection,
+            TemplatedSystemInstructions,
+        )
+
+        if isinstance(si, str):
+            local_config["system_instructions"] = CustomSystemInstructions(text=si)
+        elif isinstance(si, dict):
+            if ("text" in si or "custom_instructions" in si) and "sections" not in si:
+                text_val = si.get("text") or si.get("custom_instructions") or ""
+                local_config["system_instructions"] = CustomSystemInstructions(
+                    text=text_val
+                )
+            elif "sections" in si or "identity" in si:
+                sections_raw = si.get("sections") or []
+                sections = [
+                    SystemInstructionSection(**sec) if isinstance(sec, dict) else sec
+                    for sec in sections_raw
+                ]
+                identity_val = si.get("identity")
+                if identity_val is None and "base_instructions" in si:
+                    identity_val = si.get("base_instructions")
+                local_config["system_instructions"] = TemplatedSystemInstructions(
+                    identity=identity_val,
+                    sections=sections,
+                )
+    except ImportError:
+        return
 
 
 def _wire_policies(local_config, agent_id_u64):
@@ -1591,7 +1890,27 @@ def _build_agent_lifecycle(
                 LocalConnectionStrategy._agy_base_url_var.set(pending_url)
                 delattr(agent, "_agy_pending_base_url")
 
-            async with agent:
+            _entered_agent = False
+            for _attempt in range(1, 6):
+                try:
+                    await agent.__aenter__()
+                    _entered_agent = True
+                    break
+                except BaseException as _enter_err:
+                    _err_str = str(_enter_err)
+                    _is_transient_win_err = os.name == "nt" and (
+                        isinstance(_enter_err, PermissionError)
+                        or "WinError 32" in _err_str
+                        or "WinError 26" in _err_str
+                        or "WinError 5" in _err_str
+                        or "WinError 10055" in _err_str
+                        or "WinError 10048" in _err_str
+                    )
+                    if _is_transient_win_err and _attempt < 5:
+                        await asyncio.sleep(0.05 * _attempt)
+                        continue
+                    raise
+            try:
                 if hasattr(agent, "conversation") and hasattr(
                     agent.conversation, "connection"
                 ):
@@ -1635,6 +1954,9 @@ def _build_agent_lifecycle(
                 result_holder["instance"] = agent
                 enter_event.set()
                 await exit_event.wait()
+            finally:
+                if _entered_agent:
+                    await agent.__aexit__(*sys.exc_info())
         except BaseException as e:
             result_holder["error"] = e
             if not enter_event.is_set():
@@ -1698,7 +2020,9 @@ def _build_agent_lifecycle(
     return (controller, _wait_for_enter())
 
 
-def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
+def init_agent(
+    config_json: str, agent_id_u64: int, agent_cls: Any, passed_event_loop: Any
+) -> tuple[Any, Any]:
     import logging, sys, json
 
     # Extract and consume the backend log level injected by Rust.
@@ -1725,12 +2049,15 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
         sys.modules["_agy_bridge_globals"] = types.ModuleType("_agy_bridge_globals")
 
-    local_config = json.loads(config_json)
+    local_config: dict[str, Any] = json.loads(config_json)
 
     _wire_tool_proxies(local_config, agent_id_u64)
-    _normalize_capabilities(local_config)
+    _wire_capabilities(local_config)
     _wire_subagents(local_config)
     _wire_budget_config(local_config)
+    _wire_compaction_config(local_config)
+    _wire_retry_config(local_config)
+    _wire_system_instructions(local_config)
     _wire_policies(local_config, agent_id_u64)
     _wire_hooks(local_config, agent_id_u64)
     sdk_triggers = _wire_triggers(local_config)
@@ -1756,7 +2083,7 @@ def init_agent(config_json, agent_id_u64, agent_cls, passed_event_loop):
 
     custom_base_url = _setup_base_url_routing(local_config)
 
-    _munge_config_model(local_config)
+    _munge_config_model(local_config, custom_base_url=custom_base_url)
 
     initial_history = _extract_initial_history(local_config)
 

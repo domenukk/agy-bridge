@@ -635,9 +635,11 @@ pub async fn stream_steps_to_writer(
     // deltas (which would double the response text).
     let mut streamed_text = String::new();
 
+    let mut saw_any_step = false;
     loop {
         match process_next_step_iteration(aiter_py, agent_id).await {
             StepIterationResult::Step(step) => {
+                saw_any_step = true;
                 let content =
                     forward_step_to_writer(writer, *step, agent_id, &mut streamed_text).await;
                 if state.observe(&content) {
@@ -690,6 +692,16 @@ pub async fn stream_steps_to_writer(
             );
             send_stream_error(writer, error_msg, state.last_http_code);
         }
+    } else if !saw_any_step {
+        tracing::warn!(
+            agent_id = ?agent_id,
+            "Stream ended without yielding any steps — propagating error"
+        );
+        send_stream_error(
+            writer,
+            "Turn stream ended prematurely without yielding any steps".to_string(),
+            crate::error::HTTP_CODE_UNKNOWN,
+        );
     }
 }
 

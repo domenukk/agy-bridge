@@ -22,6 +22,24 @@ use agy_bridge_test_support::*;
 // SECTION 4: MCP Server (stdio)
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn python_cmd() -> String {
+    if let Some(py) = std::env::var_os("PYO3_PYTHON")
+        && std::path::Path::new(&py).is_file()
+    {
+        return py.to_string_lossy().into_owned();
+    }
+    let venv_win =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.venv/Scripts/python.exe");
+    if venv_win.is_file() {
+        return venv_win.to_string_lossy().into_owned();
+    }
+    if cfg!(windows) {
+        "python".to_string()
+    } else {
+        "python3".to_string()
+    }
+}
+
 /// Verify that an MCP stdio server can be configured and connected during
 /// agent creation. Uses a minimal Python MCP server that handles the
 /// initialize handshake and returns an empty tool list.
@@ -34,7 +52,7 @@ fn mcp_stdio_server_connects() {
         let server = MockGeminiServer::start(vec![MockResponse::Text("Hello.".into())]).await;
 
         // Minimal MCP stdio server: handles jsonrpc initialize + tools/list.
-        let mcp = McpServer::stdio("python3")
+        let mcp = McpServer::stdio(python_cmd())
             .args([
                 "-c",
                 r"
@@ -108,7 +126,7 @@ fn mcp_tool_call_round_trip() {
         .await;
 
         // MCP server that provides an "mcp_echo" tool and handles calls/execute.
-        let mcp = McpServer::stdio("python3")
+        let mcp = McpServer::stdio(python_cmd())
             .args([
                 "-c",
                 r"
@@ -334,7 +352,7 @@ fn combined_custom_tools_and_mcp() {
         .await;
 
         // Minimal MCP server (no tools exposed — just handshake).
-        let mcp = McpServer::stdio("python3")
+        let mcp = McpServer::stdio(python_cmd())
             .args([
                 "-c",
                 r"

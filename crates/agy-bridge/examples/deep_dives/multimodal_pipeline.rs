@@ -14,9 +14,11 @@ fn header(title: &str) {
 }
 
 fn find_generated_image(name: &str) -> Option<PathBuf> {
-    // NOLINT: example code — HOME not set means no search path, return None
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home).join(".gemini/antigravity/brain");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let base = PathBuf::from(home)
+        .join(".gemini")
+        .join("antigravity")
+        .join("brain");
     if !base.is_dir() {
         return None;
     }

@@ -3,8 +3,8 @@
 #![cfg(feature = "native")]
 
 use std::{
-    fs::{self, Permissions},
-    os::unix::fs::PermissionsExt,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -23,9 +23,13 @@ use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+fn compiled_mock_harness_template() -> &'static Path {
+    Path::new(env!("AGY_BRIDGE_MOCK_HARNESS_BIN"))
+}
+
 struct MockHarness {
     _dir: tempfile::TempDir,
-    bin_path: std::path::PathBuf,
+    bin_path: PathBuf,
 }
 
 impl MockHarness {
@@ -34,7 +38,11 @@ impl MockHarness {
             .prefix(&format!("mock_harness_{prefix}_"))
             .tempdir()
             .expect("create mock tempdir");
-        let bin_path = dir.path().join("mock_localharness");
+        #[cfg(windows)]
+        let bin_name = "mock_localharness.exe";
+        #[cfg(not(windows))]
+        let bin_name = "mock_localharness";
+        let bin_path = dir.path().join(bin_name);
         let payload_path = dir.path().join("payload.dat");
 
         let output_config = proto::localharness::OutputConfig {
@@ -52,14 +60,7 @@ impl MockHarness {
         frame.extend_from_slice(&out_bytes);
 
         fs::write(&payload_path, &frame).expect("write mock payload");
-
-        let script_content = format!(
-            "#!/bin/sh\ncat '{}'\nexec sleep 30\n",
-            payload_path.display()
-        );
-
-        fs::write(&bin_path, script_content).expect("write mock binary");
-        fs::set_permissions(&bin_path, Permissions::from_mode(0o755)).expect("set executable");
+        fs::copy(compiled_mock_harness_template(), &bin_path).expect("copy mock binary");
 
         Self {
             _dir: dir,
@@ -270,6 +271,7 @@ async fn run_mock_tool_session(listener: TcpListener) {
                 name: "calculate_sum".to_string(),
                 arguments_json: r#"{"a": 20, "b": 22}"#.to_string(),
                 arguments: None,
+                trajectory_id: String::new(),
             },
         )),
         ..Default::default()
@@ -892,6 +894,126 @@ async fn test_native_backend_v016_features_e2e() {
     let reply = agent.chat_text("Perform v016 task").await.expect("chat");
     assert_eq!(reply, "v016 answer");
     assert!(stop_called.load(Ordering::SeqCst));
+
+    agent.shutdown().await.expect("shutdown");
+    server_task.await.expect("server task completed");
+}
+
+async fn run_mock_v017_session(listener: TcpListener) {
+    let (stream, _) = listener.accept().await.expect("accept");
+    let mut ws = tokio_tungstenite::accept_async(stream)
+        .await
+        .expect("ws accept");
+
+    let _init_msg = ws.next().await.expect("init msg").expect("valid msg");
+
+    let init_resp = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::InitializeConversationResponse(
+                proto::localharness::InitializeConversationResponse {
+                    cascade_id: "traj-v017-mock".to_string(),
+                    sandbox_status: Some(proto::localharness::SandboxStatus {
+                        available: true,
+                        unavailable_reason: String::new(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&init_resp).unwrap().into(),
+    ))
+    .await
+    .expect("send init resp");
+
+    let _user_msg = ws.next().await.expect("user msg").expect("valid msg");
+
+    let text_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::StepUpdate(
+            proto::localharness::StepUpdate {
+                text_delta: "v017 answer".to_string(),
+                text: "v017 answer".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&text_event).unwrap().into(),
+    ))
+    .await
+    .expect("send text");
+
+    let state_event = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::TrajectoryStateUpdate(
+                proto::localharness::TrajectoryStateUpdate {
+                    state: 3,
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&state_event).unwrap().into(),
+    ))
+    .await
+    .expect("send state update");
+}
+
+#[tokio::test]
+async fn test_native_backend_v017_features_e2e() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let server_task = tokio::spawn(run_mock_v017_session(listener));
+
+    let mock = MockHarness::create(port, "v017");
+
+    let bridge = AgyBridge::native_builder()
+        .harness_path(mock.bin_path())
+        .build_native()
+        .expect("build bridge");
+
+    let config = AgentConfig::builder()
+        .compaction_config(
+            agy_bridge::config::CompactionConfig::builder()
+                .token_threshold(50_000)
+                .build(),
+        )
+        .budget_config(
+            agy_bridge::config::BudgetConfig::builder()
+                .scope(agy_bridge::config::BudgetScope::ForwardLooking)
+                .build(),
+        )
+        .capabilities(
+            agy_bridge::config::CapabilitiesConfig::builder()
+                .tool_output_truncation_config(
+                    agy_bridge::config::ToolOutputTruncationConfig::builder()
+                        .max_tokens(1024)
+                        .build(),
+                )
+                .build(),
+        )
+        .build();
+
+    let agent = bridge.agent(config).await.expect("create agent");
+
+    let sandbox_status = agent.sandbox_status().await.expect("sandbox_status");
+    assert_eq!(
+        sandbox_status,
+        Some(agy_bridge::types::SandboxStatus {
+            available: true,
+            unavailable_reason: None,
+        })
+    );
+
+    let reply = agent.chat_text("Perform v017 task").await.expect("chat");
+    assert_eq!(reply, "v017 answer");
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");

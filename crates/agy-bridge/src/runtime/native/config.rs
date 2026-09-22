@@ -39,7 +39,8 @@ pub(crate) fn build_harness_config(
     let mcp_servers = config.mcp_servers.iter().map(to_proto_mcp_server).collect();
     let enabled_hooks = get_enabled_hooks(hook_runner);
     let app_data_dir = resolve_app_data_dir(config.app_data_dir.as_deref());
-    let compaction_threshold = extract_compaction_threshold(config.capabilities.as_ref());
+    let (compaction_config, compaction_threshold) = extract_compaction_config(config);
+    let tool_output_truncation = extract_tool_output_truncation(config.capabilities.as_ref());
     let finish_tool_schema_json = config
         .response_schema
         .as_ref()
@@ -81,11 +82,12 @@ pub(crate) fn build_harness_config(
         models,
         enabled_hooks,
         custom_subagents,
-        tool_output_truncation: None,
+        tool_output_truncation,
         retry_config,
         policy_config,
         agent_behavior,
         budget_config,
+        compaction_config,
     }
 }
 
@@ -150,6 +152,7 @@ fn to_proto_budget_config(
         max_input_tokens: optional_u64_to_proto_i64(budget.max_input_tokens),
         max_output_tokens: optional_u64_to_proto_i64(budget.max_output_tokens),
         max_total_tokens: optional_u64_to_proto_i64(budget.max_total_tokens),
+        scope: budget.scope.to_proto_i32(),
     }
 }
 
@@ -161,6 +164,7 @@ fn to_proto_agent_behavior(behavior: crate::config::AgentBehavior) -> i32 {
         crate::config::AgentBehavior::Interactive => {
             proto::localharness::AgentBehavior::Interactive as i32
         }
+        crate::config::AgentBehavior::Minimal => proto::localharness::AgentBehavior::Minimal as i32,
     }
 }
 
@@ -265,23 +269,72 @@ fn resolve_app_data_dir(custom_path: Option<&Path>) -> String {
     })
 }
 
-fn extract_compaction_threshold(caps: Option<&CapabilitiesConfig>) -> u32 {
-    caps.and_then(|c| c.compaction_threshold)
-        // NOLINT: convert usize threshold to u32
-        .and_then(|t| u32::try_from(t).ok())
-        // NOLINT: default 0 indicates unconfigured compaction threshold
-        .unwrap_or(0)
+fn extract_compaction_config(
+    config: &crate::config::AgentConfig,
+) -> (Option<proto::localharness::CompactionConfig>, u32) {
+    if let Some(ref cc) = config.compaction_config {
+        // NOLINT: 0 indicates no threshold in protobuf
+        let threshold = cc.token_threshold.unwrap_or_default();
+        let proto = proto::localharness::CompactionConfig {
+            token_threshold: threshold,
+            // NOLINT: 0 indicates no interval in protobuf
+            checkpoint_interval_tokens: cc.checkpoint_interval_tokens.unwrap_or_default(),
+            // NOLINT: 0 indicates no limit in protobuf
+            max_context_tokens: cc.max_context_tokens.unwrap_or_default(),
+        };
+        (Some(proto), threshold)
+    } else if let Some(threshold) = config
+        .capabilities
+        .as_ref()
+        .and_then(|c| c.compaction_threshold)
+        .and_then(|t| match u32::try_from(t) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::debug!(error = %e, "compaction_threshold exceeds u32::MAX; ignoring");
+                None
+            }
+        })
+    {
+        let proto = proto::localharness::CompactionConfig {
+            token_threshold: threshold,
+            checkpoint_interval_tokens: 0,
+            max_context_tokens: 0,
+        };
+        (Some(proto), threshold)
+    } else {
+        (None, 0)
+    }
+}
+
+fn extract_tool_output_truncation(
+    caps: Option<&CapabilitiesConfig>,
+) -> Option<proto::localharness::ToolOutputTruncation> {
+    caps.and_then(|c| c.tool_output_truncation_config.as_ref())
+        .map(|trunc| proto::localharness::ToolOutputTruncation {
+            strategy: Some(
+                proto::localharness::tool_output_truncation::Strategy::Truncate(
+                    proto::localharness::tool_output_truncation::TruncateStrategy {
+                        max_tokens: match i32::try_from(trunc.max_tokens) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "truncation max_tokens exceeds i32::MAX; saturating");
+                                i32::MAX
+                            }
+                        },
+                    },
+                ),
+            ),
+        })
 }
 
 fn dirs_or_default_app_data_dir() -> String {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        home.join(".gemini")
-            .join("antigravity")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        "/tmp/.gemini/antigravity".to_string()
-    }
+    let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    base.join(".gemini")
+        .join("antigravity")
+        .to_string_lossy()
+        .to_string()
 }
 
 fn to_proto_system_instructions(
@@ -405,6 +458,12 @@ fn to_proto_harness_side_tools(
         run_command: Some(proto::localharness::RunCommandToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::RunCommand),
             max_timeout_ms,
+            enable_daemon_commands: caps
+                .and_then(|c| c.run_command_config.as_ref())
+                .is_some_and(|rc| rc.enable_daemons),
+            enable_sandbox: caps
+                .and_then(|c| c.run_command_config.as_ref())
+                .is_some_and(|rc| rc.enable_sandbox),
         }),
         file_edit: Some(proto::localharness::FileEditToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::EditFile),
@@ -432,6 +491,12 @@ fn to_proto_harness_side_tools(
         }),
         permissions: None,
         tool_search_config: None,
+        manage_task: Some(proto::localharness::ManageTaskToolConfig {
+            enabled: enabled_tools.contains(&BuiltinTools::RunCommand),
+        }),
+        schedule: Some(proto::localharness::ScheduleToolConfig {
+            enabled: enabled_tools.contains(&BuiltinTools::RunCommand),
+        }),
     }
 }
 
@@ -502,9 +567,31 @@ fn build_models_proto(config: &AgentConfig) -> Vec<proto::localharness::ModelCon
     vec![text_model, image_model]
 }
 
+fn sanitize_mcp_server_name(raw: &str) -> String {
+    let base = std::path::Path::new(raw)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw);
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "mcp_server".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn stdio_mcp_server(stdio: &McpStdioServer) -> proto::localharness::McpServerConfig {
     proto::localharness::McpServerConfig {
-        name: stdio.command.clone(),
+        name: sanitize_mcp_server_name(&stdio.command),
         transport: Some(proto::localharness::mcp_server_config::Transport::Stdio(
             proto::localharness::McpStdioTransport {
                 command: stdio.command.clone(),
@@ -658,7 +745,10 @@ fn rule_to_proto(rule: &PolicyRule) -> Option<proto::localharness::PolicyRule> {
 
 fn build_policy_config(policy_set: &PolicySet) -> proto::localharness::PolicyConfig {
     let rules = policy_set.iter().filter_map(rule_to_proto).collect();
-    proto::localharness::PolicyConfig { rules }
+    proto::localharness::PolicyConfig {
+        rules,
+        workspace_containment: 0,
+    }
 }
 
 fn to_proto_retry_config(retry: &crate::config::RetryConfig) -> proto::localharness::RetryConfig {
@@ -674,7 +764,11 @@ fn to_proto_retry_config(retry: &crate::config::RetryConfig) -> proto::localharn
 
     proto::localharness::RetryConfig {
         api_retry,
-        model_output_retry: None,
+        model_output_retry: retry.model_output_retry.as_ref().map(|r| {
+            proto::localharness::ModelOutputRetryConfig {
+                max_retries: r.max_retries.unwrap_or(3),
+            }
+        }),
     }
 }
 
@@ -686,7 +780,8 @@ mod tests {
     use crate::{
         config::{
             AgentConfig, BuiltinTools, CapabilitiesConfig, McpServer, McpStdioServer,
-            McpStreamableHttpServer, ModelAPIRetryConfig, RetryConfig, SystemInstructions,
+            McpStreamableHttpServer, ModelAPIRetryConfig, ModelOutputRetryConfig, RetryConfig,
+            SystemInstructions,
         },
         policies::{PolicyRule, PolicySet},
     };
@@ -783,6 +878,9 @@ mod tests {
                 exponential_multiplier: Some(1.5),
                 jitter_range: Some(0.2),
             }),
+            model_output_retry: Some(ModelOutputRetryConfig {
+                max_retries: Some(2),
+            }),
         };
 
         let proto = to_proto_retry_config(&retry);
@@ -791,6 +889,8 @@ mod tests {
         assert_eq!(api.initial_sleep_duration_ms, 500);
         assert!((api.exponential_multiplier - 1.5).abs() < f64::EPSILON);
         assert!((api.jitter_range - 0.2).abs() < f64::EPSILON);
+        let output = proto.model_output_retry.expect("model_output_retry");
+        assert_eq!(output.max_retries, 2);
     }
 
     #[test]
@@ -811,5 +911,69 @@ mod tests {
             proto_templated.r#type,
             Some(proto::localharness::system_instructions::Type::Appended(_))
         ));
+    }
+
+    #[test]
+    fn test_v017_minimal_behavior_and_lightweight_config() {
+        use crate::config::capabilities::AgentBehavior;
+
+        let minimal_tools = BuiltinTools::minimal();
+        assert_eq!(
+            minimal_tools,
+            [
+                BuiltinTools::RunCommand,
+                BuiltinTools::ViewFile,
+                BuiltinTools::CreateFile,
+                BuiltinTools::EditFile,
+                BuiltinTools::ListDir,
+                BuiltinTools::SearchDir,
+            ]
+        );
+        assert_eq!(BuiltinTools::default_tools().len(), 12);
+
+        let caps = CapabilitiesConfig::minimal();
+        assert_eq!(caps.agent_behavior, AgentBehavior::Minimal);
+        assert!(!caps.enable_subagents);
+        assert_eq!(caps.enabled_tools.as_deref(), Some(minimal_tools));
+
+        let cfg = AgentConfig::default().lightweight();
+        let policies = PolicySet::new();
+        let harness = build_harness_config(&cfg, None, None, &policies);
+        assert_eq!(
+            harness.agent_behavior,
+            proto::localharness::AgentBehavior::Minimal as i32
+        );
+        let side_tools = harness.harness_side_tools.expect("harness_side_tools");
+        assert!(!side_tools.subagents.unwrap().enabled);
+        assert!(!side_tools.find.unwrap().enabled);
+        assert!(side_tools.grep_search.unwrap().enabled);
+        assert!(side_tools.view_file.unwrap().enabled);
+        assert!(side_tools.run_command.unwrap().enabled);
+        assert!(!side_tools.generate_image.unwrap().enabled);
+        assert!(!side_tools.search_web.unwrap().enabled);
+        assert!(side_tools.manage_task.unwrap().enabled);
+        assert!(side_tools.schedule.unwrap().enabled);
+
+        // When RunCommand is disabled (e.g. read_only), manage_task & schedule are disabled
+        let ro_cfg = AgentConfig {
+            capabilities: Some(CapabilitiesConfig::read_only()),
+            ..AgentConfig::default()
+        };
+        let ro_harness = build_harness_config(&ro_cfg, None, None, &policies);
+        let ro_tools = ro_harness
+            .harness_side_tools
+            .expect("ro harness_side_tools");
+        assert!(!ro_tools.manage_task.unwrap().enabled);
+        assert!(!ro_tools.schedule.unwrap().enabled);
+    }
+
+    #[test]
+    fn test_v017_benchmark_retry_config() {
+        let bench = RetryConfig::benchmark();
+        let proto = to_proto_retry_config(&bench);
+        let api = proto.api_retry.expect("api_retry");
+        assert_eq!(api.max_retries, u32::MAX);
+        assert_eq!(api.initial_sleep_duration_ms, 1000);
+        assert!(proto.model_output_retry.is_none());
     }
 }

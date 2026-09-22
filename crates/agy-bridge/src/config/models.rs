@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{DEFAULT_IMAGE_GENERATION_MODEL, DEFAULT_MODEL};
+pub use crate::types::ServiceTier;
 
 /// Controls the depth of extended thinking for models that support it.
 ///

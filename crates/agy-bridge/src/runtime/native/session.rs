@@ -40,12 +40,15 @@ pub(crate) struct NativeAgentSession {
     pub(crate) connected: Arc<AtomicBool>,
     /// Storage directory associated with this session's localharness process.
     pub(crate) save_dir: PathBuf,
+    /// OS command sandbox status reported by the harness.
+    pub(crate) sandbox_status: Option<crate::types::SandboxStatus>,
 }
 
 impl NativeAgentSession {
     pub(crate) fn new(
         event_tx: mpsc::Sender<proto::localharness::InputEvent>,
         initial_usage: UsageMetadata,
+        initial_sandbox_status: Option<crate::types::SandboxStatus>,
         save_dir: PathBuf,
     ) -> Self {
         Self {
@@ -65,6 +68,7 @@ impl NativeAgentSession {
             turn_activity: Arc::new(AtomicBool::new(false)),
             connected: Arc::new(AtomicBool::new(true)),
             save_dir,
+            sandbox_status: initial_sandbox_status,
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "agy-bridge"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 rust-version = "1.95"
 description = "Async Rust bridge and native runtime for the Google Antigravity SDK"
@@ -42,6 +42,9 @@ pbjson = { workspace = true, optional = true }
 pbjson-types = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 
+# template support
+md-tmpl = { workspace = true, optional = true }
+
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
 protoc-bin-vendored = { workspace = true, optional = true }
@@ -75,7 +78,7 @@ native = [
   "dep:ureq",
   "dep:zip",
 ]
-md-tmpl = ["llm-tool/md-tmpl"]
+md-tmpl = ["dep:md-tmpl", "llm-tool/md-tmpl"]
 
 [[example]]
 name = "getting_started_hello_world"

@@ -86,7 +86,14 @@ pub(super) async fn initialize_harness(
     config: &AgentConfig,
     hook_runner: Option<&Arc<Hooks>>,
     policies: &PolicySet,
-) -> Result<(Option<String>, UsageMetadata), Error> {
+) -> Result<
+    (
+        Option<String>,
+        UsageMetadata,
+        Option<crate::types::SandboxStatus>,
+    ),
+    Error,
+> {
     let harness_config = build_harness_config(config, None, hook_runner, policies);
     let init_event = proto::localharness::InitializeConversationEvent {
         config: Some(harness_config),
@@ -122,6 +129,7 @@ pub(super) async fn initialize_harness(
 
     let mut initial_cascade_id = None;
     let mut initial_usage = UsageMetadata::default();
+    let mut initial_sandbox_status = None;
 
     if let Some(proto::localharness::output_event::Event::InitializeConversationResponse(
         ref resp,
@@ -133,9 +141,19 @@ pub(super) async fn initialize_harness(
         if let Some(ref u) = resp.cumulative_usage {
             initial_usage = to_usage_metadata(u);
         }
+        if let Some(ref s) = resp.sandbox_status {
+            initial_sandbox_status = Some(crate::types::SandboxStatus {
+                available: s.available,
+                unavailable_reason: if s.unavailable_reason.is_empty() {
+                    None
+                } else {
+                    Some(s.unavailable_reason.clone())
+                },
+            });
+        }
     }
 
-    Ok((initial_cascade_id, initial_usage))
+    Ok((initial_cascade_id, initial_usage, initial_sandbox_status))
 }
 
 fn spawn_ws_sink_task(

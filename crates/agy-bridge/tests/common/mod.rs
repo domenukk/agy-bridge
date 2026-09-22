@@ -225,7 +225,9 @@ where
     // deliberately sets it. A *missing* GEMINI_API_KEY is NOT a skip reason —
     // `api_key()` panics in that case, surfacing as a hard test failure rather
     // than a silent no-op pass.
-    if std::env::var("AGY_BRIDGE_SKIP_LIVE_TESTS").is_ok() {
+    if std::env::var("AGY_BRIDGE_SKIP_LIVE_TESTS")
+        .is_ok_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+    {
         eprintln!("[SKIP] '{test_name}' skipped (AGY_BRIDGE_SKIP_LIVE_TESTS is set)");
         return;
     }

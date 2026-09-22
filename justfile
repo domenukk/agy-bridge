@@ -27,6 +27,8 @@
 # NOTE: even `test-offline` needs network access on a cold build — the crate's
 # build.rs downloads the `localharness` wheel from PyPI for the native backend.
 
+set windows-shell := ["bash.exe", "--norc", "-cu"]
+
 # Default recipe: format, lint, and test
 default: fmt lint test
 
@@ -37,7 +39,7 @@ fmt: fmt-rust fmt-toml fmt-markdown fmt-python fmt-just
 
 # Format Rust code (nightly required for latest style rules)
 fmt-rust:
-    cargo +nightly fmt
+    if cargo +nightly fmt --version >/dev/null 2>&1; then cargo +nightly fmt; else cargo fmt; fi
 
 # Format TOML files
 fmt-toml:
@@ -45,7 +47,7 @@ fmt-toml:
 
 # Format Markdown files with prettier
 fmt-markdown:
-    npx -y prettier@latest --write '**/*.md'
+    if command -v npx >/dev/null 2>&1; then npx -y prettier@latest --write '**/*.md'; fi
 
 # Format Python files with black
 fmt-python:
@@ -68,7 +70,7 @@ lint-rust:
 
 # Lint Rust formatting
 lint-rust-fmt:
-    cargo +nightly fmt --check
+    if cargo +nightly fmt --version >/dev/null 2>&1; then cargo +nightly fmt --check; else cargo fmt --check; fi
 
 # Lint TOML files
 lint-toml:
@@ -76,7 +78,7 @@ lint-toml:
 
 # Lint Markdown files
 lint-markdown:
-    npx -y markdownlint-cli2@latest '**/*.md'
+    if command -v npx >/dev/null 2>&1; then npx -y markdownlint-cli2@latest '**/*.md'; fi
 
 # Lint the justfile (check formatting)
 lint-just:
@@ -84,12 +86,12 @@ lint-just:
 
 # Lint code hygiene (suppression patterns, structural issues)
 lint-hygiene:
-    uv run python3 scripts/lint_hygiene.py
+    uv run python scripts/lint_hygiene.py
 
 # ── Test ──────────────────────────────────────────────────────────────
 
-# Run all tests (Rust python backend + native backend + default features + Python)
-test: test-rust test-native test-default test-python
+# Run all tests (Rust python backend + native backend + default features + md-tmpl + Python)
+test: test-rust test-native test-default test-md-tmpl test-python
 
 # Run Rust tests for python backend
 test-rust:
@@ -104,9 +106,15 @@ test-native:
 # This is the feature set downstream users get, and it is the only recipe that
 # also builds/executes the doctests in README.md (which is included as crate
 # rustdoc). `test-native` deliberately does not cover it: it pins `-p
+
 # agy-bridge --no-default-features`.
 test-default:
     cargo test --workspace
+
+# Run tests and example tests for the md-tmpl feature
+test-md-tmpl:
+    cargo test -p agy-bridge --features md-tmpl --test md_tmpl_test
+    cargo test -p agy-bridge --features md-tmpl --example getting_started_template_tools
 
 # Run Python tests for the embedded agent_init helpers
 test-python:
@@ -115,9 +123,10 @@ test-python:
 # Run the full suite offline: no API key, no calls to the real Gemini API.
 #
 # Every live test short-circuits on AGY_BRIDGE_SKIP_LIVE_TESTS; the mock-server
+
 # tests run for real against local TCP listeners.
 test-offline:
-    AGY_BRIDGE_SKIP_LIVE_TESTS=1 {{ just_executable() }} test
+    AGY_BRIDGE_SKIP_LIVE_TESTS=1 "{{ just_executable() }}" test
 
 # Run tests with the bridge's tracing logs enabled, teeing everything to a
 # timestamped file under test-logs/ so failures can be diagnosed after the fact.

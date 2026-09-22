@@ -45,10 +45,11 @@ pub mod types;
 // without diving into sub-modules.
 
 pub use config::{
-    AgentBehavior, AgentConfig, BudgetConfig, BuiltinTools, CapabilitiesConfig, GeminiConfig,
-    LocalAgentConfig, McpConfigError, McpConfigFile, McpServer, McpServerSpec, McpSseServer,
-    McpStdioServer, McpStreamableHttpServer, RunCommandConfig, SessionContinuationMode,
-    SubagentCapabilities, SubagentConfig, SystemInstructions,
+    AgentBehavior, AgentConfig, BudgetConfig, BudgetScope, BuiltinTools, CapabilitiesConfig,
+    CompactionConfig, GeminiConfig, LocalAgentConfig, McpConfigError, McpConfigFile, McpServer,
+    McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer, RunCommandConfig,
+    SessionContinuationMode, SubagentCapabilities, SubagentConfig, SystemInstructions,
+    ToolOutputTruncationConfig,
 };
 pub use content::{Audio, Content, ContentPrimitive, Document, Image, Video};
 pub use error::Error;
@@ -59,18 +60,20 @@ pub use hooks::{
 /// Re-export the `#[llm_tool]`, `#[llm_prompt]`, and `#[llm_resource]` proc-macros
 /// so users only need `agy_bridge` in their dependency list.
 pub use llm_tool_macros::{llm_prompt, llm_resource, llm_tool};
+#[cfg(feature = "md-tmpl")]
+pub use md_tmpl;
 pub use policies::{AskUserHandler, PolicyDecision, PolicyRule, PolicySet};
 pub use runtime::{BackendLogLevel, RuntimeConfig};
 pub use streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk};
 pub use tools::{
     AvailableTool, PromptDefinition, PromptRegistry, ResourceDefinition, ResourceRegistry,
-    RustPrompt, RustResource, RustTool, SharedState, ToolContext, ToolDefinition, ToolError,
-    ToolOutput, ToolRegistry, ToolSource,
+    RustPrompt, RustResource, RustTool, SharedState, ToolContext, ToolDefinition, ToolEffect,
+    ToolError, ToolOutput, ToolRegistry, ToolSource,
 };
 pub use triggers::{TriggerConfig, TriggerEntry};
 pub use types::{
-    ConversationMessage, MessageRole, Modality, ModalityTokenCount, ServiceTier, Step, StopReason,
-    UsageMetadata,
+    ConversationMessage, MessageRole, Modality, ModalityTokenCount, SandboxStatus, ServiceTier,
+    Step, StopReason, UsageMetadata,
 };
 
 /// Convenience prelude — pull in everything you need with a single glob import.
@@ -83,14 +86,17 @@ pub use types::{
 /// crate so you can get started quickly without hunting for individual paths.
 pub mod prelude {
     pub use llm_tool_macros::{llm_prompt, llm_resource, llm_tool};
+    #[cfg(feature = "md-tmpl")]
+    pub use md_tmpl;
 
     pub use crate::{
         Agent, AgyBridge,
         config::{
-            AgentBehavior, AgentConfig, BudgetConfig, BuiltinTools, CapabilitiesConfig,
-            GeminiConfig, LocalAgentConfig, McpConfigError, McpConfigFile, McpServer,
-            McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer, RunCommandConfig,
-            SessionContinuationMode, SubagentCapabilities, SubagentConfig, SystemInstructions,
+            AgentBehavior, AgentConfig, BudgetConfig, BudgetScope, BuiltinTools,
+            CapabilitiesConfig, CompactionConfig, GeminiConfig, LocalAgentConfig, McpConfigError,
+            McpConfigFile, McpServer, McpServerSpec, McpSseServer, McpStdioServer,
+            McpStreamableHttpServer, RunCommandConfig, SessionContinuationMode,
+            SubagentCapabilities, SubagentConfig, SystemInstructions, ToolOutputTruncationConfig,
         },
         content::{Audio, Content, ContentPrimitive, Document, Image, Video},
         error::Error,
@@ -99,13 +105,13 @@ pub mod prelude {
         runtime::BackendLogLevel,
         streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk},
         tools::{
-            AvailableTool, RustTool, ToolContext, ToolDefinition, ToolError, ToolOutput,
-            ToolRegistry, ToolSource,
+            AvailableTool, RustTool, ToolContext, ToolDefinition, ToolEffect, ToolError,
+            ToolOutput, ToolRegistry, ToolSource,
         },
         triggers::{TriggerConfig, TriggerEntry},
         types::{
-            ConversationMessage, MessageRole, Modality, ModalityTokenCount, ServiceTier, Step,
-            StopReason, UsageMetadata,
+            ConversationMessage, MessageRole, Modality, ModalityTokenCount, SandboxStatus,
+            ServiceTier, Step, StopReason, UsageMetadata,
         },
     };
 }

@@ -48,15 +48,28 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
     let minor: u32 = version_info.getattr("minor")?.extract()?;
     let py_version = format!("{major}.{minor}");
 
-    // Set ANTIGRAVITY_HARNESS_PATH if the binary exists.
-    let harness_path = venv
+    let unix_site_packages = venv
         .join("lib")
         .join(format!("python{py_version}"))
-        .join("site-packages")
+        .join("site-packages");
+    let win_site_packages = venv.join("Lib").join("site-packages");
+    let site_packages = if unix_site_packages.is_dir() {
+        unix_site_packages
+    } else {
+        win_site_packages
+    };
+
+    #[cfg(windows)]
+    let harness_bin = "localharness.exe";
+    #[cfg(not(windows))]
+    let harness_bin = "localharness";
+
+    // Set ANTIGRAVITY_HARNESS_PATH if the binary exists.
+    let harness_path = site_packages
         .join("google")
         .join("antigravity")
         .join("bin")
-        .join("localharness");
+        .join(harness_bin);
 
     if harness_path.is_file() {
         environ.set_item(
@@ -70,11 +83,6 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
     // sys.path.insert(), addsitedir() processes .pth files — which is
     // required for editable (pip install -e) packages that rely on
     // dynamic finder hooks installed via .pth import statements.
-    let site_packages = venv
-        .join("lib")
-        .join(format!("python{py_version}"))
-        .join("site-packages");
-
     if site_packages.is_dir() {
         let sp_str = site_packages.to_string_lossy().to_string();
         let site_mod = py.import("site")?;
