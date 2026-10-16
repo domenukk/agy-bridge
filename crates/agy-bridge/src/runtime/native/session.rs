@@ -44,21 +44,31 @@ pub(crate) struct NativeAgentSession {
     pub(crate) sandbox_status: Option<crate::types::SandboxStatus>,
 }
 
+/// Initial state returned by `initialize_harness` when starting or resuming a conversation.
+pub(crate) struct InitialHarnessState {
+    pub(crate) cascade_id: Option<String>,
+    pub(crate) usage: UsageMetadata,
+    pub(crate) sandbox_status: Option<crate::types::SandboxStatus>,
+    pub(crate) history: Vec<ConversationMessage>,
+    pub(crate) last_response_text: Option<String>,
+    pub(crate) compaction_indices: Vec<u32>,
+    pub(crate) turn_count: u32,
+}
+
 impl NativeAgentSession {
     pub(crate) fn new(
         event_tx: mpsc::Sender<proto::localharness::InputEvent>,
-        initial_usage: UsageMetadata,
-        initial_sandbox_status: Option<crate::types::SandboxStatus>,
+        init: InitialHarnessState,
         save_dir: PathBuf,
     ) -> Self {
         Self {
             event_tx,
-            history: Arc::new(Mutex::new(Vec::new())),
-            total_usage: Arc::new(Mutex::new(initial_usage)),
+            history: Arc::new(Mutex::new(init.history)),
+            total_usage: Arc::new(Mutex::new(init.usage)),
             last_turn_usage: Arc::new(Mutex::new(UsageMetadata::default())),
-            last_response_text: Arc::new(Mutex::new(None)),
-            compaction_indices: Arc::new(Mutex::new(Vec::new())),
-            turn_count: Arc::new(AtomicU32::new(0)),
+            last_response_text: Arc::new(Mutex::new(init.last_response_text)),
+            compaction_indices: Arc::new(Mutex::new(init.compaction_indices)),
+            turn_count: Arc::new(AtomicU32::new(init.turn_count)),
             is_idle: Arc::new(AtomicBool::new(true)),
             idle_notify: Arc::new(Notify::new()),
             wakeup_notify: Arc::new(Notify::new()),
@@ -68,7 +78,7 @@ impl NativeAgentSession {
             turn_activity: Arc::new(AtomicBool::new(false)),
             connected: Arc::new(AtomicBool::new(true)),
             save_dir,
-            sandbox_status: initial_sandbox_status,
+            sandbox_status: init.sandbox_status,
         }
     }
 }

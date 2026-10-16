@@ -72,7 +72,7 @@ pub(crate) struct AgentBridgeState {
     /// metadata cannot round-trip through Python.
     ///
     /// Cleared on the next successful dispatch to avoid surfacing a stale error.
-    pub(crate) last_tool_error: std::sync::Mutex<Option<serde_json::Value>>,
+    pub(crate) last_tool_error: std::sync::Mutex<Option<CapturedToolError>>,
     /// Cached `(tool_args, metadata)` from the most recent successful custom
     /// tool call on this agent.
     ///
@@ -148,6 +148,41 @@ fn with_last_tool_output_slot(
     }
 }
 
+/// Structured snapshot of the most recent failed custom tool dispatch.
+///
+/// Captured on the dispatch error path so the `on_tool_error` hook can
+/// receive the same arguments and structured metadata as `post_tool_call`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedToolError {
+    /// Arguments the failing tool was invoked with (`Null` when unknown).
+    pub(crate) tool_args: serde_json::Value,
+    /// Structured [`ToolError`](llm_tool::ToolError) metadata, or `None` when
+    /// the error carried no metadata.
+    pub(crate) metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Wire shape of a serialized [`ToolError`](llm_tool::ToolError); `metadata`
+/// is private on `ToolError` and only reachable through its serde form.
+#[derive(serde::Deserialize)]
+struct ToolErrorWire {
+    #[serde(default)]
+    metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CapturedToolError {
+    /// Capture `error` (and the arguments that produced it).
+    pub(crate) fn from_tool_error(
+        tool_args: serde_json::Value,
+        error: &llm_tool::ToolError,
+    ) -> Result<Self, serde_json::Error> {
+        let wire: ToolErrorWire = serde_json::from_value(serde_json::to_value(error)?)?;
+        Ok(Self {
+            tool_args,
+            metadata: (!wire.metadata.is_empty()).then_some(wire.metadata),
+        })
+    }
+}
+
 /// Serialize a [`ToolError`](llm_tool::ToolError) and cache it in the agent's
 /// [`last_tool_error`](AgentBridgeState::last_tool_error) slot.
 ///
@@ -155,9 +190,13 @@ fn with_last_tool_output_slot(
 /// serialize the error are logged (never silently swallowed) rather than
 /// propagated, since the caller is about to raise the model-facing `PyErr`
 /// regardless and losing metadata must not mask the original tool failure.
-pub(crate) fn record_last_tool_error(agent_id: u64, error: &llm_tool::ToolError) {
-    let value = match serde_json::to_value(error) {
-        Ok(value) => value,
+pub(crate) fn record_last_tool_error(
+    agent_id: u64,
+    tool_args: serde_json::Value,
+    error: &llm_tool::ToolError,
+) {
+    let captured = match CapturedToolError::from_tool_error(tool_args, error) {
+        Ok(captured) => captured,
         Err(e) => {
             tracing::error!(
                 agent_id,
@@ -168,7 +207,7 @@ pub(crate) fn record_last_tool_error(agent_id: u64, error: &llm_tool::ToolError)
             return;
         }
     };
-    with_last_tool_error_slot(agent_id, "record", |slot| *slot = Some(value));
+    with_last_tool_error_slot(agent_id, "record", |slot| *slot = Some(captured));
 }
 
 /// Clear the agent's cached [`last_tool_error`](AgentBridgeState::last_tool_error),
@@ -179,7 +218,7 @@ pub(crate) fn clear_last_tool_error(agent_id: u64) {
 
 /// Remove and return the agent's cached
 /// [`last_tool_error`](AgentBridgeState::last_tool_error), if present.
-pub(crate) fn take_last_tool_error(agent_id: u64) -> Option<serde_json::Value> {
+pub(crate) fn take_last_tool_error(agent_id: u64) -> Option<CapturedToolError> {
     let mut taken = None;
     with_last_tool_error_slot(agent_id, "take", |slot| taken = slot.take());
     taken
@@ -191,7 +230,7 @@ pub(crate) fn take_last_tool_error(agent_id: u64) -> Option<serde_json::Value> {
 fn with_last_tool_error_slot(
     agent_id: u64,
     op: &str,
-    f: impl FnOnce(&mut Option<serde_json::Value>),
+    f: impl FnOnce(&mut Option<CapturedToolError>),
 ) {
     let map = match bridge_state().read() {
         Ok(map) => map,

@@ -1,9 +1,67 @@
-//! Custom subagent definitions and capabilities.
+//! Custom subagent definitions, capabilities, and inline skill configurations.
+
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::{AgentBehavior, BuiltinTools, SystemInstructions, capabilities::RunCommandConfig};
+
+/// An inline skill definition provided directly in memory rather than loaded from disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TypedBuilder, Default)]
+#[builder(field_defaults(default))]
+pub struct InlineSkill {
+    /// Unique identifier for the skill.
+    #[builder(setter(into))]
+    pub name: String,
+    /// Concise summary of when and how the skill should be used.
+    #[builder(setter(into))]
+    pub description: String,
+    /// Full Markdown instruction body of the skill.
+    #[builder(setter(into))]
+    pub content: String,
+    /// Optional allowlist of tools the skill is permitted to invoke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(setter(transform = |v: impl IntoIterator<Item = impl Into<String>>| v.into_iter().map(Into::into).collect()))]
+    pub allowed_tools: Vec<String>,
+    /// Tools that must be enabled for this skill to function.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(setter(transform = |v: impl IntoIterator<Item = impl Into<String>>| v.into_iter().map(Into::into).collect()))]
+    pub dependent_tools: Vec<String>,
+    /// Other skills that this skill depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(setter(transform = |v: impl IntoIterator<Item = impl Into<String>>| v.into_iter().map(Into::into).collect()))]
+    pub dependent_skills: Vec<String>,
+    /// Arbitrary key-value metadata attached to the skill.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+}
+
+/// Controls how a custom subagent inherits or overrides parent skills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentSkillsConfig {
+    /// Inherit parent skills (optionally filtered by `skill_names`) and append `extra_skills_paths`.
+    Inherit {
+        /// Specific parent skill names to inherit (empty means inherit all).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skill_names: Vec<String>,
+        /// Additional skill directories to load for this subagent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_skills_paths: Vec<PathBuf>,
+    },
+    /// Disable all skills for this subagent.
+    None,
+    /// Replace parent skills with an explicit set of skill paths and/or inline skills.
+    Override {
+        /// Filesystem paths to skills for this subagent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skills_paths: Vec<PathBuf>,
+        /// Inline skills provided directly to this subagent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inline_skills: Vec<InlineSkill>,
+    },
+}
 
 /// Capabilities configuration specifically for a custom subagent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TypedBuilder, Default)]
@@ -55,6 +113,14 @@ pub struct SubagentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<String>>| v.into_iter().map(Into::into).collect()))]
     pub tools: Vec<String>,
+    /// Optional model name override for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(into, strip_option))]
+    pub model: Option<String>,
+    /// Optional skill inheritance or override rules for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub skills_config: Option<SubagentSkillsConfig>,
 }
 
 #[cfg(test)]

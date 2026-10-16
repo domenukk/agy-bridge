@@ -2,6 +2,7 @@ syntax = "proto3";
 package antigravity.localharness;
 
 import "content.proto";
+import "skill.proto";
 
 enum LifecycleHook {
   LIFECYCLE_HOOK_UNSPECIFIED = 0;
@@ -41,6 +42,12 @@ enum PolicyEvaluationOutcome {
   POLICY_EVALUATION_OUTCOME_ALLOW = 1;
   POLICY_EVALUATION_OUTCOME_DENY = 2;
   POLICY_EVALUATION_OUTCOME_NO_MATCH = 3;
+}
+
+enum ToolExecutionMode {
+  TOOL_EXECUTION_MODE_UNSPECIFIED = 0;
+  TOOL_EXECUTION_MODE_SYNC = 1;
+  TOOL_EXECUTION_MODE_ASYNC = 2;
 }
 
 message InputConfig {
@@ -92,6 +99,25 @@ message HarnessConfig {
   antigravity.localharness.AgentBehavior agent_behavior = 22;
   antigravity.localharness.BudgetConfig budget_config = 23;
   antigravity.localharness.CompactionConfig compaction_config = 24;
+  antigravity.localharness.SkillsConfig skills_config = 27;
+  antigravity.localharness.RulesConfig rules_config = 28;
+  int32 mcp_max_output_bytes = 29;
+}
+
+message RulesConfig {
+  repeated string filenames = 1;
+}
+
+message SkillSource {
+  oneof source {
+    genai.skills.Skill skill = 1;
+    string directory_path = 2;
+  }
+}
+
+message SkillsConfig {
+  bool enabled = 1;
+  repeated antigravity.localharness.SkillSource skills = 2;
 }
 
 message BudgetConfig {
@@ -112,17 +138,19 @@ message CompactionConfig {
   uint32 token_threshold = 1;
   uint32 checkpoint_interval_tokens = 2;
   uint32 max_context_tokens = 3;
+  string summary_prompt_override = 4;
+  optional bool use_model_reported_token_count = 5;
 }
 
 message ModelAPIRetryConfig {
-  uint32 max_retries = 1;
-  uint32 initial_sleep_duration_ms = 2;
-  double exponential_multiplier = 3;
-  double jitter_range = 4;
+  optional uint32 max_retries = 1;
+  optional uint32 initial_sleep_duration_ms = 2;
+  optional double exponential_multiplier = 3;
+  optional double jitter_range = 4;
 }
 
 message ModelOutputRetryConfig {
-  uint32 max_retries = 1;
+  optional uint32 max_retries = 1;
 }
 
 message RetryConfig {
@@ -143,6 +171,7 @@ message FilesystemWorkspace {
 message GeminiModelOptions {
   string thinking_level = 1;
   string service_tier = 2;
+  int32 max_output_tokens = 3;
 }
 
 message GeminiAPIEndpoint {
@@ -240,6 +269,11 @@ message HarnessSideTools {
   antigravity.localharness.ToolSearchConfig tool_search_config = 15;
   antigravity.localharness.ManageTaskToolConfig manage_task = 16;
   antigravity.localharness.ScheduleToolConfig schedule = 17;
+  antigravity.localharness.RunWorkflowToolConfig run_workflow = 20;
+}
+
+message RunWorkflowToolConfig {
+  bool enabled = 1;
 }
 
 message ManageTaskToolConfig {
@@ -259,11 +293,12 @@ message RunCommandToolConfig {
   uint32 max_timeout_ms = 2;
   bool enable_daemon_commands = 3;
   bool enable_sandbox = 4;
+  antigravity.localharness.ToolExecutionMode execution_mode = 5;
 }
 
 message SubagentsConfig {
   bool enabled = 1;
-  int32 max_nesting_depth = 2;
+  optional int32 max_nesting_depth = 2;
   repeated string allowed_subagents = 3;
 }
 
@@ -392,9 +427,22 @@ message StepUpdate {
   antigravity.localharness.ActionSearchWeb search_web = 34;
   antigravity.localharness.ActionReadUrlContent read_url_content = 35;
   antigravity.localharness.ActionCustomTool custom_tool = 36;
+  antigravity.localharness.ActionSkillLookup skill_lookup = 37;
+  antigravity.localharness.ActionRunWorkflow run_workflow = 38;
   string request_text = 50;
   antigravity.localharness.ToolConfirmationRequest tool_confirmation_request = 51;
   antigravity.localharness.UserQuestionsRequest questions_request = 52;
+}
+
+message ActionSkillLookup {
+  string skill_name = 1;
+}
+
+message ActionRunWorkflow {
+  string script_path = 1;
+  string script = 2;
+  string description = 3;
+  string output = 4;
 }
 
 message ActionGenerateImage {
@@ -561,6 +609,7 @@ message TrajectoryStateUpdate {
     STATE_FULLY_IDLE = 2;
     STATE_CANCELLED = 3;
     STATE_WAITING_FOR_TASKS = 4;
+    STATE_WAITING_FOR_SUBAGENTS = 5;
   }
   enum StopReason {
     STOP_REASON_UNSPECIFIED = 0;
@@ -576,6 +625,7 @@ message TrajectoryStateUpdate {
   int32 depth = 7;
   antigravity.localharness.TrajectoryStateUpdate.State state = 3;
   string error = 4;
+  uint32 error_code = 8;
   antigravity.localharness.TrajectoryStateUpdate.StopReason stop_reason = 5;
 }
 
@@ -672,6 +722,7 @@ message McpServerConfig {
   repeated string disabled_tools = 5;
   antigravity.localharness.McpServerConfig.AuthProviderType auth_provider_type = 6;
   int32 timeout_seconds = 7;
+  bool force_all_tools_eager = 10;
   oneof transport {
     antigravity.localharness.McpStdioTransport stdio = 2;
     antigravity.localharness.McpHttpTransport http = 3;
@@ -814,17 +865,21 @@ message PreTurnResult {
   string reason = 2;
 }
 
-message InheritConfig {}
-message NoneConfig {}
-message OverrideConfig {
-  repeated string skills_paths = 1;
-}
-
 message SubagentSkillsConfig {
+  message InheritConfig {
+    repeated string extra_skills_paths = 1;
+    repeated string skill_names = 2;
+  }
+  message NoneConfig {
+  }
+  message OverrideConfig {
+    repeated string skills_paths = 1;
+    repeated antigravity.localharness.SkillSource skill_sources = 2;
+  }
   oneof config {
-    antigravity.localharness.InheritConfig inherit_config = 1;
-    antigravity.localharness.NoneConfig none_config = 2;
-    antigravity.localharness.OverrideConfig override_config = 3;
+    antigravity.localharness.SubagentSkillsConfig.InheritConfig inherit_config = 1;
+    antigravity.localharness.SubagentSkillsConfig.NoneConfig none_config = 2;
+    antigravity.localharness.SubagentSkillsConfig.OverrideConfig override_config = 3;
   }
 }
 
@@ -836,11 +891,13 @@ message CustomAgent {
   repeated antigravity.localharness.Tool tools = 5;
   antigravity.localharness.SubagentSkillsConfig skills_config = 6;
   antigravity.localharness.AgentBehavior agent_behavior = 7;
+  antigravity.localharness.ModelConfig model = 10;
 }
 
 message ToolOutputTruncation {
   message TruncateStrategy {
     int32 max_tokens = 1;
+    bool save_full_output = 2;
   }
   message ErrorStrategy {
     int32 max_tokens = 1;
@@ -860,6 +917,11 @@ message PolicyConfig {
   }
   repeated antigravity.localharness.PolicyRule rules = 1;
   antigravity.localharness.PolicyConfig.WorkspaceContainment workspace_containment = 2;
+  antigravity.localharness.AutoPolicyConfig auto_config = 3;
+}
+
+message AutoPolicyConfig {
+  string prompt = 1;
 }
 
 message PolicyRule {
@@ -876,6 +938,7 @@ message PolicyDecisionRequest {
   string request_id = 1;
   string rule_id = 2;
   antigravity.localharness.PreToolArgs tool_args = 3;
+  string reason = 4;
 }
 
 message PolicyDecisionResponse {

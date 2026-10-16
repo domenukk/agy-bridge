@@ -16,7 +16,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "..", "src", "runtime", "py")
 )
 
-import agent_init  # noqa: E402
+import agent_init
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -777,3 +777,239 @@ def test_wire_compaction_budget_retry_and_instructions():
     assert cfg["retry_config"].model_output_retry.max_retries == 5
     assert isinstance(cfg["system_instructions"], types.CustomSystemInstructions)
     assert cfg["system_instructions"].text == "Be concise and accurate."
+
+
+def test_v0122_inline_skills_subagent_skills_and_max_output_tokens():
+    types = _ensure_antigravity_types_module()
+    if not hasattr(types, "InlineSkill"):
+        return
+
+    cfg = {
+        "gemini_config": {
+            "api_key": "top-key",
+            "models": {
+                "default": {
+                    "name": "gemini-2.5-pro",
+                    "generation": {
+                        "thinking_level": "HIGH",
+                        "max_output_tokens": 32768,
+                    },
+                },
+            },
+        },
+        "capabilities": {
+            "enabled_tools": ["invoke_subagent", "run_workflow", "schedule"],
+            "mcp_max_output_bytes": 65536,
+            "tool_output_truncation_config": {
+                "max_tokens": 8192,
+                "save_full_output": True,
+            },
+        },
+        "inline_skills": [
+            {
+                "name": "triage",
+                "description": "Triage crash",
+                "content": "# Triage\nCheck registers.",
+                "allowed_tools": ["view_file"],
+                "dependent_tools": ["view_file"],
+                "dependent_skills": [],
+                "metadata": {"team": "sec"},
+            }
+        ],
+        "subagents": [
+            {
+                "name": "auditor",
+                "description": "Audits code",
+                "model": "gemini-2.5-flash",
+                "skills_config": {
+                    "override": {
+                        "skills_paths": ["/tmp/skills"],
+                        "inline_skills": [
+                            {
+                                "name": "sub_skill",
+                                "description": "Subagent skill",
+                                "content": "# Sub",
+                            }
+                        ],
+                    }
+                },
+            }
+        ],
+    }
+
+    agent_init._wire_capabilities(cfg)
+    agent_init._wire_inline_skills(cfg)
+    agent_init._wire_subagents(cfg)
+    agent_init._munge_config_model(cfg, custom_base_url="http://127.0.0.1:8643")
+
+    assert cfg["capabilities"].mcp_max_output_bytes == 65536
+    assert cfg["capabilities"].enabled_tools == [
+        types.BuiltinTools.INVOKE_SUBAGENT,
+        types.BuiltinTools.RUN_WORKFLOW,
+        types.BuiltinTools.SCHEDULE,
+    ]
+    assert len(cfg["inline_skills"]) == 1
+    assert isinstance(cfg["inline_skills"][0], types.InlineSkill)
+    assert cfg["inline_skills"][0].name == "triage"
+
+    sub = cfg["subagents"][0]
+    assert isinstance(sub, types.SubagentConfig)
+    assert sub.model == "gemini-2.5-flash"
+    ovr = getattr(sub.skills_config, "override_config", sub.skills_config)
+    assert isinstance(ovr, types.SubagentOverrideSkillsConfig)
+    assert ovr.skills_paths == ["/tmp/skills"]
+    assert len(ovr.inline_skills) == 1
+    assert ovr.inline_skills[0].name == "sub_skill"
+
+    model_target = cfg["model"]
+    assert isinstance(model_target, types.ModelTarget)
+    assert model_target.endpoint.options.max_output_tokens == 32768
+
+
+# ── Subagent override inline skills (python backend parity) ────────────────
+
+
+class _FakeModel:
+    """Minimal pydantic-like model supporting ``model_copy(update=...)``."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    def model_copy(self, update):
+        return _FakeModel(**{**self.__dict__, **update})
+
+
+class _FakeSkillProto:
+    def __init__(self):
+        self.allowed_tools = []
+        self.metadata = {}
+
+
+class _FakeSkillSource:
+    def __init__(self):
+        self.skill = _FakeSkillProto()
+
+
+class _FakeRepeated(list):
+    def add(self):
+        entry = _FakeSkillSource()
+        self.append(entry)
+        return entry
+
+
+def _fake_original(seen):
+    def original(strategy, skills_config):
+        seen.append(skills_config)
+        override = _FakeModel(skill_sources=_FakeRepeated())
+        return _FakeModel(override_config=override)
+
+    return original
+
+
+def test_subagent_override_inline_skills_are_encoded_as_skill_sources():
+    skill = _FakeModel(
+        name="triage_skill",
+        description="Triage crash dumps",
+        content="# Triage",
+        allowed_tools=["view_file"],
+        dependent_tools=["grep_search"],
+        dependent_skills=[],
+        metadata={"visibility": "hidden"},
+    )
+    override = _FakeModel(skills_paths=[], inline_skills=[skill])
+    seen = []
+    proto = agent_init._subagent_skills_proto_with_inline(
+        _fake_original(seen), object(), _FakeModel(override_config=override)
+    )
+    # The SDK builder never sees inline skills (it would raise ValueError).
+    assert seen[0].override_config.inline_skills == []
+    (source,) = proto.override_config.skill_sources
+    assert source.skill.name == "triage_skill"
+    assert source.skill.description == "Triage crash dumps"
+    assert source.skill.content == "# Triage"
+    assert source.skill.allowed_tools == ["view_file"]
+    assert source.skill.metadata == {
+        "visibility": "hidden",
+        "dependent_tools": json.dumps(["grep_search"]),
+    }
+
+
+def test_subagent_skills_without_inline_skills_delegate_unchanged():
+    sentinel = object()
+    override = _FakeModel(skills_paths=["/skills"], inline_skills=[])
+    config = _FakeModel(override_config=override)
+    proto = agent_init._subagent_skills_proto_with_inline(
+        lambda strategy, cfg: (sentinel, cfg), object(), config
+    )
+    assert proto == (sentinel, config)
+    inherit = _FakeModel(override_config=None)
+    assert agent_init._subagent_skills_proto_with_inline(
+        lambda strategy, cfg: (sentinel, cfg), object(), inherit
+    ) == (sentinel, inherit)
+
+
+# ── initial_history seeding (python backend parity) ────────────────────────
+
+
+class _FakeEnum:
+    def __init__(self, **members):
+        self.__dict__.update(members)
+
+
+class _FakeStep:
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+_FAKE_TYPES = _FakeEnum(
+    StepType=_FakeEnum(TEXT_RESPONSE="TEXT_RESPONSE", SYSTEM_MESSAGE="SYSTEM_MESSAGE"),
+    StepSource=_FakeEnum(USER="USER", MODEL="MODEL", SYSTEM="SYSTEM"),
+    StepTarget=_FakeEnum(USER="TARGET_USER", ENVIRONMENT="TARGET_ENVIRONMENT"),
+    StepStatus=_FakeEnum(DONE="DONE"),
+    Step=_FakeStep,
+)
+
+
+class _FakeConversation:
+    def __init__(self, steps=None):
+        self._steps = list(steps or [])
+        self._turn_start_indices = []
+
+
+def test_seed_conversation_history_matches_native_turn_accounting():
+    conv = _FakeConversation()
+    agent_init._seed_conversation_history(
+        conv,
+        [
+            {"role": "user", "content": "prior question"},
+            {"role": "model", "content": "prior answer"},
+        ],
+        _FAKE_TYPES,
+    )
+    assert [s.source for s in conv._steps] == ["USER", "MODEL"]
+    assert [s.content for s in conv._steps] == ["prior question", "prior answer"]
+    assert conv._turn_start_indices == [0]
+    assert conv._steps[1].is_complete_response is True
+    assert conv._steps[0].is_complete_response is False
+
+
+def test_seed_conversation_history_leaves_resumed_conversation_untouched():
+    existing = _FakeStep(source="USER", content="replayed")
+    conv = _FakeConversation([existing])
+    agent_init._seed_conversation_history(
+        conv, [{"role": "user", "content": "ignored"}], _FAKE_TYPES
+    )
+    assert conv._steps == [existing]
+    assert conv._turn_start_indices == []
+
+
+def test_seed_conversation_history_rejects_unknown_role():
+    conv = _FakeConversation()
+    try:
+        agent_init._seed_conversation_history(
+            conv, [{"role": "tool", "content": "x"}], _FAKE_TYPES
+        )
+    except ValueError as err:
+        assert "tool" in str(err)
+    else:
+        raise AssertionError("unknown role must fail loudly")

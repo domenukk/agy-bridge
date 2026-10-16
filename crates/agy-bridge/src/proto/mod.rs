@@ -15,6 +15,11 @@ pub mod google {
 pub mod genai {
     include!(concat!(env!("OUT_DIR"), "/genai.rs"));
     include!(concat!(env!("OUT_DIR"), "/genai.serde.rs"));
+
+    pub mod skills {
+        include!(concat!(env!("OUT_DIR"), "/genai.skills.rs"));
+        include!(concat!(env!("OUT_DIR"), "/genai.skills.serde.rs"));
+    }
 }
 
 #[cfg(feature = "native")]
@@ -32,6 +37,8 @@ pub mod antigravity {
 
 #[cfg(feature = "native")]
 pub use antigravity::localharness;
+#[cfg(feature = "native")]
+pub use genai::skills as skill;
 
 #[cfg(test)]
 #[cfg(feature = "native")]

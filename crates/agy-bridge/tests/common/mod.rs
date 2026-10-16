@@ -18,11 +18,11 @@ use fast_rands::Rand;
 pub fn api_key() -> String {
     use agy_bridge::config::{ENV_GEMINI_API_BASE_URL, ENV_GEMINI_API_KEY, PROXY_AUTH_SENTINEL};
 
-    // NOLINT: env var not set is expected — falls through to .env file below
-    if let Ok(key) = std::env::var(ENV_GEMINI_API_KEY)
-        && !key.is_empty()
-    {
-        return key.trim_matches('"').to_string();
+    if let Some(os_key) = std::env::var_os(ENV_GEMINI_API_KEY) {
+        let key = os_key.to_string_lossy();
+        if !key.is_empty() {
+            return key.trim_matches('"').to_string();
+        }
     }
     // Try loading from .env
     let env_map = agy_bridge::load_dotenv();
@@ -33,13 +33,17 @@ pub fn api_key() -> String {
     }
     // When running in proxy mode (via GEMINI_API_BASE_URL),
     // the proxy handles authentication via proxy credentials.
-    if std::env::var(ENV_GEMINI_API_BASE_URL).is_ok()
+    if std::env::var_os(ENV_GEMINI_API_BASE_URL).is_some()
         || env_map.contains_key(ENV_GEMINI_API_BASE_URL)
     {
         return PROXY_AUTH_SENTINEL.to_string();
     }
-    // NOLINT: test helper — cwd default is fine, path is only used in the panic message
-    let dotenv_path = std::env::current_dir().unwrap_or_default().join(".env");
+    let dotenv_path = std::env::current_dir()
+        .unwrap_or_else(|err| {
+            eprintln!("current_dir failed: {err}");
+            std::path::PathBuf::from(".")
+        })
+        .join(".env");
     panic!(
         "{ENV_GEMINI_API_KEY} (or {ENV_GEMINI_API_BASE_URL} for proxy mode) not set in environment or in {dotenv}",
         dotenv = dotenv_path.display(),
@@ -97,7 +101,7 @@ const DEFAULT_MAX_CONCURRENT: usize = 1;
 
 /// Maximum random stagger delay (in milliseconds) added before each test
 /// starts its first API call.  Spreads initial bursts to avoid TPM spikes.
-const STAGGER_MAX_MS: u64 = 2000;
+const STAGGER_MAX_MS: u64 = 250;
 
 /// A simple counting semaphore built on `Mutex` + `Condvar`.
 ///
@@ -156,12 +160,16 @@ impl Drop for SemaphoreGuard<'_> {
 /// Read the concurrency limit from the environment, falling back to the
 /// compiled-in default.
 fn max_concurrent_tests() -> usize {
-    std::env::var("AGY_BRIDGE_MAX_CONCURRENT_TESTS")
-        // NOLINT: env var not set is expected — falls through to default
-        .ok()
-        // NOLINT: invalid integer falls through to default concurrency limit
-        .and_then(|v| v.parse::<usize>().ok())
-        .map_or(DEFAULT_MAX_CONCURRENT, |n| n.max(1))
+    match std::env::var_os("AGY_BRIDGE_MAX_CONCURRENT_TESTS") {
+        Some(raw) => match raw.to_string_lossy().parse::<usize>() {
+            Ok(n) => n.max(1),
+            Err(err) => {
+                eprintln!("Invalid AGY_BRIDGE_MAX_CONCURRENT_TESTS ({err}), using default");
+                DEFAULT_MAX_CONCURRENT
+            }
+        },
+        None => DEFAULT_MAX_CONCURRENT,
+    }
 }
 
 /// Global concurrency gate for live integration tests.

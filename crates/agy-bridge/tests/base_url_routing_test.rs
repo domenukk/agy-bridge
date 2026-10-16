@@ -59,8 +59,9 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     buf_reader: &mut BufReader<R>,
 ) -> Option<ParsedHttpRequest> {
     let mut request_line = String::new();
-    // NOLINT: test mock server helper — malformed request means caller error, return None
-    buf_reader.read_line(&mut request_line).await.ok()?;
+    if buf_reader.read_line(&mut request_line).await.is_err() {
+        return None;
+    }
     let request_line = request_line.trim_end().to_string();
     if request_line.is_empty() {
         return None;
@@ -69,23 +70,27 @@ async fn parse_http_request<R: tokio::io::AsyncRead + Unpin>(
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        // NOLINT: test mock server helper — malformed request means caller error, return None
-        buf_reader.read_line(&mut line).await.ok()?;
+        if buf_reader.read_line(&mut line).await.is_err() {
+            return None;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         let lower = trimmed.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
-            // NOLINT: test helper — invalid content-length defaults to zero (no body)
-            content_length = val.trim().parse().unwrap_or(0);
+            match val.trim().parse::<usize>() {
+                Ok(len) => content_length = len,
+                Err(err) => eprintln!("invalid content-length header {val:?}: {err}"),
+            }
         }
     }
 
     let body = if content_length > 0 {
         let mut body_buf = vec![0u8; content_length];
-        // NOLINT: test mock server helper — incomplete body means malformed request, return None
-        buf_reader.read_exact(&mut body_buf).await.ok()?;
+        if buf_reader.read_exact(&mut body_buf).await.is_err() {
+            return None;
+        }
         String::from_utf8_lossy(&body_buf).to_string()
     } else {
         String::new()

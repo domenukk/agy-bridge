@@ -8,7 +8,7 @@ use super::super::{
     AgentId,
     command_loop::{AGY_BRIDGE_GLOBALS_MODULE, AgentRegistry},
     dispatch_rust_policy_confirm, dispatch_rust_tool,
-    py_scripts::PYTHON_AGENT_INIT_SCRIPT,
+    py_scripts::{PYTHON_AGENT_INIT_HELPERS_SCRIPT, PYTHON_AGENT_INIT_SCRIPT},
 };
 use crate::error::Error;
 
@@ -57,6 +57,13 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
     agy_bridge_globals.setattr(SET_AGENT_CONVERSATION_ID_ATTR, set_conv_id_func)?;
 
     globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;
+
+    let c_helpers = CString::new(PYTHON_AGENT_INIT_HELPERS_SCRIPT).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Python init helpers script contains null byte: {e}"
+        ))
+    })?;
+    py.run(c_helpers.as_c_str(), Some(&globals_module.dict()), None)?;
 
     let c_script = CString::new(PYTHON_AGENT_INIT_SCRIPT).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -297,7 +304,11 @@ fn warn_missing_tool_metadata(infos: &[RawToolInfo]) {
                 "Tool has no description — consider adding a docstring"
             );
         }
-        if info.parameter_schema.is_null() || info.parameter_schema == serde_json::json!({}) {
+        let schema_is_empty_object = info
+            .parameter_schema
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+        if info.parameter_schema.is_null() || schema_is_empty_object {
             tracing::warn!(
                 tool = %info.name,
                 "Tool has no parameter schema"

@@ -3,16 +3,16 @@ members = ["crates/agy-bridge", "crates/agy-bridge-test-support"]
 resolver = "3"
 
 [workspace.package]
-version = "0.16.3"
+version = "0.16.4"
 edition = "2024"
 
 [workspace.dependencies]
 # workspace crates
-agy-bridge = { path = "crates/agy-bridge", version = "0.16.3", default-features = false }
+agy-bridge = { path = "crates/agy-bridge", version = "0.16.4", default-features = false }
 agy-bridge-test-support = { path = "crates/agy-bridge-test-support", default-features = false }
-llm-tool = { version = "0.10.2" }
-llm-tool-macros = { version = "0.10.2" }
-md-tmpl = { version = "0.10.2" }
+llm-tool = { version = "0.10.3" }
+llm-tool-macros = { version = "0.10.3" }
+md-tmpl = { version = "0.10.5" }
 
 # runtime
 tokio = { version = "1", features = [
@@ -52,23 +52,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
-protoc-bin-vendored = "3.2"
+protoc-bin-vendored = "3.3"
 pbjson = "0.9"
 pbjson-build = "0.9"
 pbjson-types = "0.9"
 tokio-tungstenite = "0.30"
 ureq = { version = "3", features = ["json"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 all = { level = "deny", priority = -1 }
+unused_async_trait_impl = "allow"
 
 [workspace.lints.rust]
 warnings = "deny"
 
+[workspace.lints.rustdoc]
+redundant_explicit_links = "allow"
+
 [profile.dev]
-debug = 1
+debug = 0
 
 [profile.test]
-debug = 1
+debug = 0

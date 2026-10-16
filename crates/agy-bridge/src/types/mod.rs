@@ -412,6 +412,28 @@ pub struct ConversationMessage {
     pub content: String,
 }
 
+/// Progress snapshot emitted by a `run_workflow` step, mirroring the SDK's `WorkflowProgress`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TypedBuilder)]
+#[builder(field_defaults(default))]
+pub struct WorkflowProgress {
+    /// Path to the workflow script file when invoked via `ScriptPath`.
+    #[serde(default)]
+    #[builder(setter(into))]
+    pub script_path: String,
+    /// Inline Python source when invoked via `Script`.
+    #[serde(default)]
+    #[builder(setter(into))]
+    pub script: String,
+    /// Brief description of the workflow goal.
+    #[serde(default)]
+    #[builder(setter(into))]
+    pub description: String,
+    /// Accumulated stdout / log output from the workflow execution.
+    #[serde(default)]
+    #[builder(setter(into))]
+    pub output: String,
+}
+
 /// A single step in the agent trajectory, mirroring the SDK's `Step`.
 ///
 /// # Construction
@@ -446,7 +468,7 @@ pub struct Step {
     /// Identifier of the trajectory this step belongs to.
     ///
     /// The SDK's connection layer assigns one trajectory id per agent
-    /// trajectory. Compare with [`cascade_id`](Self::cascade_id) to tell a
+    /// trajectory. Compare with [`Step::cascade_id`] to tell a
     /// primary-agent step (`trajectory_id == cascade_id`) apart from a subagent
     /// step (`trajectory_id != cascade_id`); see [`Step::is_subagent_step`].
     /// Empty when the harness did not report one.
@@ -457,7 +479,7 @@ pub struct Step {
     ///
     /// Every step in a turn, primary and subagent alike, shares the same
     /// `cascade_id`, so it identifies the parent trajectory. A step originates
-    /// from a subagent when its [`trajectory_id`](Self::trajectory_id) differs
+    /// from a subagent when its [`Step::trajectory_id`] differs
     /// from this value. Empty when the harness did not report one.
     #[serde(default)]
     #[builder(setter(into))]
@@ -525,6 +547,10 @@ pub struct Step {
     #[serde(default)]
     #[builder(setter(strip_option))]
     pub structured_output: Option<serde_json::Value>,
+    /// Workflow execution progress when this step represents a `run_workflow` invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub workflow_progress: Option<WorkflowProgress>,
     /// Token usage for this step's model invocation.
     #[serde(default)]
     #[builder(setter(strip_option))]
@@ -599,11 +625,10 @@ impl_from_py_object!(
     UsageMetadata,
     MessageRole,
     ConversationMessage,
+    WorkflowProgress,
     Step,
     SandboxStatus
 );
 
 #[cfg(test)]
-#[cfg(test)]
-#[path = "types_tests.rs"]
 mod tests;

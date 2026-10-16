@@ -8,8 +8,8 @@ use std::{
 
 use prost::Message as _;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    process::{Child, ChildStdin, Command},
 };
 
 use crate::{error::Error, proto};
@@ -29,6 +29,7 @@ const CLIENT_LANGUAGE: &str = "rust";
 const RUST_LANGUAGE_VERSION: &str = "1.95";
 const MAX_SPAWN_ATTEMPTS: u32 = 10;
 const SPAWN_RETRY_BACKOFF_MS: u64 = 15;
+const MAX_HANDSHAKE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Running local harness process with active stdin/stdout and parsed port.
 pub(crate) struct HarnessProcess {
@@ -41,8 +42,7 @@ pub(crate) struct HarnessProcess {
 /// Locate the `localharness` binary on the current system.
 pub(crate) fn find_harness_binary() -> Result<PathBuf, Error> {
     // 1. Explicit ANTIGRAVITY_HARNESS_PATH environment variable
-    // NOLINT: environment variable is optional
-    if let Ok(custom) = std::env::var(ENV_HARNESS_PATH) {
+    if let Some(custom) = std::env::var_os(ENV_HARNESS_PATH) {
         let p = PathBuf::from(custom);
         if p.is_file() {
             return Ok(p);
@@ -73,8 +73,7 @@ pub(crate) fn find_harness_binary() -> Result<PathBuf, Error> {
     }
 
     // 4. PATH lookup
-    // NOLINT: environment variable is optional
-    if let Ok(path_var) = std::env::var(ENV_PATH) {
+    if let Some(path_var) = std::env::var_os(ENV_PATH) {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(HARNESS_BIN_NAME);
             if candidate.is_file() {
@@ -90,15 +89,13 @@ pub(crate) fn find_harness_binary() -> Result<PathBuf, Error> {
     })
 }
 
-async fn send_handshake_config(
-    stdin: &mut ChildStdin,
+async fn send_handshake_config<W: AsyncWrite + Unpin>(
+    stdin: &mut W,
     save_dir: &Path,
     env_vars: Option<&HashMap<String, String>>,
 ) -> Result<(), Error> {
-    let input_config = proto::localharness::InputConfig {
+    let mut input_config = proto::localharness::InputConfig {
         storage_directory: save_dir.to_string_lossy().to_string(),
-        port: 0,
-        bind_address: String::new(),
         client_info: Some(proto::localharness::ClientInfo {
             language: CLIENT_LANGUAGE.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -106,10 +103,11 @@ async fn send_handshake_config(
             os: std::env::consts::OS.to_string(),
             os_version: String::new(),
         }),
-        // NOLINT: empty environment map fallback when not provided
-        env: env_vars.cloned().unwrap_or_default(),
-        use_interactions_api: false,
+        ..proto::localharness::InputConfig::default()
     };
+    if let Some(vars) = env_vars {
+        input_config.env.clone_from(vars);
+    }
 
     let mut encoded = Vec::new();
     input_config
@@ -140,11 +138,9 @@ async fn send_handshake_config(
     Ok(())
 }
 
-async fn read_handshake_response(
-    stdout: &mut ChildStdout,
+async fn read_handshake_response<R: AsyncRead + Unpin>(
+    stdout: &mut R,
 ) -> Result<proto::localharness::OutputConfig, Error> {
-    const MAX_HANDSHAKE_BYTES: usize = 10 * 1024 * 1024;
-
     let mut len_buf = [0u8; 4];
     stdout
         .read_exact(&mut len_buf)
@@ -287,9 +283,7 @@ impl HarnessProcess {
 
     /// Terminate the child process and asynchronously wait for it to exit.
     pub(crate) async fn kill(&mut self) {
-        if let Err(e) = self.child.kill().await {
-            tracing::debug!(error = %e, "Process already terminated");
-        }
+        self.start_kill();
         if let Err(e) = self.child.wait().await {
             tracing::debug!(error = %e, "Error waiting for child process on termination");
         }
@@ -306,5 +300,68 @@ impl HarnessProcess {
 impl Drop for HarnessProcess {
     fn drop(&mut self) {
         self.start_kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handshake_config_and_response_roundtrip() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let save_dir = Path::new("/tmp/agy-test");
+        send_handshake_config(&mut client, save_dir, None)
+            .await
+            .expect("send_handshake_config succeeds");
+
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).await.unwrap();
+        let req_len = u32::from_le_bytes(len_buf) as usize;
+        let mut req_buf = vec![0u8; req_len];
+        server.read_exact(&mut req_buf).await.unwrap();
+        let decoded = proto::localharness::InputConfig::decode(&req_buf[..]).unwrap();
+        assert_eq!(decoded.storage_directory, "/tmp/agy-test");
+
+        let resp = proto::localharness::OutputConfig {
+            port: 12345,
+            api_key: "secret-key".to_string(),
+        };
+        let mut resp_bytes = Vec::new();
+        resp.encode(&mut resp_bytes).unwrap();
+        let resp_len = u32::try_from(resp_bytes.len()).unwrap();
+        server.write_all(&resp_len.to_le_bytes()).await.unwrap();
+        server.write_all(&resp_bytes).await.unwrap();
+        server.flush().await.unwrap();
+
+        let parsed = read_handshake_response(&mut client)
+            .await
+            .expect("read_handshake_response succeeds");
+        assert_eq!(parsed.port, 12345);
+        assert_eq!(parsed.api_key, "secret-key");
+    }
+
+    #[tokio::test]
+    async fn read_handshake_response_rejects_oversized_frame() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let oversized = u32::try_from(MAX_HANDSHAKE_BYTES + 1).unwrap();
+        server.write_all(&oversized.to_le_bytes()).await.unwrap();
+        server.flush().await.unwrap();
+
+        let err = read_handshake_response(&mut client)
+            .await
+            .expect_err("oversized handshake frame must be rejected");
+        assert!(err.to_string().contains("exceeds 10 MiB limit"));
+    }
+
+    #[tokio::test]
+    async fn read_handshake_response_handles_unexpected_eof() {
+        let (mut client, server) = tokio::io::duplex(64);
+        drop(server);
+
+        let err = read_handshake_response(&mut client)
+            .await
+            .expect_err("EOF on stdout must fail cleanly");
+        assert!(err.to_string().contains("Failed to read OutputConfig"));
     }
 }

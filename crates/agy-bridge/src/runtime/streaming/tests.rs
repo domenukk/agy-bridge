@@ -530,3 +530,10 @@ fn stream_limits_from_config_uses_defaults_for_none() {
         super::DEFAULT_MAX_CONSECUTIVE_EMPTY_STEPS
     );
 }
+
+#[test]
+fn format_token_metric_renders_some_and_none_without_fabricating_zero() {
+    assert_eq!(super::format_token_metric(Some(128)), "128");
+    assert_eq!(super::format_token_metric(Some(0)), "0");
+    assert_eq!(super::format_token_metric(None), "n/a");
+}

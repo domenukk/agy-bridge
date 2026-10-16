@@ -14,7 +14,7 @@ use crate::error::Error;
 
 /// Configuration for a trigger that the SDK will run.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TriggerConfig {
     /// Periodic trigger: fires every `interval`.
     Every {
@@ -27,6 +27,33 @@ pub enum TriggerConfig {
         /// Directory to watch for changes.
         path: PathBuf,
     },
+}
+
+impl<'de> Deserialize<'de> for TriggerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum RawTriggerConfig {
+            Every {
+                #[serde(with = "duration_secs")]
+                interval: Duration,
+            },
+            OnFileChange {
+                path: PathBuf,
+            },
+        }
+
+        match RawTriggerConfig::deserialize(deserializer)? {
+            RawTriggerConfig::Every { interval } => {
+                Self::try_every(interval).map_err(serde::de::Error::custom)
+            }
+            RawTriggerConfig::OnFileChange { path } => {
+                Self::try_on_file_change(path).map_err(serde::de::Error::custom)
+            }
+        }
+    }
 }
 
 impl TriggerConfig {
@@ -160,7 +187,7 @@ impl TriggerConfig {
 
 /// A named trigger attached to an agent.
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TriggerEntry {
     /// Descriptive name for the trigger (e.g. `"poll_threads"`).
     pub name: String,
@@ -170,6 +197,29 @@ pub struct TriggerEntry {
     /// For `OnFileChange`, the placeholder `{changes}` is replaced with
     /// the list of changed files.
     pub message_template: String,
+}
+
+impl<'de> Deserialize<'de> for TriggerEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawTriggerEntry {
+            name: String,
+            config: TriggerConfig,
+            message_template: String,
+        }
+
+        let raw = RawTriggerEntry::deserialize(deserializer)?;
+        let entry = Self {
+            name: raw.name,
+            config: raw.config,
+            message_template: raw.message_template,
+        };
+        entry.validate().map_err(serde::de::Error::custom)?;
+        Ok(entry)
+    }
 }
 
 impl TriggerEntry {
@@ -209,9 +259,24 @@ impl TriggerEntry {
 }
 
 /// An ordered list of triggers to attach to an agent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct TriggerSet {
     entries: Vec<TriggerEntry>,
+}
+
+impl<'de> Deserialize<'de> for TriggerSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawTriggerSet {
+            entries: Vec<TriggerEntry>,
+        }
+
+        let raw = RawTriggerSet::deserialize(deserializer)?;
+        Self::try_from_iter(raw.entries).map_err(serde::de::Error::custom)
+    }
 }
 
 impl TriggerSet {
@@ -357,6 +422,9 @@ mod duration_secs {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
         let secs = f64::deserialize(de)?;
+        if !secs.is_finite() {
+            return Err(serde::de::Error::custom("duration must be finite"));
+        }
         if secs < 0.0 {
             return Err(serde::de::Error::custom("duration must not be negative"));
         }
@@ -365,7 +433,7 @@ mod duration_secs {
                 "trigger interval must be at least 1 second",
             ));
         }
-        Ok(Duration::from_secs_f64(secs))
+        Duration::try_from_secs_f64(secs).map_err(serde::de::Error::custom)
     }
 }
 
@@ -596,12 +664,9 @@ mod tests {
         // Sub-second intervals should be rejected during deserialization,
         // matching the constructor validation.
         let json = r#"{"Every":{"interval":0.5}}"#;
-        let result = serde_json::from_str::<TriggerConfig>(json);
-        assert!(
-            // NOLINT: .is_err() in assert — verifying deserialization correctly rejects invalid input
-            result.is_err(),
-            "Sub-second interval should be rejected during deserialization"
-        );
+        let err = serde_json::from_str::<TriggerConfig>(json)
+            .expect_err("Sub-second interval should be rejected during deserialization");
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
@@ -751,5 +816,33 @@ mod tests {
     #[test]
     fn try_every_sub_second_is_err() {
         assert!(TriggerConfig::try_every(Duration::from_millis(500)).is_err());
+    }
+
+    #[test]
+    fn serde_rejects_overflow_duration() {
+        let json = r#"{"Every":{"interval":1e30}}"#;
+        assert!(serde_json::from_str::<TriggerConfig>(json).is_err());
+    }
+
+    #[test]
+    fn serde_rejects_invalid_on_file_change_paths() {
+        for bad_json in [
+            r#"{"OnFileChange":{"path":""}}"#,
+            r#"{"OnFileChange":{"path":"relative/dir"}}"#,
+            r#"{"OnFileChange":{"path":"/workspace/../etc/passwd"}}"#,
+        ] {
+            let parsed = serde_json::from_str::<TriggerConfig>(bad_json);
+            assert!(parsed.is_err(), "Expected serde rejection for {bad_json}");
+        }
+    }
+
+    #[test]
+    fn serde_rejects_empty_trigger_entry_and_set() {
+        let bad_entry =
+            r#"{"name":"  ","config":{"Every":{"interval":10.0}},"message_template":"ok"}"#;
+        assert!(serde_json::from_str::<TriggerEntry>(bad_entry).is_err());
+
+        let bad_set = r#"{"entries":[{"name":"poll","config":{"Every":{"interval":10.0}},"message_template":""}]}"#;
+        assert!(serde_json::from_str::<TriggerSet>(bad_set).is_err());
     }
 }

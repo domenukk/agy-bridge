@@ -10,8 +10,7 @@ use pyo3::prelude::*;
 pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
     let sys = py.import("sys")?;
 
-    // NOLINT: `.ok()` — env var not set is expected; falls back to cwd below
-    let workspace_root = match std::env::var("CARGO_MANIFEST_DIR").ok() {
+    let workspace_root = match std::env::var_os("CARGO_MANIFEST_DIR") {
         Some(dir) if !dir.is_empty() => discover_venv_root(std::path::Path::new(&dir)),
         _ => {
             tracing::warn!(
@@ -64,19 +63,23 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
     #[cfg(not(windows))]
     let harness_bin = "localharness";
 
-    // Set ANTIGRAVITY_HARNESS_PATH if the binary exists.
+    // Set ANTIGRAVITY_HARNESS_PATH if not already configured in os.environ,
+    // preferring the build-time version-verified NATIVE_HARNESS_PATH before .venv.
     let harness_path = site_packages
         .join("google")
         .join("antigravity")
         .join("bin")
         .join(harness_bin);
 
-    if harness_path.is_file() {
-        environ.set_item(
-            "ANTIGRAVITY_HARNESS_PATH",
-            harness_path.to_string_lossy().to_string(),
-        )?;
-        tracing::debug!(path = %harness_path.display(), "Set ANTIGRAVITY_HARNESS_PATH in Python os.environ");
+    if !environ.contains("ANTIGRAVITY_HARNESS_PATH")? {
+        let resolved_harness = option_env!("NATIVE_HARNESS_PATH")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file())
+            .or_else(|| harness_path.is_file().then_some(harness_path));
+        if let Some(hp) = resolved_harness {
+            environ.set_item("ANTIGRAVITY_HARNESS_PATH", hp.to_string_lossy().to_string())?;
+            tracing::debug!(path = %hp.display(), "Set ANTIGRAVITY_HARNESS_PATH in Python os.environ");
+        }
     }
 
     // Use site.addsitedir() to add venv site-packages. Unlike a plain

@@ -128,6 +128,7 @@ fn test_service_tier_in_usage_metadata_and_generation_config() {
     let gen_cfg = GenerationConfig {
         thinking_level: None,
         service_tier: Some(ServiceTier::Flex),
+        max_output_tokens: None,
     };
     let gen_json = serde_json::to_string(&gen_cfg).expect("serialize");
     let parsed_gen: GenerationConfig = serde_json::from_str(&gen_json).expect("deserialize");
@@ -254,7 +255,7 @@ fn test_stop_hook_types_and_runner() {
 #[test]
 fn test_target_antigravity_sdk_version_exported() {
     let version = env!("TARGET_ANTIGRAVITY_SDK_VERSION");
-    assert_eq!(version, "0.1.17");
+    assert_eq!(version, "0.1.22");
 }
 
 #[cfg(feature = "python")]

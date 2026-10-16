@@ -3,13 +3,17 @@
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
+/// Default compaction threshold for 1M-token context models (950,000 tokens).
+pub const DEFAULT_COMPACTION_TOKEN_THRESHOLD: u32 = 950_000;
+
+/// Default maximum context window for 1M-token context models (1,000,000 tokens).
+pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 1_000_000;
+
 /// Configuration for conversation trajectory compaction and context limits.
 ///
 /// Antigravity manages context by compacting older conversation history when
 /// the active trajectory exceeds `token_threshold`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TypedBuilder, Default,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TypedBuilder, Default)]
 #[builder(field_defaults(default))]
 pub struct CompactionConfig {
     /// Token ceiling allowed for the conversation history before compaction occurs.
@@ -24,6 +28,43 @@ pub struct CompactionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub max_context_tokens: Option<u32>,
+    /// Optional custom prompt used when summarizing compacted history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option))]
+    pub summary_prompt_override: Option<String>,
+    /// Whether to use the model-reported token count when evaluating compaction thresholds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub use_model_reported_token_count: Option<bool>,
+}
+
+impl CompactionConfig {
+    /// Creates a `CompactionConfig` configured for a full 1M-token context window
+    /// (`token_threshold = 950_000`, `max_context_tokens = 1_000_000`).
+    #[must_use]
+    pub const fn one_million() -> Self {
+        Self {
+            token_threshold: Some(DEFAULT_COMPACTION_TOKEN_THRESHOLD),
+            checkpoint_interval_tokens: None,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+            summary_prompt_override: None,
+            use_model_reported_token_count: None,
+        }
+    }
+
+    /// Sets an optional custom prompt used when summarizing compacted history.
+    #[must_use]
+    pub fn with_summary_prompt_override(mut self, prompt: impl Into<String>) -> Self {
+        self.summary_prompt_override = Some(prompt.into());
+        self
+    }
+
+    /// Sets whether to use the model-reported token count when evaluating compaction thresholds.
+    #[must_use]
+    pub const fn with_use_model_reported_token_count(mut self, enabled: bool) -> Self {
+        self.use_model_reported_token_count = Some(enabled);
+        self
+    }
 }
 
 #[cfg(test)]

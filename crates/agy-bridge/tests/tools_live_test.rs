@@ -32,8 +32,6 @@ impl RustTool for GetDeviceSerial {
     const NAME: &'static str = "get_device_serial";
     const DESCRIPTION: &'static str = "Returns the serial number for a device.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
@@ -69,8 +67,6 @@ impl RustTool for CheckBuildStatus {
     const NAME: &'static str = "check_build_status";
     const DESCRIPTION: &'static str = "Checks the status of a build job.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
@@ -115,8 +111,6 @@ impl RustTool for AddNumbers {
     const NAME: &'static str = "add_numbers";
     const DESCRIPTION: &'static str = "Adds two numbers together.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,
@@ -218,13 +212,13 @@ fn rust_tool_definition_serde_roundtrip() {
             .expect("FlashParams deserialization");
     assert_eq!(params.device_id, "dev-1");
     assert_eq!(params.build_image, "img.bin");
-    let schema = schemars::schema_for!(FlashParams);
-    let schema_value = serde_json::to_value(&schema).expect("schema to Value");
+    let schema =
+        agy_bridge::config::JsonSchema::from_schema::<FlashParams>().expect("FlashParams schema");
 
     let tool = agy_bridge::tools::ToolDefinition::new(
         "flash_device",
         "Flashes a build image onto a device.",
-        schema_value,
+        schema.as_value().clone(),
     );
 
     let json_str = serde_json::to_string(&tool).expect("serialize ToolDefinition");
@@ -422,8 +416,6 @@ impl RustTool for WhoAmI {
     const NAME: &'static str = "who_am_i";
     const DESCRIPTION: &'static str = "Returns the caller's conversation identifier.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         _params: Self::Params,

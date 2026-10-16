@@ -59,8 +59,8 @@ fmt-just:
 
 # ── Lint ──────────────────────────────────────────────────────────────
 
-# Lint all code (Rust clippy, Rust fmt, TOML, Markdown, Justfile, hygiene)
-lint: lint-rust lint-rust-fmt lint-toml lint-markdown lint-just lint-hygiene
+# Lint all code (Rust clippy, Rust fmt, TOML, Markdown, Python, Justfile, hygiene)
+lint: lint-rust lint-rust-fmt lint-toml lint-markdown lint-python lint-just lint-hygiene
 
 # Lint Rust with clippy across all feature combinations
 lint-rust:
@@ -79,6 +79,13 @@ lint-toml:
 # Lint Markdown files
 lint-markdown:
     if command -v npx >/dev/null 2>&1; then npx -y markdownlint-cli2@latest '**/*.md'; fi
+
+# Lint Python formatting, ruff rules, and mypy static types
+lint-python:
+    uv run black --check .
+    uv run ruff check .
+    uv run mypy --strict scripts/lint_hygiene.py
+    uv run mypy .
 
 # Lint the justfile (check formatting)
 lint-just:

@@ -261,10 +261,12 @@ pub(in crate::runtime) async fn handle_delete(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
+    let reg_cleanup = std::sync::Arc::clone(&registry);
+    let (op_tx, op_rx) = oneshot::channel();
     run_py_async_op(
         registry,
         agent_id,
-        reply,
+        op_tx,
         "delete",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -273,6 +275,15 @@ pub(in crate::runtime) async fn handle_delete(
         |_py_none| (),
     )
     .await;
+    lock_registry(&reg_cleanup).remove(&agent_id);
+    match op_rx.await {
+        Ok(res) => {
+            if let Err(send_err) = reply.send(res) {
+                tracing::debug!(agent_id = ?agent_id, error = ?send_err, "delete reply receiver dropped");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "delete operation channel closed"),
+    }
 }
 
 /// Disconnect from the agent without deleting state via the async Python API.
@@ -281,10 +292,12 @@ pub(in crate::runtime) async fn handle_disconnect(
     agent_id: AgentId,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
+    let reg_cleanup = std::sync::Arc::clone(&registry);
+    let (op_tx, op_rx) = oneshot::channel();
     run_py_async_op(
         registry,
         agent_id,
-        reply,
+        op_tx,
         "disconnect",
         |_, agent| {
             let conv = agent.getattr("conversation")?;
@@ -293,6 +306,15 @@ pub(in crate::runtime) async fn handle_disconnect(
         |_py_none| (),
     )
     .await;
+    lock_registry(&reg_cleanup).remove(&agent_id);
+    match op_rx.await {
+        Ok(res) => {
+            if let Err(send_err) = reply.send(res) {
+                tracing::debug!(agent_id = ?agent_id, error = ?send_err, "disconnect reply receiver dropped");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "disconnect operation channel closed"),
+    }
 }
 
 #[cfg(test)]

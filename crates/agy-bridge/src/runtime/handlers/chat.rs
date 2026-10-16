@@ -143,11 +143,14 @@ fn extract_response_metadata(
 
         // The conversation carries both usage and structured output. It can be
         // absent very early in an agent's life; that is not an error.
-        let conversation = agent_bound
-            .getattr("conversation")
-            // NOLINT: `.ok()` — probing optional Python attr; absence is expected.
-            .ok()
-            .filter(|conv| !conv.is_none());
+        let conversation = match agent_bound.getattr("conversation") {
+            Ok(conv) if !conv.is_none() => Some(conv),
+            Ok(_) => None,
+            Err(err) => {
+                tracing::trace!(agent_id = ?agent_id, error = %err, "Agent has no conversation attribute");
+                None
+            }
+        };
 
         let usage = extract_usage_metadata(response_bound, conversation.as_ref(), agent_id);
         let structured = extract_structured_output(conversation.as_ref())?;
@@ -166,30 +169,42 @@ fn extract_usage_metadata(
     conversation: Option<&Bound<'_, PyAny>>,
     agent_id: AgentId,
 ) -> Option<UsageMetadata> {
-    // NOLINT: `.ok()` — probing optional Python attr; absence is expected.
-    let mut usage_py = response_bound.getattr("usage_metadata").ok();
+    let mut usage_py = match response_bound.getattr("usage_metadata") {
+        Ok(u) => Some(u),
+        Err(err) => {
+            tracing::trace!(agent_id = ?agent_id, error = %err, "Response has no usage_metadata attribute");
+            None
+        }
+    };
     if usage_py.as_ref().is_none_or(pyo3::Bound::is_none)
         && let Some(conv) = conversation
     {
-        // NOLINT: `.ok()` — probing optional Python attr; absence is expected.
-        usage_py = conv.getattr("last_turn_usage").ok();
+        usage_py = match conv.getattr("last_turn_usage") {
+            Ok(u) => Some(u),
+            Err(err) => {
+                tracing::trace!(agent_id = ?agent_id, error = %err, "Conversation has no last_turn_usage attribute");
+                None
+            }
+        };
     }
     let usage_py = usage_py?;
     if usage_py.is_none() {
         return None;
     }
-    let dict = super::super::py_scripts::to_dict_py(&usage_py)
-        .inspect_err(|e| {
+    let dict = match super::super::py_scripts::to_dict_py(&usage_py) {
+        Ok(d) => d,
+        Err(e) => {
             tracing::warn!(agent_id = ?agent_id, error = %e, "Failed to convert usage_metadata to dict");
-        })
-        // NOLINT: best-effort telemetry; error already logged by inspect_err above.
-        .ok()?;
-    dict.extract::<UsageMetadata>()
-        .inspect_err(|e| {
+            return None;
+        }
+    };
+    match dict.extract::<UsageMetadata>() {
+        Ok(u) => Some(u),
+        Err(e) => {
             tracing::warn!(agent_id = ?agent_id, error = %e, "Failed to extract UsageMetadata from dict");
-        })
-        // NOLINT: best-effort telemetry; error already logged by inspect_err above.
-        .ok()
+            None
+        }
+    }
 }
 
 /// Read the turn's structured output from the conversation's synchronous

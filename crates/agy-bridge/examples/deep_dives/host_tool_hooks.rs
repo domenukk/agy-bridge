@@ -16,6 +16,9 @@ use agy_bridge::{
     tools::{ToolError, ToolOutput},
 };
 
+/// Machine-readable error code attached to `broken_tool` failures.
+const INTENTIONAL_FAILURE_CODE: &str = "INTENTIONAL_FAILURE";
+
 #[llm_tool]
 /// Returns a greeting for the given name.
 fn greet(
@@ -29,8 +32,10 @@ fn greet(
 /// A tool that always fails. Useful for testing error handling.
 fn broken_tool() -> Result<ToolOutput, ToolError> {
     Err(
-        ToolError::new("RuntimeError: This tool is intentionally broken!")
-            .with_meta("error_code", serde_json::json!("INTENTIONAL_FAILURE")),
+        ToolError::new("RuntimeError: This tool is intentionally broken!").with_meta(
+            "error_code",
+            serde_json::Value::String(INTENTIONAL_FAILURE_CODE.to_owned()),
+        ),
     )
 }
 

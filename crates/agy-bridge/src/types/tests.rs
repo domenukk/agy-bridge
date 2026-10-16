@@ -211,6 +211,7 @@ fn test_step_full_roundtrip() {
         http_code: 0,
         is_complete_response: Some(false),
         structured_output: None,
+        workflow_progress: None,
         usage_metadata: Some(UsageMetadata {
             prompt_token_count: Some(500),
             cached_content_token_count: None,

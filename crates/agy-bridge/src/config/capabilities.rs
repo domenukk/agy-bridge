@@ -33,8 +33,11 @@ pub enum BuiltinTools {
     #[serde(rename = "ask_question")]
     AskQuestion,
     /// Spawn a subagent.
-    #[serde(rename = "start_subagent")]
-    StartSubagent,
+    #[serde(rename = "invoke_subagent", alias = "start_subagent")]
+    InvokeSubagent,
+    /// Execute a dynamic Python workflow script.
+    #[serde(rename = "run_workflow")]
+    RunWorkflow,
     /// Generate images from text prompts.
     #[serde(rename = "generate_image")]
     GenerateImage,
@@ -44,12 +47,20 @@ pub enum BuiltinTools {
     /// Fetch content from a URL via HTTP request.
     #[serde(rename = "read_url_content")]
     ReadUrlContent,
+    /// Schedule a timer or recurring cron job.
+    #[serde(rename = "schedule")]
+    Schedule,
     /// Signal task completion.
     #[serde(rename = "finish")]
     Finish,
 }
 
 impl BuiltinTools {
+    /// Backwards-compatible alias for [`Self::InvokeSubagent`].
+    // NOLINT: backwards-compatible alias for StartSubagent -> InvokeSubagent
+    #[allow(non_upper_case_globals)]
+    pub const StartSubagent: Self = Self::InvokeSubagent;
+
     #[must_use]
     /// Returns tools that only read (no writes, no command execution).
     pub const fn read_only() -> &'static [Self] {
@@ -74,10 +85,12 @@ impl BuiltinTools {
             Self::CreateFile,
             Self::EditFile,
             Self::AskQuestion,
-            Self::StartSubagent,
+            Self::InvokeSubagent,
+            Self::RunWorkflow,
             Self::GenerateImage,
             Self::SearchWeb,
             Self::ReadUrlContent,
+            Self::Schedule,
             Self::Finish,
         ]
     }
@@ -94,10 +107,12 @@ impl BuiltinTools {
             Self::EditFile,
             Self::RunCommand,
             Self::AskQuestion,
-            Self::StartSubagent,
+            Self::InvokeSubagent,
+            Self::RunWorkflow,
             Self::GenerateImage,
             Self::SearchWeb,
             Self::ReadUrlContent,
+            Self::Schedule,
             Self::Finish,
         ]
     }
@@ -143,10 +158,12 @@ impl BuiltinTools {
             Self::CreateFile,
             Self::EditFile,
             Self::RunCommand,
-            Self::StartSubagent,
+            Self::InvokeSubagent,
+            Self::RunWorkflow,
             Self::GenerateImage,
             Self::SearchWeb,
             Self::ReadUrlContent,
+            Self::Schedule,
             Self::Finish,
         ]
     }
@@ -163,10 +180,12 @@ impl BuiltinTools {
             Self::EditFile => "edit_file",
             Self::RunCommand => "run_command",
             Self::AskQuestion => "ask_question",
-            Self::StartSubagent => "start_subagent",
+            Self::InvokeSubagent => "invoke_subagent",
+            Self::RunWorkflow => "run_workflow",
             Self::GenerateImage => "generate_image",
             Self::SearchWeb => "search_web",
             Self::ReadUrlContent => "read_url_content",
+            Self::Schedule => "schedule",
             Self::Finish => "finish",
         }
     }
@@ -183,10 +202,12 @@ impl BuiltinTools {
             Self::EditFile => "Edit an existing file.",
             Self::RunCommand => "Execute a shell command.",
             Self::AskQuestion => "Ask the user a question.",
-            Self::StartSubagent => "Spawn a subagent.",
+            Self::InvokeSubagent => "Spawn a subagent.",
+            Self::RunWorkflow => "Execute a dynamic Python workflow script.",
             Self::GenerateImage => "Generate images from text prompts.",
             Self::SearchWeb => "Search the web for information.",
             Self::ReadUrlContent => "Fetch content from a URL via HTTP request.",
+            Self::Schedule => "Schedule a timer or recurring cron job.",
             Self::Finish => "Signal task completion.",
         }
     }
@@ -226,8 +247,8 @@ impl std::fmt::Display for AgentBehavior {
 
 /// Agent capability toggles: tool allowlists, subagent support, and compaction.
 ///
-/// Construct with the named constructors ([`with_tools`](Self::with_tools),
-/// [`read_only`](Self::read_only), …) for common presets, or with the
+/// Construct with the named constructors ([`Self::with_tools`],
+/// [`Self::read_only`], …) for common presets, or with the
 /// [`TypedBuilder`] for fine-grained control. Both preserve the SDK-matching
 /// defaults (subagents enabled, default image model):
 ///
@@ -277,7 +298,7 @@ pub struct CapabilitiesConfig {
     /// The model to use for image generation.
     ///
     /// This setting is a shorthand for `GeminiConfig.models.image_generation.name`.
-    /// If both are specified, the value in [`GeminiConfig`](super::GeminiConfig) takes precedence and
+    /// If both are specified, the value in [`super::GeminiConfig`] takes precedence and
     /// this field is ignored.
     #[serde(default = "super::default_image_model")]
     #[builder(default = DEFAULT_IMAGE_GENERATION_MODEL.to_owned(), setter(into))]
@@ -294,6 +315,10 @@ pub struct CapabilitiesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(into, strip_option))]
     pub tool_output_truncation_config: Option<super::truncation::ToolOutputTruncationConfig>,
+    /// Maximum allowed size in bytes for a single MCP tool output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub mcp_max_output_bytes: Option<u32>,
 }
 
 /// Configuration for the builtin `run_command` tool.
@@ -400,11 +425,14 @@ mod tests {
         assert!(!read_only.contains(&BuiltinTools::CreateFile));
 
         let all = BuiltinTools::all_tools();
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), 15);
         assert!(all.contains(&BuiltinTools::CreateFile));
         assert!(all.contains(&BuiltinTools::Finish));
         assert!(all.contains(&BuiltinTools::SearchWeb));
         assert!(all.contains(&BuiltinTools::ReadUrlContent));
+        assert!(all.contains(&BuiltinTools::InvokeSubagent));
+        assert!(all.contains(&BuiltinTools::RunWorkflow));
+        assert!(all.contains(&BuiltinTools::Schedule));
 
         assert_eq!(BuiltinTools::ListDir.as_sdk_name(), "list_directory");
         assert_eq!(BuiltinTools::SearchWeb.as_sdk_name(), "search_web");
@@ -449,10 +477,12 @@ mod tests {
             (BuiltinTools::EditFile, "edit_file"),
             (BuiltinTools::RunCommand, "run_command"),
             (BuiltinTools::AskQuestion, "ask_question"),
-            (BuiltinTools::StartSubagent, "start_subagent"),
+            (BuiltinTools::InvokeSubagent, "invoke_subagent"),
+            (BuiltinTools::RunWorkflow, "run_workflow"),
             (BuiltinTools::GenerateImage, "generate_image"),
             (BuiltinTools::SearchWeb, "search_web"),
             (BuiltinTools::ReadUrlContent, "read_url_content"),
+            (BuiltinTools::Schedule, "schedule"),
             (BuiltinTools::Finish, "finish"),
         ];
         for (variant, py_str) in expected {
@@ -520,10 +550,14 @@ mod tests {
 
     #[test]
     fn builtin_tools_snake_case_serde() {
-        // Verify that serde serializes with snake_case as specified by the attribute.
-        let tool = BuiltinTools::StartSubagent;
+        // Verify that serde serializes with snake_case as specified by the attribute,
+        // and that the legacy "start_subagent" alias still deserializes cleanly.
+        let tool = BuiltinTools::InvokeSubagent;
         let json = serde_json::to_string(&tool).unwrap();
-        assert_eq!(json, "\"start_subagent\"");
+        assert_eq!(json, "\"invoke_subagent\"");
+        let legacy: BuiltinTools = serde_json::from_str("\"start_subagent\"").unwrap();
+        assert_eq!(legacy, BuiltinTools::InvokeSubagent);
+        assert_eq!(BuiltinTools::StartSubagent, BuiltinTools::InvokeSubagent);
 
         let tool = BuiltinTools::GenerateImage;
         let json = serde_json::to_string(&tool).unwrap();

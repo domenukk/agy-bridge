@@ -25,18 +25,15 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
 
     // ── 1. Generate a JSON Schema from the Rust struct ──────────────────
 
-    let schema_root = schemars::schema_for!(Summary);
-    let schema_value = serde_json::to_value(&schema_root).expect("schema serialization");
+    let schema = JsonSchema::from_schema::<Summary>()?;
     println!(
         "  Schema: {}",
-        serde_json::to_string_pretty(&schema_value).expect("schema serialization")
+        serde_json::to_string_pretty(schema.as_value()).expect("schema serialization")
     );
 
     // ── 2. Build AgentConfig with native response_schema ────────────────
 
-    let config = AgentConfig::builder()
-        .response_schema(JsonSchema::new(schema_value))
-        .build();
+    let config = AgentConfig::builder().response_schema(schema).build();
 
     let agent = bridge.agent(config).await?;
 

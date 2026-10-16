@@ -11,8 +11,6 @@
 mod interactive;
 mod runner;
 mod types;
-#[cfg(test)]
-mod types_tests;
 
 pub use interactive::*;
 pub use runner::*;

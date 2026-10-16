@@ -132,22 +132,24 @@ fn handle_on_tool_error(
 /// Enrich an [`OnToolErrorContext`](crate::hooks::OnToolErrorContext) with the
 /// `metadata` from a captured [`ToolError`](llm_tool::ToolError) value.
 ///
-/// `captured` is the serialized `ToolError` (`{"message": ..., "metadata":
-/// {...}}`) recorded on the dispatch error path, or `None` when no structured
-/// error was captured (e.g. an error raised on the Python side). When present,
-/// its `metadata` object replaces the context's metadata; when absent — or when
-/// the captured error carried no metadata — the context's metadata is left as
-/// its deserialized default ([`serde_json::Value::Null`]).
+/// `captured` is the [`CapturedToolError`](super::bridge_state::CapturedToolError)
+/// recorded on the dispatch error path, or `None` when no structured error was
+/// captured (e.g. an error raised on the Python side). When it carries
+/// metadata, that metadata object replaces the context's metadata; otherwise
+/// the context's metadata is left as its deserialized default
+/// ([`serde_json::Value::Null`]).
 ///
 /// Kept pure (no locks, no globals) so it can be unit-tested directly.
 fn merge_tool_error_metadata(
     mut ctx: crate::hooks::OnToolErrorContext,
-    captured: Option<serde_json::Value>,
+    captured: Option<super::bridge_state::CapturedToolError>,
 ) -> crate::hooks::OnToolErrorContext {
-    if let Some(serde_json::Value::Object(mut map)) = captured
-        && let Some(metadata) = map.remove("metadata")
+    if let Some(super::bridge_state::CapturedToolError {
+        metadata: Some(metadata),
+        ..
+    }) = captured
     {
-        ctx.metadata = metadata;
+        ctx.metadata = serde_json::Value::Object(metadata);
     }
     ctx
 }
@@ -417,7 +419,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let ctx = build_tool_context(tool_state, conversation_id);
-        let output = match registry.dispatch(&name, args, &ctx).await {
+        let output = match registry.dispatch(&name, args.clone(), &ctx).await {
             Ok(output) => {
                 // Success: drop any stale error so a later `on_tool_error`
                 // never surfaces metadata from a previous failed call.
@@ -429,7 +431,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
                 // collapsing it into a model-facing string, so the
                 // `on_tool_error` hook can recover the metadata. The model
                 // still sees exactly `ToolError::to_string()`.
-                super::bridge_state::record_last_tool_error(agent_id, &e);
+                super::bridge_state::record_last_tool_error(agent_id, args, &e);
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()));
             }
         };
@@ -469,18 +471,27 @@ mod merge_tests {
 
     #[test]
     fn merge_capture_without_metadata_leaves_metadata_null() {
-        // A serialized ToolError with no metadata skips the `metadata` field.
-        let captured = serde_json::json!({"message": "boom"});
+        let error = llm_tool::ToolError::new("boom");
+        let captured = super::super::bridge_state::CapturedToolError::from_tool_error(
+            serde_json::Value::Null,
+            &error,
+        )
+        .expect("ToolError serializes");
+        assert_eq!(captured.metadata, None);
         let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
         assert_eq!(ctx.metadata, serde_json::Value::Null);
     }
 
     #[test]
     fn merge_capture_with_metadata_enriches_context() {
-        let captured = serde_json::json!({
-            "message": "boom",
-            "metadata": {"status_code": 503}
-        });
+        let error =
+            llm_tool::ToolError::new("boom").with_meta("status_code", serde_json::json!(503));
+        let captured = super::super::bridge_state::CapturedToolError::from_tool_error(
+            serde_json::json!({"a": 1}),
+            &error,
+        )
+        .expect("ToolError serializes");
+        assert_eq!(captured.tool_args, serde_json::json!({"a": 1}));
         let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
         assert_eq!(ctx.metadata["status_code"], 503);
         // Other fields are preserved unchanged.
@@ -490,11 +501,15 @@ mod merge_tests {
 
     #[test]
     fn merge_real_tool_error_roundtrip_surfaces_not_found() {
-        // End-to-end shape: serialize a real ToolError exactly as
+        // End-to-end shape: capture a real ToolError exactly as
         // `record_last_tool_error` does, then merge and assert the convenience
         // helper detects it.
         let error = llm_tool::ToolError::not_found(llm_tool::RegistryItem::Tool, "add_nummbers");
-        let captured = serde_json::to_value(&error).unwrap();
+        let captured = super::super::bridge_state::CapturedToolError::from_tool_error(
+            serde_json::Value::Null,
+            &error,
+        )
+        .expect("ToolError serializes");
         let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
         assert!(ctx.is_not_found());
     }

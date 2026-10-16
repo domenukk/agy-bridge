@@ -12,12 +12,12 @@ requires-python = ">=3.11"
 dependencies = [
   # Needed by `cargo test --features python`: the embedded interpreter imports
   # `google.antigravity.*`, and the SDK pulls in `watchfiles` for triggers.
-  "google-antigravity>=0.1.17",
+  "google-antigravity>=0.1.22",
   "watchfiles",
 ]
 
 [dependency-groups]
-dev = ["black>=24", "pytest>=8"]
+dev = ["black>=24", "mypy>=2.4.0", "pytest>=8", "ruff>=0.16.10"]
 
 [tool.uv]
 # Not an installable package — just an environment.
@@ -35,3 +35,21 @@ extend-exclude = '''
   | target
 )/
 '''
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = [".venv", "target"]
+
+[tool.mypy]
+python_version = "3.11"
+exclude = ["^\\.venv/", "^target/"]
+mypy_path = ["crates/agy-bridge/src/runtime/py"]
+
+[[tool.mypy.overrides]]
+module = [
+  "google",
+  "google.antigravity",
+  "google.antigravity.*",
+  "websockets.*",
+]
+ignore_missing_imports = true

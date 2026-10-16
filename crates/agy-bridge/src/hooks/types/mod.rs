@@ -728,3 +728,6 @@ impl std::fmt::Debug for HookCallback {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

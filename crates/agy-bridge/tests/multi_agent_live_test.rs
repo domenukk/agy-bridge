@@ -7,11 +7,11 @@ mod common;
 fn test_base_url() -> String {
     use agy_bridge::config::ENV_GEMINI_API_BASE_URL;
 
-    // NOLINT: env var not set is expected — falls through to .env file below
-    if let Ok(url) = std::env::var(ENV_GEMINI_API_BASE_URL)
-        && !url.is_empty()
-    {
-        return url.trim_matches('"').to_string();
+    if let Some(os_url) = std::env::var_os(ENV_GEMINI_API_BASE_URL) {
+        let url = os_url.to_string_lossy();
+        if !url.is_empty() {
+            return url.trim_matches('"').to_string();
+        }
     }
     let env_map = agy_bridge::load_dotenv();
     if let Some(url) = env_map.get(ENV_GEMINI_API_BASE_URL)

@@ -43,6 +43,55 @@ fn test_to_domain_step_states_and_sources() {
     assert_eq!(step.status, StepStatus::Error);
     assert_eq!(step.source, StepSource::Model);
     assert_eq!(step.error, "Boom");
+
+    let subagent_tool = proto::localharness::StepUpdate {
+        step_index: 4,
+        state: 2,
+        source: 3,
+        parent_trajectory_id: "parent-traj-1".to_string(),
+        view_file: Some(proto::localharness::ActionViewFile {
+            file_path: "/tmp/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 50,
+            content_offset: 0,
+        }),
+        ..Default::default()
+    };
+    let step = to_domain_step(&subagent_tool);
+    assert_eq!(step.step_type, StepType::ToolCall);
+    assert_eq!(step.depth, 1);
+    assert_eq!(step.tool_calls.len(), 1);
+    assert_eq!(step.tool_calls[0].name, "view_file");
+    assert_eq!(
+        step.tool_calls[0].canonical_path.as_deref(),
+        Some("/tmp/foo.rs")
+    );
+
+    let workflow_step = proto::localharness::StepUpdate {
+        step_index: 5,
+        state: 2,
+        source: 3,
+        run_workflow: Some(proto::localharness::ActionRunWorkflow {
+            script_path: "/tmp/wf.py".to_string(),
+            script: "print('hi')".to_string(),
+            description: "Run test workflow".to_string(),
+            output: "hi\n".to_string(),
+        }),
+        skill_lookup: Some(proto::localharness::ActionSkillLookup {
+            skill_name: "triage".to_string(),
+        }),
+        ..Default::default()
+    };
+    let step = to_domain_step(&workflow_step);
+    assert_eq!(step.step_type, StepType::ToolCall);
+    assert_eq!(step.tool_calls.len(), 2);
+    assert_eq!(step.tool_calls[0].name, "skill_lookup");
+    assert_eq!(step.tool_calls[1].name, "run_workflow");
+    let wf = step.workflow_progress.expect("workflow_progress");
+    assert_eq!(wf.script_path, "/tmp/wf.py");
+    assert_eq!(wf.script, "print('hi')");
+    assert_eq!(wf.description, "Run test workflow");
+    assert_eq!(wf.output, "hi\n");
 }
 
 #[test]
@@ -201,6 +250,55 @@ async fn test_handle_trajectory_state_update_flow() {
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].content, "Final reply");
     assert_eq!(hist[0].role, MessageRole::Model);
+    assert_eq!(
+        last_response_text.lock().unwrap().as_deref(),
+        Some("Final reply")
+    );
+}
+
+#[tokio::test]
+async fn test_compaction_step_and_hook_dispatch() {
+    use std::sync::atomic::AtomicUsize;
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    let fired_clone = Arc::clone(&fired);
+    let mut hooks = Hooks::new();
+    hooks.on_compaction("compaction_counter", move |_ctx| {
+        fired_clone.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let res = dispatch_on_compaction_hook(&hooks);
+    assert!(matches!(
+        res,
+        proto::localharness::call_hook_response::Result::EmptyResult(_)
+    ));
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+    let active_writer = Arc::new(tokio::sync::Mutex::new(None));
+    let last_response_text = Arc::new(Mutex::new(None));
+    let last_error = Arc::new(Mutex::new(None));
+    let produced_output = Arc::new(AtomicBool::new(false));
+    let turn_activity = Arc::new(AtomicBool::new(false));
+    let compaction_indices = Arc::new(Mutex::new(Vec::new()));
+
+    let compaction_step = proto::localharness::StepUpdate {
+        step_index: 42,
+        compaction: Some(proto::localharness::ActionCompaction {}),
+        ..Default::default()
+    };
+    let step_ctx = StepUpdateContext {
+        active_writer: &active_writer,
+        last_response_text: &last_response_text,
+        last_error: &last_error,
+        produced_output: &produced_output,
+        turn_activity: &turn_activity,
+        compaction_indices: &compaction_indices,
+    };
+    handle_step_update(1, compaction_step.clone(), &step_ctx).await;
+    // Duplicate step update should not duplicate the index
+    handle_step_update(1, compaction_step, &step_ctx).await;
+
+    assert_eq!(*compaction_indices.lock().unwrap(), vec![42]);
 }
 
 #[tokio::test]

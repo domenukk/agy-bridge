@@ -521,5 +521,4 @@ impl From<&PolicySet> for Vec<PolicyRule> {
 }
 
 #[cfg(test)]
-#[path = "rules_tests.rs"]
 mod tests;

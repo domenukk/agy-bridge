@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.17";
+const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.22";
 
 // NOLINT: main returns Result for feature-conditional compilation
 #[allow(clippy::unnecessary_wraps)]
@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("cargo:rerun-if-changed=proto/content.proto");
+    println!("cargo:rerun-if-changed=proto/skill.proto");
     println!("cargo:rerun-if-changed=proto/localharness.proto");
     println!("cargo:rerun-if-env-changed=ANTIGRAVITY_HARNESS_PATH");
     println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
@@ -158,15 +159,20 @@ fn configure_python_dll_search_path() {
             for dll in &dll_files {
                 if let Some(fname) = dll.file_name() {
                     let dest_dll = dest_dir.join(fname);
-                    if !dest_dll.exists() {
-                        // NOLINT: best-effort DLL staging into target directory
-                        let _ = std::fs::copy(dll, &dest_dll);
+                    if !dest_dll.exists()
+                        && let Err(e) = std::fs::copy(dll, &dest_dll)
+                    {
+                        println!("cargo:warning=Failed to stage DLL {}: {e}", dll.display());
                     }
                 }
             }
             let cfg_dest = dest_dir.join("pyvenv.cfg");
-            // NOLINT: best-effort pyvenv.cfg staging into target directory
-            let _ = std::fs::write(&cfg_dest, &pyvenv_content);
+            if let Err(e) = std::fs::write(&cfg_dest, &pyvenv_content) {
+                println!(
+                    "cargo:warning=Failed to stage pyvenv.cfg at {}: {e}",
+                    cfg_dest.display()
+                );
+            }
         }
     }
 }
@@ -205,6 +211,7 @@ fn compile_protos() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_dir = manifest_dir.join("proto");
     let content_proto = proto_dir.join("content.proto");
+    let skill_proto = proto_dir.join("skill.proto");
     let localharness_proto = proto_dir.join("localharness.proto");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -215,7 +222,10 @@ fn compile_protos() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(&descriptor_path)
         .compile_well_known_types()
         .extern_path(".google.protobuf", "::pbjson_types");
-    prost_config.compile_protos(&[localharness_proto, content_proto], &[proto_dir])?;
+    prost_config.compile_protos(
+        &[localharness_proto, content_proto, skill_proto],
+        &[proto_dir],
+    )?;
 
     let descriptor_set = std::fs::read(descriptor_path)?;
     pbjson_build::Builder::new()
@@ -234,11 +244,18 @@ fn is_cached_binary_valid(out_dir: &Path, bin_path: &Path) -> bool {
         return false;
     }
     let version_path = out_dir.join(VERSION_STAMP_FILE);
-    // NOLINT: version stamp file is absent on clean build before extraction
-    if let Ok(content) = std::fs::read_to_string(&version_path) {
-        content.trim() == TARGET_ANTIGRAVITY_SDK_VERSION
-    } else {
-        false
+    if !version_path.is_file() {
+        return false;
+    }
+    match std::fs::read_to_string(&version_path) {
+        Ok(content) => content.trim() == TARGET_ANTIGRAVITY_SDK_VERSION,
+        Err(err) => {
+            println!(
+                "cargo:warning=Failed to read version stamp {}: {err}",
+                version_path.display()
+            );
+            false
+        }
     }
 }
 
@@ -246,50 +263,6 @@ fn is_cached_binary_valid(out_dir: &Path, bin_path: &Path) -> bool {
 fn write_version_stamp(out_dir: &Path) -> io::Result<()> {
     let version_path = out_dir.join(VERSION_STAMP_FILE);
     std::fs::write(version_path, TARGET_ANTIGRAVITY_SDK_VERSION)
-}
-
-#[cfg(feature = "native")]
-fn find_venv_candidate(bin_name: &str) -> Option<PathBuf> {
-    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from)?;
-    let mut current = manifest_dir;
-    loop {
-        let venv = current.join(".venv");
-        if venv.is_dir() {
-            // Windows venv layout: .venv/Lib/site-packages/...
-            let win_candidate = venv
-                .join("Lib")
-                .join("site-packages")
-                .join("google")
-                .join("antigravity")
-                .join("bin")
-                .join(bin_name);
-            if win_candidate.is_file() {
-                return Some(win_candidate);
-            }
-
-            // Unix venv layout: .venv/lib/python3.X/site-packages/...
-            let lib_dir = venv.join("lib");
-            // NOLINT: lib directory may not exist or may be unreadable
-            if let Ok(entries) = std::fs::read_dir(&lib_dir) {
-                for entry in entries.flatten() {
-                    let candidate = entry
-                        .path()
-                        .join("site-packages")
-                        .join("google")
-                        .join("antigravity")
-                        .join("bin")
-                        .join(bin_name);
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-        if !current.pop() {
-            break;
-        }
-    }
-    None
 }
 
 #[cfg(feature = "native")]
@@ -319,14 +292,17 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if target_bin_path.exists() {
-        // NOLINT: removing stale binary is best-effort before re-extracting
-        let _ = std::fs::remove_file(&target_bin_path);
+    if target_bin_path.exists()
+        && let Err(e) = std::fs::remove_file(&target_bin_path)
+    {
+        println!(
+            "cargo:warning=Failed to remove stale harness binary at {}: {e}",
+            target_bin_path.display()
+        );
     }
 
     // 2. Check ANTIGRAVITY_HARNESS_PATH env var override
-    // NOLINT: environment variable is optional
-    if let Ok(custom_path) = env::var(ENV_HARNESS_PATH) {
+    if let Some(custom_path) = env::var_os(ENV_HARNESS_PATH) {
         let p = PathBuf::from(custom_path);
         if p.is_file() {
             println!("cargo:rustc-env=NATIVE_HARNESS_PATH={}", p.display());
@@ -334,16 +310,10 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. Check workspace .venv
-    if let Some(venv_bin) = find_venv_candidate(bin_name) {
-        #[cfg(unix)]
-        set_executable_permission(&venv_bin)?;
-        println!("cargo:rustc-env=NATIVE_HARNESS_PATH={}", venv_bin.display());
-        return Ok(());
-    }
-
-    // 4. Check ~/.gemini/antigravity/bin cache (version-stamped)
-    let home_cache_dir = env::var_os(ENV_HOME)
+    // 3. Check ~/.gemini/antigravity/bin/v<VERSION> cache (version-isolated so
+    //    older crates.io build scripts never fight over the shared binary or
+    //    hit ETXTBSY when localharness is running)
+    let home_bin_dir = env::var_os(ENV_HOME)
         .or_else(|| env::var_os(ENV_USERPROFILE))
         .map(PathBuf::from)
         .map(|home| {
@@ -351,12 +321,18 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
                 .join(ANTIGRAVITY_DIR)
                 .join(BIN_DIR)
         });
+    let versioned_cache_dir = home_bin_dir
+        .as_ref()
+        .map(|bin_dir| bin_dir.join(format!("v{TARGET_ANTIGRAVITY_SDK_VERSION}")));
 
-    if let Some(ref cache_dir) = home_cache_dir {
+    if let Some(ref cache_dir) = versioned_cache_dir {
         let candidate = cache_dir.join(bin_name);
         if is_cached_binary_valid(cache_dir, &candidate) {
             #[cfg(unix)]
             set_executable_permission(&candidate)?;
+            if let Some(ref shared_bin_dir) = home_bin_dir {
+                sync_shared_bin(&candidate, &shared_bin_dir.join(bin_name));
+            }
             println!(
                 "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
                 candidate.display()
@@ -365,11 +341,11 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 5. Download from PyPI wheel (into shared home cache if writable, else OUT_DIR)
+    // 4. Download from PyPI wheel (into versioned home cache if writable, else OUT_DIR)
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
 
-    let (dest_dir, dest_bin_path) = if let Some(ref cache_dir) = home_cache_dir
+    let (dest_dir, dest_bin_path) = if let Some(ref cache_dir) = versioned_cache_dir
         && std::fs::create_dir_all(cache_dir).is_ok()
     {
         (cache_dir.clone(), cache_dir.join(bin_name))
@@ -382,12 +358,36 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     );
     download_and_extract_wheel(&target_os, &target_arch, &dest_bin_path)?;
     write_version_stamp(&dest_dir)?;
+    if let Some(ref shared_bin_dir) = home_bin_dir {
+        sync_shared_bin(&dest_bin_path, &shared_bin_dir.join(bin_name));
+    }
 
     println!(
         "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
         dest_bin_path.display()
     );
     Ok(())
+}
+
+#[cfg(feature = "native")]
+fn sync_shared_bin(versioned_bin: &Path, shared_bin: &Path) {
+    let tmp = shared_bin.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::copy(versioned_bin, &tmp).is_ok() {
+        #[cfg(unix)]
+        if let Err(e) = set_executable_permission(&tmp) {
+            println!(
+                "cargo:warning=Failed to set executable permissions on {}: {e}",
+                tmp.display()
+            );
+        }
+        // Atomic rename avoids ETXTBSY even when shared_bin is currently executing
+        if let Err(e) = std::fs::rename(&tmp, shared_bin) {
+            println!(
+                "cargo:warning=Failed to atomically update shared harness {}: {e}",
+                shared_bin.display()
+            );
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -452,16 +452,22 @@ fn download_and_extract_wheel(
     let mut found = false;
     for i in 0..zip_archive.len() {
         let mut file = zip_archive.by_index(i)?;
-        let name = file.name().replace('\\', "/");
+        let name = file.name()?.replace('\\', "/");
         if name.ends_with("google/antigravity/bin/localharness")
             || name.ends_with("google/antigravity/bin/localharness.exe")
         {
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut out = File::create(dest_path)?;
-            io::copy(&mut file, &mut out)?;
-            out.flush()?;
+            let tmp_path = dest_path.with_extension(format!("tmp.{}", std::process::id()));
+            {
+                let mut out = File::create(&tmp_path)?;
+                io::copy(&mut file, &mut out)?;
+                out.flush()?;
+            }
+            #[cfg(unix)]
+            set_executable_permission(&tmp_path)?;
+            std::fs::rename(&tmp_path, dest_path)?;
             found = true;
             break;
         }
@@ -470,9 +476,6 @@ fn download_and_extract_wheel(
     if !found {
         return Err("Could not find localharness binary inside downloaded wheel".into());
     }
-
-    #[cfg(unix)]
-    set_executable_permission(dest_path)?;
 
     Ok(())
 }

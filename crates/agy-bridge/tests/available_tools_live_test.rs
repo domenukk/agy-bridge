@@ -34,8 +34,6 @@ impl RustTool for Multiply {
     const NAME: &'static str = "multiply";
     const DESCRIPTION: &'static str = "Multiplies two numbers.";
 
-    // NOLINT: forward-compat with future clippy::unused_async_trait_impl lint
-    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         params: Self::Params,

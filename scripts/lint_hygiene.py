@@ -14,6 +14,8 @@ Stale NOLINTs (where the next line doesn't trigger any check) are also flagged.
 import re
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
+from itertools import pairwise
 from pathlib import Path
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -22,13 +24,32 @@ MAX_FILE_LINES = 1200
 
 RUST_DIRS = ["crates/"]
 RUST_EXTS = {".rs"}
-ALL_DIRS = RUST_DIRS
-ALL_EXTS = RUST_EXTS
+PYTHON_DIRS = ["crates/", "scripts/"]
+PYTHON_EXTS = {".py"}
+ALL_DIRS = ["crates/", "scripts/"]
+ALL_EXTS = {".rs", ".py"}
 
 # Suppression markers.
 NOLINT_WITH_REASON = re.compile(r"//\s*NOLINT:\s*\S")
 NOLINT_ANY = re.compile(r"//\s*NOLINT")
 NOLINT_BARE = re.compile(r"//\s*NOLINT\s*$")
+
+# Test-code classification (Rust).
+TEST_PATH = re.compile(
+    r"(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|_tests?\.rs$|(^|/)crates/agy-bridge-test-support/"
+)
+CFG_TEST_ATTR = re.compile(r"^\s*#\[cfg\(test\)\]\s*$")
+CFG_TEST_MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+CFG_TEST_MOD_INLINE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+MODULE_ROOT_FILES = {"mod.rs", "lib.rs", "main.rs"}
+
+
+class Scope(Enum):
+    """Which code a check applies to."""
+
+    ALL = "all"
+    PRODUCTION_ONLY = "production"
+    TEST_ONLY = "test"
 
 
 # ── Check definitions ────────────────────────────────────────────────────────
@@ -46,6 +67,7 @@ class Check:
     exclude: re.Pattern[str] | None = None  # lines matching this are skipped
     exclude_path: re.Pattern[str] | None = None  # file paths matching this are skipped
     suppressible: bool = True  # if False, NOLINT cannot suppress this check
+    scope: Scope = Scope.ALL  # production-only / test-only restriction
     hits: list[str] = field(default_factory=list)
     suppressed: list[str] = field(default_factory=list)
 
@@ -53,11 +75,48 @@ class Check:
 CHECKS: list[Check] = [
     # ── Rust: hard errors (cannot be NOLINTed) ────────────────────────────
     Check(
-        name="Rust: too_many_lines suppression",
-        pattern=re.compile(r"too_many_lines"),
+        name="Rust: complexity lint suppression",
+        pattern=re.compile(
+            r"too_many_lines|too_many_arguments|type_complexity|cognitive_complexity"
+        ),
         dirs=RUST_DIRS,
         exts=RUST_EXTS,
-        message="NEVER suppress too_many_lines — refactor the function instead.",
+        message="NEVER suppress complexity lints — refactor the function or type instead.",
+        suppressible=False,
+    ),
+    Check(
+        name="Rust: #[path = ...] module override",
+        pattern=re.compile(r"#\[path\s*="),
+        dirs=RUST_DIRS,
+        exts=RUST_EXTS,
+        message='NEVER use #[path = "..."] — use standard <module>/mod.rs directory hierarchy instead.',
+        suppressible=False,
+    ),
+    Check(
+        name="Rust: include!(...) outside OUT_DIR",
+        pattern=re.compile(r"\binclude!\("),
+        dirs=RUST_DIRS,
+        exts=RUST_EXTS,
+        message="NEVER use include!() to stitch source files — use normal modules.",
+        exclude=re.compile(r"OUT_DIR"),
+        exclude_path=re.compile(r"crates/agy-bridge/src/proto/mod\.rs$"),
+        suppressible=False,
+    ),
+    Check(
+        name="Rust: untyped schemars::schema_for! conversion",
+        pattern=re.compile(r"schemars::schema_for!"),
+        dirs=RUST_DIRS,
+        exts=RUST_EXTS,
+        message="Use JsonSchema::from_schema::<T>() or #[llm_tool] instead of raw schemars::schema_for!.",
+        exclude_path=re.compile(r"crates/agy-bridge/src/config/agent/mod\.rs$"),
+        suppressible=False,
+    ),
+    Check(
+        name="Rust: banned fastrand crate",
+        pattern=re.compile(r"\bfastrand::"),
+        dirs=RUST_DIRS,
+        exts=RUST_EXTS,
+        message="Use fast_rands instead of fastrand.",
         suppressible=False,
     ),
     # ── Rust: lint suppression ────────────────────────────────────────────
@@ -92,10 +151,12 @@ CHECKS: list[Check] = [
     ),
     Check(
         name="Rust: .unwrap_or_default() (hidden errors)",
-        pattern=re.compile(r"\.unwrap_or_default\(\)"),
+        pattern=re.compile(
+            r"\.unwrap_or_default\(\)|\.(unwrap_or_else|map_or_else)\(\s*(String::new|Vec::new|HashMap::new|Default::default)\b"
+        ),
         dirs=RUST_DIRS,
         exts=RUST_EXTS,
-        message="Silently replaces errors/None with defaults. Log or propagate instead.",
+        message="Silently replaces errors/None with defaults. Use an explicit match and log/propagate the error.",
     ),
     Check(
         name="Rust: .ok() (Result→Option, error discarded)",
@@ -130,11 +191,31 @@ CHECKS: list[Check] = [
         message="Error value is discarded in pattern match. Capture and log/propagate it.",
     ),
     Check(
-        name="Rust: .unwrap_or(()) / .unwrap_or(0) (silent swallow)",
-        pattern=re.compile(r"\.unwrap_or\(\s*(\(\)|\b0\b|false|true)\s*\)"),
+        name="Rust: .unwrap_or(()) / .unwrap_or(0) / .unwrap_or(T::MAX) / .unwrap_or(Value::Null) (silent swallow)",
+        pattern=re.compile(
+            r"\.unwrap_or\(\s*(\(\)|\b0\b|false|true|\b[A-Z0-9_]*(ZERO|UNSET)[A-Z0-9_]*\b"
+            r"|\b[iu](8|16|32|64|128|size)::(MAX|MIN)\b|\bf(32|64)::(MAX|MIN)\b"
+            r"|(serde_json::)?Value::Null)\s*\)"
+        ),
         dirs=RUST_DIRS,
         exts=RUST_EXTS,
-        message="Silently swallows errors with a trivial default. Handle the error explicitly.",
+        message="Silently swallows errors with a trivial/sentinel default. Handle the error explicitly.",
+    ),
+    Check(
+        name="Rust: serde_json::json! in production code",
+        pattern=re.compile(r"\bjson!\s*\("),
+        dirs=RUST_DIRS,
+        exts=RUST_EXTS,
+        message="Untyped JSON grab-bag in production code. Use #[derive(Serialize)] structs (json! is allowed only in tests).",
+        scope=Scope.PRODUCTION_ONLY,
+    ),
+    Check(
+        name="Rust: test skip-guards (.ok()? / else { return; })",
+        pattern=re.compile(r"\.ok\(\)\?|else\s*\{\s*return\s*;\s*\}"),
+        dirs=RUST_DIRS,
+        exts=RUST_EXTS,
+        message="Tests must fail loudly, never silently skip. Use expect()/assert! instead.",
+        scope=Scope.TEST_ONLY,
     ),
     # ── Rust: panic-at-runtime markers ────────────────────────────────────
     Check(
@@ -143,6 +224,24 @@ CHECKS: list[Check] = [
         dirs=RUST_DIRS,
         exts=RUST_EXTS,
         message="Will panic at runtime. Implement or return an error.",
+    ),
+    # ── Python: error & test hygiene ──────────────────────────────────────
+    Check(
+        name="Python: bare except or silent pass",
+        pattern=re.compile(r"^\s*except\s*:|^\s*except\b[^:]*:\s*pass\b"),
+        dirs=PYTHON_DIRS,
+        exts=PYTHON_EXTS,
+        message="Catch specific exceptions and handle/log them instead of bare except or pass.",
+        exclude_path=re.compile(r"scripts/lint_hygiene\.py$"),
+    ),
+    Check(
+        name="Python: inspect.getsource() in tests",
+        pattern=re.compile(r"inspect\.getsource\("),
+        dirs=PYTHON_DIRS,
+        exts=PYTHON_EXTS,
+        message="Test behavior, never source text via inspect.getsource().",
+        exclude_path=re.compile(r"scripts/lint_hygiene\.py$"),
+        suppressible=False,
     ),
 ]
 
@@ -171,6 +270,55 @@ def is_nolinted(lines: list[str], lineno: int) -> bool:
     return bool(NOLINT_WITH_REASON.search(prev_line))
 
 
+def module_dir(path: Path) -> Path:
+    """Directory holding the child modules declared in `path`."""
+    if path.name in MODULE_ROOT_FILES:
+        return path.parent
+    return path.parent / path.stem
+
+
+def cfg_test_module_paths(rust_files: list[Path]) -> list[Path]:
+    """Files/dirs of out-of-line modules declared under `#[cfg(test)]`."""
+    gated: list[Path] = []
+    for path in rust_files:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for attr_line, decl_line in pairwise(lines):
+            if not CFG_TEST_ATTR.match(attr_line):
+                continue
+            decl = CFG_TEST_MOD_DECL.match(decl_line)
+            if decl is None:
+                continue
+            child = module_dir(path) / decl.group(1)
+            gated.extend([child.with_suffix(".rs"), child])
+    return gated
+
+
+def is_test_file(path: Path, gated_modules: list[Path]) -> bool:
+    """Whether every line of `path` is test-only code."""
+    if TEST_PATH.search(path.as_posix()):
+        return True
+    return any(path == gated or gated in path.parents for gated in gated_modules)
+
+
+def first_inline_test_line(lines: list[str]) -> int:
+    """1-indexed line where a top-level inline `#[cfg(test)] mod x { ... }` starts."""
+    for index, (attr_line, decl_line) in enumerate(pairwise(lines), start=1):
+        if CFG_TEST_ATTR.match(attr_line) and CFG_TEST_MOD_INLINE.match(decl_line):
+            return index
+    return len(lines) + 1
+
+
+def line_in_scope(scope: Scope, is_test_line: bool) -> bool:
+    """Whether a check with `scope` applies to a (test / production) line."""
+    match scope:
+        case Scope.ALL:
+            return True
+        case Scope.PRODUCTION_ONLY:
+            return not is_test_line
+        case Scope.TEST_ONLY:
+            return is_test_line
+
+
 # ── Check runners ────────────────────────────────────────────────────────────
 
 
@@ -194,6 +342,8 @@ def run_pattern_checks() -> bool:
     all_dirs_set = {d for d, _ in all_dirs_exts}
     all_exts_set = {e for _, e in all_dirs_exts}
     for path in source_files(list(all_dirs_set), all_exts_set):
+        if path.as_posix().endswith("scripts/lint_hygiene.py"):
+            continue
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
@@ -203,6 +353,7 @@ def run_pattern_checks() -> bool:
                 nolint_locations[(path, lineno)] = False  # not yet consumed
 
     # Second pass: run checks, marking consumed NOLINTs.
+    gated_modules = cfg_test_module_paths(source_files(RUST_DIRS, RUST_EXTS))
     for check in CHECKS:
         print(f"=== {check.name} ===")
         files = source_files(check.dirs, check.exts)
@@ -213,8 +364,13 @@ def run_pattern_checks() -> bool:
                 lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
+            whole_file_is_test = is_test_file(path, gated_modules)
+            inline_test_start = first_inline_test_line(lines)
             for lineno, line in enumerate(lines, start=1):
                 if not check.pattern.search(line):
+                    continue
+                is_test_line = whole_file_is_test or lineno >= inline_test_start
+                if not line_in_scope(check.scope, is_test_line):
                     continue
                 # Skip lines that are NOLINT comments — pattern matches in
                 # the reason text are not actual code violations.
@@ -285,8 +441,8 @@ def run_bare_nolint_check() -> bool:
 
 
 def run_long_file_check() -> bool:
-    """Flag files exceeding MAX_FILE_LINES."""
-    print(f"=== Long files (>{MAX_FILE_LINES} lines) ===")
+    """Flag files reaching or exceeding MAX_FILE_LINES."""
+    print(f"=== Long files (>={MAX_FILE_LINES} lines) ===")
     long_files: list[tuple[Path, int]] = []
 
     for path in source_files(ALL_DIRS, ALL_EXTS):
@@ -294,7 +450,7 @@ def run_long_file_check() -> bool:
             line_count = sum(1 for _ in path.open(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        if line_count > MAX_FILE_LINES:
+        if line_count >= MAX_FILE_LINES:
             long_files.append((path, line_count))
 
     if long_files:
@@ -315,6 +471,9 @@ def run_long_file_check() -> bool:
 
 
 def main() -> int:
+    import os
+
+    os.chdir(Path(__file__).resolve().parent.parent)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):

@@ -18,11 +18,12 @@ use super::{
     NativeAgentSession, WS_CONNECT_RETRY_COUNT, WS_CONNECT_RETRY_DELAY,
     config::build_harness_config,
     events::{
-        TrajectoryStateContext, handle_call_hook_request, handle_policy_decision_request,
-        handle_step_update, handle_tool_call, handle_trajectory_state_update, handle_usage_update,
-        to_usage_metadata,
+        StepUpdateContext, TrajectoryStateContext, handle_call_hook_request,
+        handle_policy_decision_request, handle_step_update, handle_tool_call,
+        handle_trajectory_state_update, handle_usage_update, to_usage_metadata,
     },
     proto,
+    session::InitialHarnessState,
 };
 use crate::{
     agent::AgentId,
@@ -30,7 +31,7 @@ use crate::{
     error::Error,
     hooks::Hooks,
     policies::PolicySet,
-    types::{ConversationMessage, UsageMetadata},
+    types::{ConversationMessage, MessageRole, UsageMetadata},
 };
 
 pub(super) type HarnessWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -86,14 +87,7 @@ pub(super) async fn initialize_harness(
     config: &AgentConfig,
     hook_runner: Option<&Arc<Hooks>>,
     policies: &PolicySet,
-) -> Result<
-    (
-        Option<String>,
-        UsageMetadata,
-        Option<crate::types::SandboxStatus>,
-    ),
-    Error,
-> {
+) -> Result<InitialHarnessState, Error> {
     let harness_config = build_harness_config(config, None, hook_runner, policies);
     let init_event = proto::localharness::InitializeConversationEvent {
         config: Some(harness_config),
@@ -127,22 +121,33 @@ pub(super) async fn initialize_harness(
             message: format!("Failed to parse InitializeConversationResponse ({first_text}): {e}"),
         })?;
 
-    let mut initial_cascade_id = None;
-    let mut initial_usage = UsageMetadata::default();
-    let mut initial_sandbox_status = None;
+    Ok(parse_init_response(&init_resp, config))
+}
+
+fn parse_init_response(
+    init_resp: &proto::localharness::OutputEvent,
+    config: &AgentConfig,
+) -> InitialHarnessState {
+    let mut cascade_id = None;
+    let mut usage = UsageMetadata::default();
+    let mut sandbox_status = None;
+    let mut history = Vec::new();
+    let mut last_response_text = None;
+    let mut compaction_indices = Vec::new();
+    let mut turn_count = 0u32;
 
     if let Some(proto::localharness::output_event::Event::InitializeConversationResponse(
         ref resp,
     )) = init_resp.event
     {
         if !resp.cascade_id.is_empty() {
-            initial_cascade_id = Some(resp.cascade_id.clone());
+            cascade_id = Some(resp.cascade_id.clone());
         }
         if let Some(ref u) = resp.cumulative_usage {
-            initial_usage = to_usage_metadata(u);
+            usage = to_usage_metadata(u);
         }
         if let Some(ref s) = resp.sandbox_status {
-            initial_sandbox_status = Some(crate::types::SandboxStatus {
+            sandbox_status = Some(crate::types::SandboxStatus {
                 available: s.available,
                 unavailable_reason: if s.unavailable_reason.is_empty() {
                     None
@@ -151,9 +156,91 @@ pub(super) async fn initialize_harness(
                 },
             });
         }
+        for step_update in &resp.history {
+            if step_update.compaction.is_some()
+                && !compaction_indices.contains(&step_update.step_index)
+            {
+                compaction_indices.push(step_update.step_index);
+            }
+            if step_update.source == 2 {
+                let text = if step_update.request_text.is_empty() {
+                    step_update.text.clone()
+                } else {
+                    step_update.request_text.clone()
+                };
+                if !text.is_empty() {
+                    history.push(ConversationMessage {
+                        role: MessageRole::User,
+                        content: text,
+                    });
+                    turn_count = turn_count.saturating_add(1);
+                }
+            } else if (step_update.source == 3 || step_update.source == 0)
+                && !step_update.text.is_empty()
+            {
+                history.push(ConversationMessage {
+                    role: MessageRole::Model,
+                    content: step_update.text.clone(),
+                });
+                last_response_text = Some(step_update.text.clone());
+            }
+        }
     }
 
-    Ok((initial_cascade_id, initial_usage, initial_sandbox_status))
+    if history.is_empty() && !config.initial_history.is_empty() {
+        history.clone_from(&config.initial_history);
+        last_response_text = history
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Model)
+            .map(|m| m.content.clone());
+        let user_turns = history
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count();
+        turn_count = match u32::try_from(user_turns) {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    user_turns,
+                    "initial_history user turn count exceeds u32; saturating turn_count"
+                );
+                u32::MAX
+            }
+        };
+    }
+
+    InitialHarnessState {
+        cascade_id,
+        usage,
+        sandbox_status,
+        history,
+        last_response_text,
+        compaction_indices,
+        turn_count,
+    }
+}
+
+pub(super) fn remove_persisted_conversation_files(save_dir: &std::path::Path, cascade_id: &str) {
+    if cascade_id.is_empty() {
+        return;
+    }
+    for candidate in [
+        save_dir.join(format!("{cascade_id}.db")),
+        save_dir.join(format!("traj-{cascade_id}")),
+        save_dir.join(cascade_id),
+    ] {
+        if candidate.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&candidate) {
+                tracing::debug!(path = %candidate.display(), error = %e, "Failed removing persisted conversation dir");
+            }
+        } else if candidate.is_file()
+            && let Err(e) = std::fs::remove_file(&candidate)
+        {
+            tracing::debug!(path = %candidate.display(), error = %e, "Failed removing persisted conversation file");
+        }
+    }
 }
 
 fn spawn_ws_sink_task(
@@ -172,7 +259,11 @@ fn spawn_ws_sink_task(
             match serde_json::to_string(&event) {
                 Ok(json_str) => {
                     if let Err(e) = ws_sink.send(Message::Text(json_str.into())).await {
-                        tracing::error!(error = %e, "Failed to write InputEvent to WebSocket");
+                        if is_session_end {
+                            tracing::debug!(error = %e, "WebSocket already closed on SessionEndRequest");
+                        } else {
+                            tracing::error!(error = %e, "Failed to write InputEvent to WebSocket");
+                        }
                         break;
                     }
                 }
@@ -197,6 +288,7 @@ struct SessionReaderContext {
     last_error: Arc<Mutex<Option<crate::streaming::StreamError>>>,
     produced_output: Arc<AtomicBool>,
     turn_activity: Arc<AtomicBool>,
+    compaction_indices: Arc<Mutex<Vec<u32>>>,
     event_tx: mpsc::Sender<proto::localharness::InputEvent>,
     turn_count: Arc<AtomicU32>,
     total_usage: Arc<Mutex<crate::types::UsageMetadata>>,
@@ -215,6 +307,7 @@ impl SessionReaderContext {
             last_error: Arc::clone(&session.last_error),
             produced_output: Arc::clone(&session.produced_output),
             turn_activity: Arc::clone(&session.turn_activity),
+            compaction_indices: Arc::clone(&session.compaction_indices),
             event_tx: session.event_tx.clone(),
             turn_count: Arc::clone(&session.turn_count),
             total_usage: Arc::clone(&session.total_usage),
@@ -240,7 +333,15 @@ fn spawn_ws_reader_task(
             let msg = match msg_res {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::error!(error = %e, "Error reading from harness WebSocket");
+                    if connected_clone.load(Ordering::Acquire) {
+                        tracing::error!(error = %e, "Error reading from harness WebSocket");
+                    } else {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "Harness WebSocket closed during agent shutdown"
+                        );
+                    }
                     break;
                 }
             };
@@ -282,16 +383,15 @@ async fn dispatch_output_event(
 ) {
     match event {
         proto::localharness::output_event::Event::StepUpdate(step_update) => {
-            handle_step_update(
-                agent_id,
-                step_update,
-                &ctx.active_writer,
-                &ctx.last_response_text,
-                &ctx.last_error,
-                &ctx.produced_output,
-                &ctx.turn_activity,
-            )
-            .await;
+            let step_ctx = StepUpdateContext {
+                active_writer: &ctx.active_writer,
+                last_response_text: &ctx.last_response_text,
+                last_error: &ctx.last_error,
+                produced_output: &ctx.produced_output,
+                turn_activity: &ctx.turn_activity,
+                compaction_indices: &ctx.compaction_indices,
+            };
+            handle_step_update(agent_id, step_update, &step_ctx).await;
         }
         proto::localharness::output_event::Event::ToolCall(tool_call) => {
             let writer = Arc::clone(&ctx.active_writer);
@@ -381,4 +481,35 @@ pub(super) fn spawn_session_io_tasks(
     let (ws_sink, ws_stream_reader) = ws.split();
     spawn_ws_sink_task(runtime, ws_sink, event_rx);
     spawn_ws_reader_task(runtime, agent_id, ws_stream_reader, session);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streaming::channel_with_buffer;
+
+    #[tokio::test]
+    async fn handle_ws_reader_exit_marks_disconnected_and_fails_active_turn() {
+        let connected = Arc::new(AtomicBool::new(true));
+        let is_idle = Arc::new(AtomicBool::new(false));
+        let idle_notify = Arc::new(Notify::new());
+        let (writer, handle) = channel_with_buffer(8);
+        let active_writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+
+        handle_ws_reader_exit(&connected, &is_idle, &idle_notify, &active_writer).await;
+
+        assert!(!connected.load(Ordering::SeqCst));
+        assert!(is_idle.load(Ordering::SeqCst));
+        assert!(active_writer.lock().await.is_none());
+
+        let err = handle
+            .text()
+            .await
+            .expect_err("active turn should fail with StreamError on WebSocket exit");
+        assert!(
+            err.to_string()
+                .contains("Harness WebSocket closed before the turn completed"),
+            "unexpected error: {err}"
+        );
+    }
 }

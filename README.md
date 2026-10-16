@@ -1,14 +1,17 @@
 # agy-bridge
 
-Build LLM agents in Rust — with tools, hooks, streaming, and multimodal input.
-
-Rust bridge for the
+Rust SDK for building LLM agents with tools, hooks, policies, streaming,
+subagents, and multimodal input on top of the
 [Google Antigravity SDK](https://github.com/Google-Antigravity/antigravity-sdk-python)
-via [PyO3](https://pyo3.rs).
+(`localharness`).
 
-> Rust's compile-time checks make it a natural fit for vibe coding agents —
-> schema mismatches, missing parameters, and typos in tool definitions
-> (via [`#[llm_tool]`](#custom-tools)) are caught at build time, not at runtime.
+Supports two runtime backends behind a unified API:
+
+- **`native` (default)**: Pure-Rust client that communicates directly with the
+  standalone `localharness` binary over stdio protobuf and WebSocket JSON
+  without a Python interpreter.
+- **`python`**: In-process bridge to the Python `google-antigravity` package via
+  [PyO3](https://pyo3.rs).
 
 ## Installation
 
@@ -258,11 +261,11 @@ struct Summary {
     bullet_points: Vec<String>,
 }
 
-let schema = serde_json::to_value(schemars::schema_for!(Summary))
+let schema = JsonSchema::from_schema::<Summary>()
     .expect("schema serialization");
 
 let config = AgentConfig::builder()
-    .response_schema(JsonSchema::new(schema))
+    .response_schema(schema)
     .build();
 
 // The agent's response will be valid JSON matching `Summary`.

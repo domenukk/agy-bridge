@@ -13,10 +13,12 @@ pub use llm_tool::__private;
 #[cfg(feature = "md-tmpl")]
 pub use llm_tool::md_tmpl;
 pub use llm_tool::{
-    EmptyParams, Json, JsonSchema, PromptDefinition, PromptOutput, PromptRegistry, RegistryItem,
-    ResourceDefinition, ResourceOutput, ResourceRegistry, RustPrompt, RustResource, RustTool,
-    SharedState, ToolContext, ToolDefinition, ToolEffect, ToolError, ToolOutput, ToolRegistry,
-    definition_of, llm_prompt, llm_resource, llm_tool,
+    EmptyParams, Json, JsonSchema, OutputSanitization, PromptDefinition, PromptOutput,
+    PromptRegistry, RegistryItem, ResourceDefinition, ResourceOutput, ResourceRegistry, RustPrompt,
+    RustResource, RustTool, Sanitized, SharedState, ToolContext, ToolDefinition, ToolEffect,
+    ToolError, ToolOutput, ToolRegistry, definition_of, is_quarantined_output, llm_prompt,
+    llm_resource, llm_tool, neutralize_delimiters, quarantine_tool_output,
+    unquarantine_tool_output,
 };
 
 // ── Available tool discovery types ──────────────────────────────────

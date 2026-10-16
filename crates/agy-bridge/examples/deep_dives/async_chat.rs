@@ -124,13 +124,11 @@ impl AsyncChatRoom {
 
         self.notify.notify_waiters();
 
-        if timeout(
+        if let Err(_elapsed) = timeout(
             Duration::from_secs(DISCUSSION_TIMEOUT_SECS),
             futures::future::join_all(tasks),
         )
         .await
-        // NOLINT: if-condition checking timeout result — value is not needed, only the timeout status
-        .is_err()
         {
             eprintln!("  ⚠ Discussion timed out after {DISCUSSION_TIMEOUT_SECS}s");
         }

@@ -48,10 +48,6 @@ impl std::fmt::Display for ThinkingLevel {
 }
 
 /// Generation parameters for a model, mirroring the SDK's `GenerationConfig`.
-///
-/// Currently only `thinking_level` is forwarded to the Gemini backend via
-/// the Antigravity SDK. Additional generation parameters (temperature,
-/// `top_p`, etc.) will be added when the SDK exposes them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerationConfig {
     /// Thinking level for models that support extended thinking.
@@ -61,6 +57,9 @@ pub struct GenerationConfig {
     /// Service tier for the model (standard, priority, flex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<crate::types::ServiceTier>,
+    /// Maximum number of output tokens the model is allowed to generate per response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i32>,
 }
 
 /// A single model slot with its name, optional API key, and generation config.
@@ -184,6 +183,7 @@ mod tests {
             generation: GenerationConfig {
                 thinking_level: Some(ThinkingLevel::High),
                 service_tier: None,
+                max_output_tokens: Some(8192),
             },
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -191,6 +191,7 @@ mod tests {
         assert_eq!(parsed.name, "gemini-3.5-flash");
         assert_eq!(parsed.api_key.as_deref(), Some("mock_test_api_key_123"));
         assert_eq!(parsed.generation.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(parsed.generation.max_output_tokens, Some(8192));
     }
 
     #[test]

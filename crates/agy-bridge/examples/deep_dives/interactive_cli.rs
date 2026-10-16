@@ -31,13 +31,17 @@ fn read_file_upside_down(
 
 fn read_user_input() -> Option<String> {
     print!("\n  You: ");
-    // NOLINT: example code — flush failure returns None, ending input gracefully
-    std::io::stdout().flush().ok()?;
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("Failed to flush stdout: {e}");
+        return None;
+    }
 
     let stdin = std::io::stdin();
     let mut line = String::new();
-    // NOLINT: example code — readline failure returns None, ending input gracefully
-    stdin.lock().read_line(&mut line).ok()?;
+    if let Err(e) = stdin.lock().read_line(&mut line) {
+        eprintln!("Failed to read stdin: {e}");
+        return None;
+    }
 
     let trimmed = line.trim().to_owned();
     if trimmed.is_empty() {

@@ -33,7 +33,9 @@ fn test_compaction_config_builder_and_defaults() {
 #[test]
 fn test_agent_config_with_compaction_config() {
     let compaction = CompactionConfig::builder().token_threshold(75_000).build();
-    let agent_cfg = AgentConfig::builder().compaction_config(compaction).build();
+    let agent_cfg = AgentConfig::builder()
+        .compaction_config(compaction.clone())
+        .build();
     assert_eq!(agent_cfg.compaction_config, Some(compaction));
 
     let json = serde_json::to_string(&agent_cfg).expect("serialize");
@@ -336,6 +338,7 @@ fn test_v017_lightweight_compaction_budget_retry_mock_server_turn() {
                         generation: GenerationConfig {
                             thinking_level: Some(ThinkingLevel::Low),
                             service_tier: Some(ServiceTier::Flex),
+                            max_output_tokens: Some(16_384),
                         },
                     },
                     ..ModelConfig::default()
@@ -374,6 +377,223 @@ fn test_v017_lightweight_compaction_budget_retry_mock_server_turn() {
             reply.contains("Lightweight v0.17 agent ready."),
             "Unexpected reply: {reply}"
         );
+        agent.shutdown().await.expect("shutdown succeeds");
+    });
+}
+
+#[test]
+fn test_v0_1_22_sdk_features_roundtrip() {
+    use agy_bridge::{
+        BuiltinTools, InlineSkill, SubagentConfig, SubagentSkillsConfig, WorkflowProgress,
+    };
+
+    let inline_skill = InlineSkill::builder()
+        .name("memory_safety_audit")
+        .description("Audit memory safety invariants")
+        .content("# Memory Safety Audit\n1. Check bounds.")
+        .allowed_tools(vec!["view_file", "grep_search"])
+        .dependent_tools(vec!["view_file"])
+        .dependent_skills(vec!["core_triage"])
+        .build();
+
+    let subagent = SubagentConfig::builder()
+        .name("verifier")
+        .description("Adversarial verifier")
+        .model("gemini-3.5-flash")
+        .skills_config(SubagentSkillsConfig::Override {
+            skills_paths: vec![std::path::PathBuf::from("/tmp/skills")],
+            inline_skills: vec![inline_skill.clone()],
+        })
+        .build();
+
+    let compaction = CompactionConfig::one_million()
+        .with_summary_prompt_override("Keep all reproduction steps and addresses.")
+        .with_use_model_reported_token_count(true);
+
+    let truncation = ToolOutputTruncationConfig::new(8192).with_save_full_output(true);
+
+    let caps = CapabilitiesConfig::builder()
+        .mcp_max_output_bytes(131_072)
+        .tool_output_truncation_config(truncation)
+        .enabled_tools(vec![
+            BuiltinTools::ViewFile,
+            BuiltinTools::InvokeSubagent,
+            BuiltinTools::RunWorkflow,
+            BuiltinTools::Schedule,
+        ])
+        .build();
+
+    let agent_cfg = AgentConfig::builder()
+        .inline_skills(vec![inline_skill])
+        .subagents(vec![subagent])
+        .compaction_config(compaction)
+        .capabilities(caps)
+        .build();
+
+    let json = serde_json::to_string(&agent_cfg).expect("serialize v0.1.22 AgentConfig");
+    let parsed: AgentConfig = serde_json::from_str(&json).expect("deserialize v0.1.22 AgentConfig");
+    assert_eq!(parsed.inline_skills.len(), 1);
+    assert_eq!(parsed.inline_skills[0].name, "memory_safety_audit");
+    assert_eq!(parsed.subagents.len(), 1);
+    assert_eq!(
+        parsed.subagents[0].model.as_deref(),
+        Some("gemini-3.5-flash")
+    );
+    assert_eq!(
+        parsed
+            .compaction_config
+            .as_ref()
+            .and_then(|c| c.summary_prompt_override.as_deref()),
+        Some("Keep all reproduction steps and addresses.")
+    );
+    assert_eq!(
+        parsed
+            .compaction_config
+            .as_ref()
+            .and_then(|c| c.use_model_reported_token_count),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.mcp_max_output_bytes),
+        Some(131_072)
+    );
+    assert!(
+        parsed
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.tool_output_truncation_config)
+            .is_some_and(|t| t.save_full_output && t.max_tokens == 8192)
+    );
+
+    let wf = WorkflowProgress {
+        script_path: "/tmp/workflow.py".to_string(),
+        script: String::new(),
+        description: "Multi-agent triage workflow".to_string(),
+        output: "phase 1 complete".to_string(),
+    };
+    let wf_json = serde_json::to_string(&wf).expect("serialize WorkflowProgress");
+    let wf_parsed: WorkflowProgress =
+        serde_json::from_str(&wf_json).expect("deserialize WorkflowProgress");
+    assert_eq!(wf_parsed, wf);
+}
+
+fn v0_1_22_agent_config(base_url: String) -> AgentConfig {
+    use agy_bridge::{
+        BuiltinTools, ConversationMessage, InlineSkill, MessageRole, SubagentConfig,
+        SubagentSkillsConfig,
+        config::{
+            GeminiConfig, GenerationConfig, ModelConfig, ModelEntry, RetryConfig, ThinkingLevel,
+        },
+        policies::PolicyRule,
+        types::ServiceTier,
+    };
+
+    let inline_skill = InlineSkill::builder()
+        .name("triage_skill")
+        .description("Triage crash dumps")
+        .content("# Triage\nVerify ASan splat.")
+        .allowed_tools(vec!["view_file", "grep_search"])
+        .build();
+    let subagent = SubagentConfig::builder()
+        .name("sub_verifier")
+        .description("Subagent verifier")
+        .model("gemini-3-flash-preview")
+        .skills_config(SubagentSkillsConfig::Override {
+            skills_paths: Vec::new(),
+            inline_skills: vec![inline_skill.clone()],
+        })
+        .build();
+
+    AgentConfig {
+        initial_history: vec![
+            ConversationMessage {
+                role: MessageRole::User,
+                content: "prior question".to_string(),
+            },
+            ConversationMessage {
+                role: MessageRole::Model,
+                content: "prior answer".to_string(),
+            },
+        ],
+        inline_skills: vec![inline_skill],
+        subagents: vec![subagent],
+        gemini: Some(GeminiConfig {
+            api_key: Some("mock-v0122-key".to_string()),
+            base_url: Some(base_url),
+            models: ModelConfig {
+                default: ModelEntry {
+                    name: "gemini-3-flash-preview".to_string(),
+                    api_key: Some("per-model-key".to_string()),
+                    generation: GenerationConfig {
+                        thinking_level: Some(ThinkingLevel::Low),
+                        service_tier: Some(ServiceTier::Flex),
+                        max_output_tokens: Some(16_384),
+                    },
+                },
+                ..ModelConfig::default()
+            },
+        }),
+        compaction_config: Some(
+            CompactionConfig::one_million()
+                .with_summary_prompt_override("Preserve all PoC commands.")
+                .with_use_model_reported_token_count(true),
+        ),
+        capabilities: Some(
+            CapabilitiesConfig::builder()
+                .mcp_max_output_bytes(65_536)
+                .tool_output_truncation_config(
+                    ToolOutputTruncationConfig::new(4096).with_save_full_output(true),
+                )
+                .enabled_tools(vec![
+                    BuiltinTools::ViewFile,
+                    BuiltinTools::InvokeSubagent,
+                    BuiltinTools::RunWorkflow,
+                    BuiltinTools::Schedule,
+                ])
+                .build(),
+        ),
+        retry_config: Some(RetryConfig::benchmark()),
+        policies: vec![PolicyRule::AllowAll],
+        ..AgentConfig::default()
+    }
+}
+
+#[test]
+fn test_v0_1_22_real_localharness_turn_with_inline_skills_and_compaction() {
+    use agy_bridge_test_support::*;
+
+    let rt = multi_thread_rt();
+    rt.block_on(async {
+        let server = MockGeminiServer::start(vec![MockResponse::Text(
+            "Real localharness v0.1.22 turn succeeded.".into(),
+        )])
+        .await;
+
+        let bridge = shared_bridge();
+        let agent = bridge
+            .agent(v0_1_22_agent_config(server.base_url()))
+            .await
+            .expect("real localharness v0.1.22 accepted all new config fields");
+        let pre_history = agent.history().await.expect("initial history read");
+        assert_eq!(pre_history.len(), 2);
+        assert_eq!(
+            agent.last_response().await.expect("last_response"),
+            Some("prior answer".to_string())
+        );
+        assert_eq!(agent.turn_count().await.expect("turn_count"), 1);
+
+        let reply = agent
+            .chat_text("ping v0.1.22")
+            .await
+            .expect("v0.1.22 chat succeeds");
+        assert!(
+            reply.contains("Real localharness v0.1.22 turn succeeded."),
+            "Unexpected reply: {reply}"
+        );
+        assert_eq!(agent.turn_count().await.expect("turn_count after turn"), 2);
         agent.shutdown().await.expect("shutdown succeeds");
     });
 }

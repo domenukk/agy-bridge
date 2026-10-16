@@ -227,6 +227,13 @@ impl StreamErrorState {
     }
 }
 
+fn format_token_metric(count: Option<u64>) -> String {
+    match count {
+        Some(n) => n.to_string(),
+        None => "n/a".to_owned(),
+    }
+}
+
 async fn forward_step_to_writer(
     writer: &crate::streaming::ChatResponseWriter,
     mut step: crate::types::Step,
@@ -284,12 +291,9 @@ async fn forward_step_to_writer(
     let usage_summary = step.usage_metadata.as_ref().map(|u| {
         format!(
             "{}p/{}o/{}t",
-            // NOLINT: zero is the correct default for missing token counts
-            u.prompt_token_count.unwrap_or(0),
-            // NOLINT: zero is the correct default for missing token counts
-            u.candidates_token_count.unwrap_or(0),
-            // NOLINT: zero is the correct default for missing token counts
-            u.thoughts_token_count.unwrap_or(0),
+            format_token_metric(u.prompt_token_count),
+            format_token_metric(u.candidates_token_count),
+            format_token_metric(u.thoughts_token_count),
         )
     });
     let text_len = step.content.len() + step.content_delta.len();
@@ -725,5 +729,4 @@ fn send_stream_error(
 }
 
 #[cfg(test)]
-#[path = "streaming_tests.rs"]
 mod tests;

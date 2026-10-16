@@ -21,9 +21,12 @@ use tokio::sync::mpsc;
 use self::{
     events::to_proto_user_input,
     process::HarnessProcess,
-    session::NativeAgentSession,
+    session::{InitialHarnessState, NativeAgentSession},
     tools::build_available_tools,
-    ws::{HarnessWsStream, connect_to_harness, initialize_harness, spawn_session_io_tasks},
+    ws::{
+        HarnessWsStream, connect_to_harness, initialize_harness,
+        remove_persisted_conversation_files, spawn_session_io_tasks,
+    },
 };
 use crate::{
     agent::{AgentId, Runtime},
@@ -264,15 +267,7 @@ impl NativeRuntime {
         config: &AgentConfig,
         hook_runner: Option<&Arc<Hooks>>,
         policies: &PolicySet,
-    ) -> Result<
-        (
-            HarnessWsStream,
-            Option<String>,
-            UsageMetadata,
-            Option<crate::types::SandboxStatus>,
-        ),
-        Error,
-    > {
+    ) -> Result<(HarnessWsStream, InitialHarnessState), Error> {
         let (mut port, mut api_key, was_reused) = self
             .get_or_spawn_harness(save_dir, custom_binary_path, agent_id, false)
             .await?;
@@ -294,14 +289,8 @@ impl NativeRuntime {
             Err(e) => return Err(e),
         };
 
-        let (initial_cascade_id, initial_usage, initial_sandbox_status) =
-            initialize_harness(&mut ws, config, hook_runner, policies).await?;
-        Ok((
-            ws,
-            initial_cascade_id,
-            initial_usage,
-            initial_sandbox_status,
-        ))
+        let init_state = initialize_harness(&mut ws, config, hook_runner, policies).await?;
+        Ok((ws, init_state))
     }
 
     /// Terminate all managed localharness processes and wait for exit.
@@ -362,7 +351,7 @@ async fn acquire_session_turn(
 ) -> Result<(), Error> {
     if !session.connected.load(Ordering::SeqCst) {
         return Err(Error::BackendError {
-            message: "Agent session is disconnected: the harness                       WebSocket has closed and cannot accept new turns"
+            message: "Agent session is disconnected: the harness WebSocket has closed and cannot accept new turns"
                 .to_string(),
         });
     }
@@ -505,7 +494,16 @@ impl Runtime for NativeRuntime {
             let policies = PolicySet::validated_from(config.policies.clone())?;
 
             let save_dir = config.save_dir.clone().unwrap_or_else(std::env::temp_dir);
-            let (ws, initial_cascade_id, initial_usage, initial_sandbox_status) = match self
+            if config.save_dir.is_some()
+                && let Err(e) = std::fs::create_dir_all(&save_dir)
+            {
+                tracing::warn!(
+                    path = %save_dir.display(),
+                    error = %e,
+                    "Failed to pre-create save_dir for localharness"
+                );
+            }
+            let (ws, init_state) = match self
                 .connect_and_init_harness(
                     &save_dir,
                     custom_binary_path.as_deref(),
@@ -524,6 +522,7 @@ impl Runtime for NativeRuntime {
                 }
             };
 
+            let initial_cascade_id = init_state.cascade_id.clone();
             if let Some(ref id) = initial_cascade_id
                 && let Err(e) =
                     crate::runtime::bridge_state::set_agent_conversation_id(agent_id, id.clone())
@@ -535,12 +534,7 @@ impl Runtime for NativeRuntime {
             let (event_tx, event_rx) =
                 mpsc::channel::<proto::localharness::InputEvent>(EVENT_CHANNEL_BUFFER_SIZE);
 
-            let session = Arc::new(NativeAgentSession::new(
-                event_tx,
-                initial_usage,
-                initial_sandbox_status,
-                save_dir,
-            ));
+            let session = Arc::new(NativeAgentSession::new(event_tx, init_state, save_dir));
 
             spawn_session_io_tasks(&runtime, agent_id, ws, &session, event_rx);
 
@@ -597,6 +591,14 @@ impl Runtime for NativeRuntime {
 
             session.produced_output.store(false, Ordering::SeqCst);
             session.turn_activity.store(false, Ordering::SeqCst);
+            match session.last_response_text.lock() {
+                Ok(mut resp_lock) => {
+                    *resp_lock = None;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Poisoned last_response_text lock in chat");
+                }
+            }
             match session.last_error.lock() {
                 Ok(mut err_lock) => {
                     *err_lock = None;
@@ -1001,6 +1003,22 @@ impl Runtime for NativeRuntime {
                 message: format!("Poisoned history lock: {e}"),
             })?;
             hist.clear();
+            let mut indices =
+                session
+                    .compaction_indices
+                    .lock()
+                    .map_err(|e| Error::BackendError {
+                        message: format!("Poisoned compaction_indices lock: {e}"),
+                    })?;
+            indices.clear();
+            let mut last_resp =
+                session
+                    .last_response_text
+                    .lock()
+                    .map_err(|e| Error::BackendError {
+                        message: format!("Poisoned last_response_text lock: {e}"),
+                    })?;
+            *last_resp = None;
             session.turn_count.store(0, Ordering::SeqCst);
             Ok(())
         }
@@ -1058,6 +1076,30 @@ impl Runtime for NativeRuntime {
         }
     }
 
+    fn delete(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
+        let sessions_map = Arc::clone(&self.sessions);
+        let shutdown_fut = self.shutdown_agent(agent_id);
+        async move {
+            let save_dir_opt = match sessions_map.read() {
+                Ok(s) => s.get(&agent_id).map(|sess| sess.save_dir.clone()),
+                Err(e) => {
+                    tracing::error!(error = %e, "Poisoned NATIVE_SESSIONS lock in delete");
+                    None
+                }
+            };
+            let conv_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id);
+            let res = shutdown_fut.await;
+            if let (Some(save_dir), Some(cid)) = (save_dir_opt, conv_id) {
+                remove_persisted_conversation_files(&save_dir, &cid);
+            }
+            res
+        }
+    }
+
+    fn disconnect(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
+        self.shutdown_agent(agent_id)
+    }
+
     fn is_idle(&self, agent_id: AgentId) -> impl Future<Output = Result<bool, Error>> + Send {
         let sessions_map = Arc::clone(&self.sessions);
         async move {
@@ -1097,4 +1139,4 @@ impl Runtime for NativeRuntime {
 }
 
 #[cfg(test)]
-mod mod_tests;
+mod tests;

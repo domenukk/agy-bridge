@@ -94,6 +94,8 @@ pub(crate) fn to_domain_step(update: &proto::localharness::StepUpdate) -> Step {
         _ => StepSource::Model,
     };
 
+    let tool_calls = super::tools::extract_step_tool_calls(update);
+
     let (step_type, structured_output) = if update.compaction.is_some() {
         (StepType::Compaction, None)
     } else if let Some(ref finish) = update.finish {
@@ -109,6 +111,8 @@ pub(crate) fn to_domain_step(update: &proto::localharness::StepUpdate) -> Step {
             }
         };
         (StepType::Finish, structured)
+    } else if !tool_calls.is_empty() {
+        (StepType::ToolCall, None)
     } else if !update.text.is_empty() {
         (StepType::TextResponse, None)
     } else if !update.thinking.is_empty() {
@@ -117,20 +121,34 @@ pub(crate) fn to_domain_step(update: &proto::localharness::StepUpdate) -> Step {
         (StepType::Unknown, None)
     };
 
+    let depth = u32::from(!update.parent_trajectory_id.is_empty());
+
     let mut step = Step::builder()
         .id(format!("step-{}", update.step_index))
         .step_index(update.step_index)
         .cascade_id(update.cascade_id.clone())
         .trajectory_id(update.trajectory_id.clone())
         .parent_trajectory_id(update.parent_trajectory_id.clone())
+        .depth(depth)
         .step_type(step_type)
         .status(status)
         .source(source)
         .content(update.text.clone())
         .thinking(update.thinking.clone())
+        .tool_calls(tool_calls)
         .error(update.error_message.clone())
         .build();
     step.structured_output = structured_output;
+    step.workflow_progress =
+        update
+            .run_workflow
+            .as_ref()
+            .map(|rw| crate::types::WorkflowProgress {
+                script_path: rw.script_path.clone(),
+                script: rw.script.clone(),
+                description: rw.description.clone(),
+                output: rw.output.clone(),
+            });
     step
 }
 
@@ -283,23 +301,44 @@ fn record_step_error(
     }
 }
 
+/// Context handles required to process a harness step update.
+pub(crate) struct StepUpdateContext<'a> {
+    pub(crate) active_writer: &'a Arc<tokio::sync::Mutex<Option<ChatResponseWriter>>>,
+    pub(crate) last_response_text: &'a Arc<Mutex<Option<String>>>,
+    pub(crate) last_error: &'a Arc<Mutex<Option<crate::streaming::StreamError>>>,
+    pub(crate) produced_output: &'a Arc<AtomicBool>,
+    pub(crate) turn_activity: &'a Arc<AtomicBool>,
+    pub(crate) compaction_indices: &'a Arc<Mutex<Vec<u32>>>,
+}
+
 pub(crate) async fn handle_step_update(
     agent_id: AgentId,
     step_update: proto::localharness::StepUpdate,
-    active_writer_clone: &Arc<tokio::sync::Mutex<Option<ChatResponseWriter>>>,
-    last_response_text_clone: &Arc<Mutex<Option<String>>>,
-    last_error_clone: &Arc<Mutex<Option<crate::streaming::StreamError>>>,
-    produced_output_clone: &Arc<AtomicBool>,
-    turn_activity_clone: &Arc<AtomicBool>,
+    ctx: &StepUpdateContext<'_>,
 ) {
     // The harness emitted a step for this turn: record activity so an abnormal
     // empty completion can be distinguished from a silent failed trajectory.
-    turn_activity_clone.store(true, Ordering::SeqCst);
+    ctx.turn_activity.store(true, Ordering::SeqCst);
+    if step_update.compaction.is_some() {
+        match ctx.compaction_indices.lock() {
+            Ok(mut indices) => {
+                if !indices.contains(&step_update.step_index) {
+                    indices.push(step_update.step_index);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Poisoned compaction_indices lock in handle_step_update"
+                );
+            }
+        }
+    }
     let is_model_source = step_update.source == 3 || step_update.source == 0;
     if is_model_source && !step_update.text_delta.is_empty() {
-        produced_output_clone.store(true, Ordering::SeqCst);
-        dispatch_text_delta(&step_update.text_delta, active_writer_clone).await;
-        match last_response_text_clone.lock() {
+        ctx.produced_output.store(true, Ordering::SeqCst);
+        dispatch_text_delta(&step_update.text_delta, ctx.active_writer).await;
+        match ctx.last_response_text.lock() {
             Ok(mut lock) => {
                 if let Some(ref mut existing) = *lock {
                     existing.push_str(&step_update.text_delta);
@@ -313,12 +352,12 @@ pub(crate) async fn handle_step_update(
         }
     }
     if is_model_source && !step_update.thinking_delta.is_empty() {
-        dispatch_thinking_delta(&step_update.thinking_delta, active_writer_clone).await;
+        dispatch_thinking_delta(&step_update.thinking_delta, ctx.active_writer).await;
     }
 
     if is_model_source && !step_update.text.is_empty() {
-        produced_output_clone.store(true, Ordering::SeqCst);
-        match last_response_text_clone.lock() {
+        ctx.produced_output.store(true, Ordering::SeqCst);
+        match ctx.last_response_text.lock() {
             Ok(mut lock) => *lock = Some(step_update.text.clone()),
             Err(e) => {
                 tracing::error!(error = %e, "Poisoned last_response_text lock in handle_step_update");
@@ -331,7 +370,7 @@ pub(crate) async fn handle_step_update(
     {
         match serde_json::from_str::<serde_json::Value>(&finish.output_string) {
             Ok(val) => {
-                let guard = active_writer_clone.lock().await;
+                let guard = ctx.active_writer.lock().await;
                 if let Some(ref writer) = *guard {
                     writer.set_structured_output(val);
                 }
@@ -346,7 +385,7 @@ pub(crate) async fn handle_step_update(
         || step_update.error.is_some()
         || !step_update.error_message.is_empty()
     {
-        record_step_error(&step_update, last_error_clone);
+        record_step_error(&step_update, ctx.last_error);
     }
 
     if !step_update.cascade_id.is_empty()
@@ -359,7 +398,7 @@ pub(crate) async fn handle_step_update(
     }
 
     let step = to_domain_step(&step_update);
-    let guard = active_writer_clone.lock().await;
+    let guard = ctx.active_writer.lock().await;
     if let Some(ref writer) = *guard {
         ChatResponseWriter::fan_out(&writer.subs.step, &writer.step_tx, step, "step").await;
     }
@@ -373,8 +412,13 @@ async fn emit_tool_call_stream_events(
 ) {
     let guard = active_writer_clone.lock().await;
     if let Some(ref writer) = *guard {
-        let parsed_args: serde_json::Value =
-            serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+        let parsed_args: serde_json::Value = match serde_json::from_str(args_json) {
+            Ok(val) => val,
+            Err(e) => {
+                tracing::warn!(error = %e, tool = tool_name, "Failed to parse tool call arguments JSON");
+                serde_json::Value::Null
+            }
+        };
         let tc_event = ToolCallEvent {
             name: tool_name.to_string(),
             args: parsed_args,
@@ -405,6 +449,25 @@ async fn emit_tool_call_stream_events(
     }
 }
 
+/// Wire envelope wrapping non-object custom tool output as `{"result": ...}`.
+#[derive(serde::Serialize)]
+struct ToolResultEnvelope<T: serde::Serialize> {
+    result: T,
+}
+
+pub(super) fn parse_json_or_null(json_str: &str, context: &str) -> serde_json::Value {
+    if json_str.is_empty() {
+        return serde_json::Value::Null;
+    }
+    match serde_json::from_str(json_str) {
+        Ok(val) => val,
+        Err(err) => {
+            tracing::warn!(error = %err, context, "Failed to parse JSON payload; defaulting to null");
+            serde_json::Value::Null
+        }
+    }
+}
+
 async fn run_tool_pre_check(
     agent_id: AgentId,
     tool_name: &str,
@@ -432,8 +495,7 @@ async fn run_tool_pre_check(
             }
         }
 
-        let mut args_val: serde_json::Value =
-            serde_json::from_str(&args_json_owned).unwrap_or(serde_json::Value::Null);
+        let mut args_val = parse_json_or_null(&args_json_owned, "run_tool_pre_check");
 
         if let Some(hr) = hr_clone {
             let ctx = PreToolCallDecideContext::new(&tool_name_owned, args_val.clone());
@@ -480,25 +542,34 @@ async fn execute_custom_tool(
         Ok(out) => {
             crate::runtime::bridge_state::clear_last_tool_error(agent_id);
             let content_str = out.content().to_string();
-            let metadata = serde_json::to_value(out.metadata()).unwrap_or(serde_json::Value::Null);
-            crate::runtime::bridge_state::record_last_tool_output(agent_id, args_val, metadata);
-            let response_json = match serde_json::from_str::<serde_json::Value>(&content_str) {
-                Ok(val) => {
-                    if val.is_object() {
-                        content_str
-                    } else {
-                        serde_json::json!({ "result": val }).to_string()
-                    }
-                }
+            let metadata = match serde_json::to_value(out.metadata()) {
+                Ok(val) => val,
                 Err(err) => {
-                    tracing::trace!(error = %err, "Tool output is plain text, wrapping in result object");
-                    serde_json::json!({ "result": content_str }).to_string()
+                    tracing::warn!(error = %err, tool = tool_name, "Failed to serialize tool metadata; defaulting to null");
+                    serde_json::Value::Null
                 }
             };
-            (response_json, String::new())
+            crate::runtime::bridge_state::record_last_tool_output(agent_id, args_val, metadata);
+            let response_json = match serde_json::from_str::<serde_json::Value>(&content_str) {
+                Ok(val) if val.is_object() => Ok(content_str),
+                Ok(val) => serde_json::to_string(&ToolResultEnvelope { result: val }),
+                Err(err) => {
+                    tracing::trace!(error = %err, "Tool output is plain text, wrapping in result object");
+                    serde_json::to_string(&ToolResultEnvelope {
+                        result: content_str,
+                    })
+                }
+            };
+            match response_json {
+                Ok(json) => (json, String::new()),
+                Err(err) => {
+                    tracing::warn!(error = %err, tool = tool_name, "Failed to serialize tool result envelope");
+                    (String::new(), err.to_string())
+                }
+            }
         }
         Err(err) => {
-            crate::runtime::bridge_state::record_last_tool_error(agent_id, &err);
+            crate::runtime::bridge_state::record_last_tool_error(agent_id, args_val, &err);
             let err_str = err.to_string();
             (String::new(), err_str)
         }
@@ -525,10 +596,7 @@ pub(crate) async fn handle_tool_call(
             (
                 bridge_entry.and_then(|e| e.registry.clone()),
                 bridge_entry.and_then(|e| e.hook_runner.clone()),
-                bridge_entry
-                    .map(|e| e.tool_state.clone())
-                    // NOLINT: default JSON null/empty value for uninitialized tool state
-                    .unwrap_or_default(),
+                bridge_entry.map_or_else(llm_tool::SharedState::new, |e| e.tool_state.clone()),
                 bridge_entry.and_then(|e| match e.conversation_id.lock() {
                     Ok(guard) => guard.clone(),
                     Err(err) => {
@@ -636,8 +704,7 @@ fn dispatch_pre_tool_hook(
 ) -> proto::localharness::call_hook_response::Result {
     let (tool_name, args_val) = match req.args {
         Some(proto::localharness::call_hook_request::Args::PreToolArgs(ref a)) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&a.arguments_json).unwrap_or(serde_json::Value::Null);
+            let parsed = parse_json_or_null(&a.arguments_json, "dispatch_pre_tool_hook");
             (a.tool_name.clone(), parsed)
         }
         _ => (String::new(), serde_json::Value::Null),
@@ -706,22 +773,29 @@ fn dispatch_on_tool_error_hook(
         }
         _ => (String::new(), String::new()),
     };
-    let metadata = crate::runtime::bridge_state::take_last_tool_error(agent_id)
-        .unwrap_or(serde_json::Value::Null);
+    // `OnToolErrorContext` documents `Null` as "no tool arguments / metadata".
+    let (tool_args, metadata) = match crate::runtime::bridge_state::take_last_tool_error(agent_id) {
+        Some(captured) => {
+            let metadata = match captured.metadata {
+                Some(map) => serde_json::Value::Object(map),
+                None => serde_json::Value::Null,
+            };
+            (captured.tool_args, metadata)
+        }
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
     let ctx = OnToolErrorContext {
         tool_name,
-        tool_args: serde_json::Value::Null,
+        tool_args,
         error: error_message,
         metadata,
     };
     let res = hr.run_on_tool_error(&ctx);
-    // NOLINT: empty string default for proto custom_error_message
-    let custom_error_message = res.unwrap_or_default();
-    proto::localharness::call_hook_response::Result::OnToolErrorResult(
-        proto::localharness::OnToolErrorResult {
-            custom_error_message,
-        },
-    )
+    let mut err_result = proto::localharness::OnToolErrorResult::default();
+    if let Some(msg) = res {
+        err_result.custom_error_message = msg;
+    }
+    proto::localharness::call_hook_response::Result::OnToolErrorResult(err_result)
 }
 
 fn dispatch_on_session_start_hook(
@@ -794,6 +868,15 @@ fn parse_stop_args(a: &proto::localharness::StopArgs) -> crate::hooks::StopArgs 
     }
 }
 
+fn dispatch_on_compaction_hook(
+    hr: &crate::hooks::Hooks,
+) -> proto::localharness::call_hook_response::Result {
+    hr.run_on_compaction(&crate::hooks::OnCompactionContext {});
+    proto::localharness::call_hook_response::Result::EmptyResult(
+        proto::localharness::EmptyResult {},
+    )
+}
+
 fn dispatch_stop_hook(
     hr: &crate::hooks::Hooks,
     req: &proto::localharness::CallHookRequest,
@@ -836,21 +919,21 @@ pub(crate) async fn handle_call_hook_request(
             5 => Some(dispatch_pre_tool_hook(&hr, &req)),
             6 => Some(dispatch_post_tool_hook(agent_id, &hr, &req)),
             7 => Some(dispatch_on_tool_error_hook(agent_id, &hr, &req)),
+            8 => Some(dispatch_on_compaction_hook(&hr)),
             9 => Some(dispatch_stop_hook(&hr, &req)),
-            _ => {
-                if matches!(
-                    req.args,
-                    Some(proto::localharness::call_hook_request::Args::StopArgs(_))
-                ) {
-                    Some(dispatch_stop_hook(&hr, &req))
-                } else {
-                    Some(
-                        proto::localharness::call_hook_response::Result::EmptyResult(
-                            proto::localharness::EmptyResult {},
-                        ),
-                    )
+            _ => match req.args {
+                Some(proto::localharness::call_hook_request::Args::OnCompactionArgs(_)) => {
+                    Some(dispatch_on_compaction_hook(&hr))
                 }
-            }
+                Some(proto::localharness::call_hook_request::Args::StopArgs(_)) => {
+                    Some(dispatch_stop_hook(&hr, &req))
+                }
+                _ => Some(
+                    proto::localharness::call_hook_response::Result::EmptyResult(
+                        proto::localharness::EmptyResult {},
+                    ),
+                ),
+            },
         })
         .await
         {
@@ -903,16 +986,11 @@ pub(crate) async fn handle_policy_decision_request(
     };
 
     if let Some(ph) = ph_opt {
-        let tool_name = req
-            .tool_args
-            .as_ref()
-            .map_or_else(String::new, |a| a.tool_name.clone());
-        let args_str = req
-            .tool_args
-            .as_ref()
-            .map_or("{}", |a| a.arguments_json.as_str());
-        let args_val: serde_json::Value =
-            serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+        let (tool_name, args_str) = match req.tool_args.as_ref() {
+            Some(a) => (a.tool_name.clone(), a.arguments_json.as_str()),
+            None => (String::new(), "{}"),
+        };
+        let args_val = parse_json_or_null(args_str, "handle_policy_decision_request");
         let allowed = tokio::task::spawn_blocking(move || ph.confirm(&tool_name, &args_val))
             .await
             .unwrap_or_else(|e| {
@@ -991,15 +1069,15 @@ pub(crate) async fn handle_trajectory_state_update(
         ctx.idle_notify.notify_waiters();
 
         match ctx.last_response_text.lock() {
-            Ok(mut lock) => {
-                if let Some(text) = lock.take()
+            Ok(lock) => {
+                if let Some(ref text) = *lock
                     && !text.is_empty()
                 {
                     match ctx.history.lock() {
                         Ok(mut hist) => {
                             hist.push(ConversationMessage {
                                 role: MessageRole::Model,
-                                content: text,
+                                content: text.clone(),
                             });
                         }
                         Err(e) => {
@@ -1060,5 +1138,4 @@ pub(crate) async fn handle_trajectory_state_update(
 }
 
 #[cfg(test)]
-#[path = "events_tests.rs"]
 mod tests;

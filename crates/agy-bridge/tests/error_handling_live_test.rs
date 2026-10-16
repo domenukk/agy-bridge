@@ -21,14 +21,9 @@ fn live_agent_invalid_config_returns_error() {
 
             match bridge.agent(config).await {
                 Ok(agent) => {
-                    let result = agent.chat("PING").await;
-                    assert!(
-                        // NOLINT: test assertion — checking that invalid config produces an error
-                        result.is_err(),
-                        "Expected an error due to invalid config, got success"
-                    );
-                    if let Err(e) = result {
-                        eprintln!("Got expected error from invalid config: {e}");
+                    match agent.chat("PING").await {
+                        Ok(_) => panic!("Expected an error due to invalid config, got success"),
+                        Err(e) => eprintln!("Got expected error from invalid config: {e}"),
                     }
                     agent.shutdown().await?;
                 }
@@ -58,27 +53,24 @@ fn live_error_recovery_force_python_error() {
                 .response_schema(agy_bridge::config::JsonSchema::new(schema))
                 .build();
 
-            let result = bridge.agent(config).await;
-            // NOLINT: test intentionally handles both Ok/Err paths to validate error recovery
-            if let Ok(agent) = result {
-                let chat_result = agent.chat("hi").await;
-                assert!(
-                    // NOLINT: test assertion — checking that forced error produces an error
-                    chat_result.is_err(),
-                    "Expected chat to fail with python error"
-                );
-                let err_str = format!("{:?}", chat_result.err().unwrap());
-                eprintln!("Clean Rust error from Python: {err_str}");
-                agent.shutdown().await?;
-            } else {
-                let err_str = format!("{:?}", result.err().unwrap());
-                eprintln!("Clean Rust error from Python on init: {err_str}");
-                assert!(
-                    err_str.contains("Python")
-                        || err_str.contains("Error")
-                        || err_str.contains("InvalidConfig"),
-                    "Should have an error message indicating failure"
-                );
+            match bridge.agent(config).await {
+                Ok(agent) => {
+                    match agent.chat("hi").await {
+                        Ok(_) => panic!("Expected chat to fail with python error"),
+                        Err(err) => eprintln!("Clean Rust error from Python: {err:?}"),
+                    }
+                    agent.shutdown().await?;
+                }
+                Err(err) => {
+                    let err_str = format!("{err:?}");
+                    eprintln!("Clean Rust error from Python on init: {err_str}");
+                    assert!(
+                        err_str.contains("Python")
+                            || err_str.contains("Error")
+                            || err_str.contains("InvalidConfig"),
+                        "Should have an error message indicating failure"
+                    );
+                }
             }
             Ok(())
         })

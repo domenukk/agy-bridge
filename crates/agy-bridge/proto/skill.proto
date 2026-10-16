@@ -1,0 +1,26 @@
+syntax = "proto3";
+package genai.skills;
+
+message SkillFile {
+  string mime_type = 1;
+  oneof content {
+    string text = 2;
+    bytes data = 3;
+  }
+}
+
+message Skill {
+  message InlineResources {
+    map<string, genai.skills.SkillFile> resources = 1;
+  }
+  string name = 1;
+  string skill_id = 2;
+  string description = 3;
+  string content = 4;
+  repeated string allowed_tools = 5;
+  map<string, string> metadata = 6;
+  oneof resources {
+    genai.skills.Skill.InlineResources inline_resources = 7;
+    genai.skills.SkillFile zipped_resources = 8;
+  }
+}

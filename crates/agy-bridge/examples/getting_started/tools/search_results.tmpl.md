@@ -1,11 +1,11 @@
 ---
 allow_unused: true
 types:
-  - FileMatch = struct(path = str)
+  - FileMatch = struct(path = untrusted str)
 
 params:
   - matches = list(FileMatch)
-  - query = str
+  - query = untrusted str
 ---
 
 Results for "{{ query }}":

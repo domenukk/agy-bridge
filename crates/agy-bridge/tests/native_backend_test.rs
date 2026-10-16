@@ -424,6 +424,7 @@ async fn handle_mock_policy_exchange(
                         ..Default::default()
                     }),
                     rule_id: "rule-1".to_string(),
+                    reason: String::new(),
                 },
             ),
         ),
@@ -1014,6 +1015,158 @@ async fn test_native_backend_v017_features_e2e() {
 
     let reply = agent.chat_text("Perform v017 task").await.expect("chat");
     assert_eq!(reply, "v017 answer");
+
+    agent.shutdown().await.expect("shutdown");
+    server_task.await.expect("server task completed");
+}
+
+async fn run_mock_v0_1_22_session(listener: TcpListener) {
+    let (stream, _) = listener.accept().await.expect("accept");
+    let mut ws = tokio_tungstenite::accept_async(stream)
+        .await
+        .expect("ws accept");
+
+    let init_msg = ws.next().await.expect("init msg").expect("valid msg");
+    let init_txt = init_msg.into_text().expect("text");
+    assert!(
+        init_txt.contains("inline_sec_skill"),
+        "Expected inline skill in InitializeConversationRequest: {init_txt}"
+    );
+    assert!(
+        init_txt.contains("Keep crash addresses"),
+        "Expected summaryPromptOverride in InitializeConversationRequest: {init_txt}"
+    );
+
+    let init_resp = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::InitializeConversationResponse(
+                proto::localharness::InitializeConversationResponse {
+                    cascade_id: "traj-v0122-mock".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&init_resp).unwrap().into(),
+    ))
+    .await
+    .expect("send init resp");
+
+    let _user_msg = ws.next().await.expect("user msg").expect("valid msg");
+
+    let wf_step_event = proto::localharness::OutputEvent {
+        event: Some(proto::localharness::output_event::Event::StepUpdate(
+            proto::localharness::StepUpdate {
+                step_index: 1,
+                trajectory_id: "traj-v0122-mock".to_string(),
+                cascade_id: "traj-v0122-mock".to_string(),
+                state: 3,
+                run_workflow: Some(proto::localharness::ActionRunWorkflow {
+                    script_path: "/tmp/audit_wf.py".to_string(),
+                    script: "phase('triage')".to_string(),
+                    description: "Run triage workflow".to_string(),
+                    output: "Triage phase complete".to_string(),
+                }),
+                skill_lookup: Some(proto::localharness::ActionSkillLookup {
+                    skill_name: "inline_sec_skill".to_string(),
+                }),
+                text_delta: "v0.1.22 workflow done".to_string(),
+                text: "v0.1.22 workflow done".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&wf_step_event).unwrap().into(),
+    ))
+    .await
+    .expect("send wf step");
+
+    let state_event = proto::localharness::OutputEvent {
+        event: Some(
+            proto::localharness::output_event::Event::TrajectoryStateUpdate(
+                proto::localharness::TrajectoryStateUpdate {
+                    state: 3,
+                    ..Default::default()
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&state_event).unwrap().into(),
+    ))
+    .await
+    .expect("send state update");
+}
+
+#[tokio::test]
+async fn test_native_backend_v0_1_22_features_e2e() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let server_task = tokio::spawn(run_mock_v0_1_22_session(listener));
+
+    let mock = MockHarness::create(port, "v0122");
+
+    let bridge = AgyBridge::native_builder()
+        .harness_path(mock.bin_path())
+        .build_native()
+        .expect("build bridge");
+
+    let inline_skill = agy_bridge::InlineSkill::builder()
+        .name("inline_sec_skill")
+        .description("Inline security skill")
+        .content("# Skill\nCheck bounds.")
+        .build();
+
+    let config = AgentConfig::builder()
+        .compaction_config(
+            agy_bridge::CompactionConfig::one_million()
+                .with_summary_prompt_override("Keep crash addresses")
+                .with_use_model_reported_token_count(true),
+        )
+        .capabilities(
+            agy_bridge::CapabilitiesConfig::builder()
+                .mcp_max_output_bytes(65_536)
+                .tool_output_truncation_config(
+                    agy_bridge::ToolOutputTruncationConfig::new(4096).with_save_full_output(true),
+                )
+                .build(),
+        )
+        .build();
+
+    let agent = bridge
+        .agent(config)
+        .inline_skills(vec![inline_skill])
+        .await
+        .expect("create agent");
+
+    let mut handle = agent
+        .chat("Run v0.1.22 workflow")
+        .await
+        .expect("start chat");
+    let mut step_rx = handle.take_step_stream().expect("step stream");
+    let result = handle.text().await.expect("chat result");
+    let mut saw_wf_progress = false;
+    let mut saw_skill_lookup = false;
+    while let Some(step) = step_rx.recv().await {
+        if let Some(ref wf) = step.workflow_progress {
+            assert_eq!(wf.script_path, "/tmp/audit_wf.py");
+            assert_eq!(wf.output, "Triage phase complete");
+            saw_wf_progress = true;
+        }
+        if step.tool_calls.iter().any(|tc| tc.name == "skill_lookup") {
+            saw_skill_lookup = true;
+        }
+    }
+    assert_eq!(result.text(), "v0.1.22 workflow done");
+    assert!(saw_wf_progress, "Expected Step.workflow_progress");
+    assert!(saw_skill_lookup, "Expected skill_lookup tool call in Step");
 
     agent.shutdown().await.expect("shutdown");
     server_task.await.expect("server task completed");

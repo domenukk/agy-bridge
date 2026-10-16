@@ -100,15 +100,12 @@ fn test_policy_set_validated_from_rejects_invalid() {
     use agy_bridge::policies::{PolicyRule, PolicySet};
 
     // Invalid: empty tool name should fail validation
-    let result = PolicySet::validated_from(vec![
+    let err = PolicySet::validated_from(vec![
         PolicyRule::Allow(String::new()), // empty tool name
         PolicyRule::DenyAll,
-    ]);
-    assert!(
-        // NOLINT: test assertion \u2014 checking that validation rejects empty tool name
-        result.is_err(),
-        "Expected validation error for empty tool name"
-    );
+    ])
+    .expect_err("Expected validation error for empty tool name");
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]

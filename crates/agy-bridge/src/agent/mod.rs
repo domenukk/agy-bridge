@@ -626,6 +626,7 @@ impl<R: Runtime> AgentHandle<R> {
     pub async fn delete(&self) -> Result<(), Error> {
         let result = self.runtime.delete(self.id).await;
         self.is_shutdown.store(true, Ordering::SeqCst);
+        self.remove_from_bridge_state();
         result
     }
 
@@ -640,7 +641,23 @@ impl<R: Runtime> AgentHandle<R> {
     pub async fn disconnect(&self) -> Result<(), Error> {
         let result = self.runtime.disconnect(self.id).await;
         self.is_shutdown.store(true, Ordering::SeqCst);
+        self.remove_from_bridge_state();
         result
+    }
+
+    fn remove_from_bridge_state(&self) {
+        match crate::runtime::bridge_state().write() {
+            Ok(mut map) => {
+                map.remove(&self.id);
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = self.id,
+                    error = %e,
+                    "BRIDGE_STATE RwLock poisoned during cleanup — bridge state entry may leak"
+                );
+            }
+        }
     }
 
     /// Check whether the agent is currently idle (not running a turn).
