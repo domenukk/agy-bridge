@@ -36,6 +36,10 @@ pub struct CompactionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub use_model_reported_token_count: Option<bool>,
+    /// Whether to retain the last user message intact when compacting history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub include_last_user_message: Option<bool>,
 }
 
 impl CompactionConfig {
@@ -49,6 +53,7 @@ impl CompactionConfig {
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             summary_prompt_override: None,
             use_model_reported_token_count: None,
+            include_last_user_message: None,
         }
     }
 
@@ -63,6 +68,13 @@ impl CompactionConfig {
     #[must_use]
     pub const fn with_use_model_reported_token_count(mut self, enabled: bool) -> Self {
         self.use_model_reported_token_count = Some(enabled);
+        self
+    }
+
+    /// Sets whether to retain the last user message intact when compacting history.
+    #[must_use]
+    pub const fn with_include_last_user_message(mut self, enabled: bool) -> Self {
+        self.include_last_user_message = Some(enabled);
         self
     }
 }

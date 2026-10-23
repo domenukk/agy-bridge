@@ -42,7 +42,17 @@ pub(crate) fn build_harness_config(
         config.capabilities.as_ref(),
         has_workspace_only,
     ));
-    let workspaces = build_workspace_protos(&config.workspaces);
+    let mut effective_workspaces = config.workspaces.clone();
+    for rule in policy_set.iter() {
+        if let PolicyRule::WorkspaceOnly(paths) = rule {
+            for p in paths {
+                if !effective_workspaces.contains(p) {
+                    effective_workspaces.push(p.clone());
+                }
+            }
+        }
+    }
+    let workspaces = build_workspace_protos(&effective_workspaces);
     let models = build_models_proto(config);
     let mcp_servers = config.mcp_servers.iter().map(to_proto_mcp_server).collect();
     let enabled_hooks = get_enabled_hooks(hook_runner);
@@ -235,6 +245,10 @@ fn to_proto_skills_config(
     Some(proto::localharness::SkillsConfig {
         enabled: true,
         skills: inline_skills.iter().map(to_proto_inline_skill).collect(),
+        skill_versions: HashMap::new(),
+        presentation_mode: 0,
+        materialized_skills_dir: String::new(),
+        preactivate_skills: Vec::new(),
     })
 }
 
@@ -417,6 +431,7 @@ fn extract_compaction_config(
     if let Some(ref cc) = config.compaction_config {
         let mut proto = proto::localharness::CompactionConfig {
             use_model_reported_token_count: cc.use_model_reported_token_count,
+            include_last_user_message: cc.include_last_user_message,
             ..proto::localharness::CompactionConfig::default()
         };
         if let Some(threshold) = cc.token_threshold {
@@ -451,6 +466,7 @@ fn extract_compaction_config(
             max_context_tokens: 0,
             summary_prompt_override: String::new(),
             use_model_reported_token_count: None,
+            include_last_user_message: None,
         };
         (Some(proto), threshold)
     } else {
@@ -494,22 +510,36 @@ fn to_proto_system_instructions(
     si: &SystemInstructions,
 ) -> proto::localharness::SystemInstructions {
     match si {
-        SystemInstructions::Custom(text) => custom_system_instructions(text),
+        SystemInstructions::Custom(text) => custom_system_instructions(text, None),
+        SystemInstructions::TitledCustom { text, title } => {
+            custom_system_instructions(text, title.as_deref())
+        }
         SystemInstructions::Templated { identity, sections } => {
             templated_system_instructions(identity.as_deref(), sections)
         }
     }
 }
 
-fn custom_text_part(text: String) -> proto::localharness::custom_system_instructions::Part {
+fn custom_text_part(
+    text: String,
+    title: Option<&str>,
+) -> proto::localharness::custom_system_instructions::Part {
+    let resolved_title = match title {
+        Some(t) => t.to_owned(),
+        None => String::new(),
+    };
     proto::localharness::custom_system_instructions::Part {
         part: Some(proto::localharness::custom_system_instructions::part::Part::Text(text)),
+        title: resolved_title,
     }
 }
 
-fn custom_system_instructions(text: &str) -> proto::localharness::SystemInstructions {
+fn custom_system_instructions(
+    text: &str,
+    title: Option<&str>,
+) -> proto::localharness::SystemInstructions {
     let custom = proto::localharness::CustomSystemInstructions {
-        part: vec![custom_text_part(text.to_string())],
+        part: vec![custom_text_part(text.to_string(), title)],
     };
     proto::localharness::SystemInstructions {
         r#type: Some(proto::localharness::system_instructions::Type::Custom(
@@ -608,6 +638,7 @@ fn to_proto_harness_side_tools(
             enabled: subagents_enabled,
             max_nesting_depth,
             allowed_subagents,
+            disable_define_subagent_tool: caps.is_some_and(|c| c.disable_define_subagent_tool),
         }),
         find: Some(proto::localharness::FindToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::FindFile),
@@ -665,6 +696,7 @@ fn to_proto_harness_side_tools(
         }),
         run_workflow: Some(proto::localharness::RunWorkflowToolConfig {
             enabled: run_workflow_enabled,
+            execution_mode: 0,
         }),
     }
 }
@@ -783,31 +815,9 @@ fn build_models_proto(config: &AgentConfig) -> Vec<proto::localharness::ModelCon
     vec![text_model, image_model]
 }
 
-fn sanitize_mcp_server_name(raw: &str) -> String {
-    let base = std::path::Path::new(raw)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(raw);
-    let sanitized: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "mcp_server".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn stdio_mcp_server(stdio: &McpStdioServer) -> proto::localharness::McpServerConfig {
+fn stdio_mcp_server(name: String, stdio: &McpStdioServer) -> proto::localharness::McpServerConfig {
     proto::localharness::McpServerConfig {
-        name: sanitize_mcp_server_name(&stdio.command),
+        name,
         transport: Some(proto::localharness::mcp_server_config::Transport::Stdio(
             proto::localharness::McpStdioTransport {
                 command: stdio.command.clone(),
@@ -824,19 +834,20 @@ fn stdio_mcp_server(stdio: &McpStdioServer) -> proto::localharness::McpServerCon
 }
 
 fn http_mcp_server(
+    name: String,
     url: String,
     headers: Option<&HashMap<String, String>>,
     timeout_seconds: i32,
 ) -> proto::localharness::McpServerConfig {
     let mut http_transport = proto::localharness::McpHttpTransport {
-        url: url.clone(),
+        url,
         ..proto::localharness::McpHttpTransport::default()
     };
     if let Some(hdrs) = headers {
         http_transport.headers.clone_from(hdrs);
     }
     proto::localharness::McpServerConfig {
-        name: url,
+        name,
         transport: Some(proto::localharness::mcp_server_config::Transport::Http(
             http_transport,
         )),
@@ -849,12 +860,13 @@ fn http_mcp_server(
 }
 
 fn to_proto_mcp_server(s: &McpServer) -> proto::localharness::McpServerConfig {
+    let name = s.server_name();
     match s {
-        McpServer::Stdio(stdio) => stdio_mcp_server(stdio),
-        McpServer::Sse(sse) => http_mcp_server(sse.url.clone(), sse.headers.as_ref(), 0),
+        McpServer::Stdio(stdio) => stdio_mcp_server(name, stdio),
+        McpServer::Sse(sse) => http_mcp_server(name, sse.url.clone(), sse.headers.as_ref(), 0),
         McpServer::Http(http) => {
             let timeout_secs = f64_to_timeout_seconds(http.timeout);
-            http_mcp_server(http.url.clone(), http.headers.as_ref(), timeout_secs)
+            http_mcp_server(name, http.url.clone(), http.headers.as_ref(), timeout_secs)
         }
     }
 }

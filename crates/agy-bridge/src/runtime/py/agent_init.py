@@ -49,6 +49,23 @@ try:
 except ImportError as _imp_err:
     _INIT_LOGGER.debug("agent_init_helpers not pre-imported: %s", _imp_err)
 
+try:
+    from sdk_proto_parity import (
+        ATTR_CUSTOM_TITLE,
+        ATTR_DISABLE_DEFINE_SUBAGENT_TOOL,
+        FIELD_DISABLE_DEFINE_SUBAGENT_TOOL,
+        FIELD_INCLUDE_LAST_USER_MESSAGE,
+        FIELD_TITLE,
+        PROTO_COMPACTION_CONFIG,
+        PROTO_CUSTOM_SI_PART,
+        PROTO_SUBAGENTS_CONFIG,
+        _patch_compaction_config_proto,
+        _patch_harness_side_tools_proto,
+        _require_sdk_proto_field,
+    )
+except ImportError as _imp_err:
+    _INIT_LOGGER.debug("sdk_proto_parity not pre-imported: %s", _imp_err)
+
 __all__ = [
     "_WS_MAXSIZE_DEFAULT_CAP",
     "_WS_MAXSIZE_PATCH_SDK_VERSION",
@@ -132,6 +149,16 @@ def _normalize_capabilities(local_config: dict[str, Any]) -> None:
 def _wire_capabilities(local_config: dict[str, Any]) -> None:
     """Convert normalized capabilities dict into a strongly-typed SDK `CapabilitiesConfig`."""
     _normalize_capabilities(local_config)
+    caps_raw = local_config.get("capabilities")
+    disable_define_subagent = isinstance(caps_raw, dict) and bool(
+        caps_raw.get(FIELD_DISABLE_DEFINE_SUBAGENT_TOOL, False)
+    )
+    if disable_define_subagent:
+        _require_sdk_proto_field(
+            PROTO_SUBAGENTS_CONFIG,
+            FIELD_DISABLE_DEFINE_SUBAGENT_TOOL,
+            "CapabilitiesConfig.disable_define_subagent_tool",
+        )
     if "capabilities" in local_config and isinstance(
         local_config["capabilities"], dict
     ):
@@ -141,7 +168,6 @@ def _wire_capabilities(local_config: dict[str, Any]) -> None:
             if hasattr(CapabilitiesConfig, "model_rebuild"):
                 CapabilitiesConfig.model_rebuild()
             caps_dict = dict(local_config["capabilities"])
-            # Translate Rust-only `command_timeout_ms` if `run_command_config` is unset
             cmd_timeout_ms = caps_dict.pop("command_timeout_ms", None)
             if (
                 cmd_timeout_ms is not None
@@ -150,12 +176,14 @@ def _wire_capabilities(local_config: dict[str, Any]) -> None:
                 caps_dict["run_command_config"] = RunCommandConfig(
                     timeout_seconds=float(cmd_timeout_ms) / 1000.0
                 )
-            # Strip Rust-only `image_model` field so CapabilitiesConfig validation succeeds
             caps_dict.pop("image_model", None)
             if hasattr(CapabilitiesConfig, "model_fields"):
                 allowed_keys = set(CapabilitiesConfig.model_fields.keys())
                 caps_dict = {k: v for k, v in caps_dict.items() if k in allowed_keys}
-            local_config["capabilities"] = CapabilitiesConfig(**caps_dict)
+            sdk_caps = CapabilitiesConfig(**caps_dict)
+            if disable_define_subagent:
+                object.__setattr__(sdk_caps, ATTR_DISABLE_DEFINE_SUBAGENT_TOOL, True)
+            local_config["capabilities"] = sdk_caps
         except _RECOVERABLE_ERRORS as exc:
             _INIT_LOGGER.debug("CapabilitiesConfig coercion skipped: %s", exc)
 
@@ -326,24 +354,47 @@ def _wire_compaction_config(local_config: dict[str, Any]) -> None:
         local_config.pop("compaction_config", None)
         return
     if isinstance(cc, dict):
+        if cc.get(FIELD_INCLUDE_LAST_USER_MESSAGE):
+            _require_sdk_proto_field(
+                PROTO_COMPACTION_CONFIG,
+                FIELD_INCLUDE_LAST_USER_MESSAGE,
+                "CompactionConfig.include_last_user_message",
+            )
         try:
             from google.antigravity.types import CompactionConfig
 
-            token_threshold = cc.get("token_threshold")
-            if token_threshold is not None and int(token_threshold) > 0:
-                cc_kwargs: dict[str, Any] = {"token_threshold": int(token_threshold)}
+            raw_threshold = cc.get("token_threshold")
+            token_threshold = (
+                int(raw_threshold)
+                if raw_threshold is not None and int(raw_threshold) > 0
+                else None
+            )
+            extras = {
+                k: cc[k]
                 for k in (
                     "checkpoint_interval_tokens",
                     "max_context_tokens",
                     "summary_prompt_override",
                     "use_model_reported_token_count",
-                ):
-                    if cc.get(k) is not None:
-                        cc_kwargs[k] = cc[k]
+                    "include_last_user_message",
+                )
+                if cc.get(k) is not None
+            }
+            if token_threshold is not None or extras:
+                cc_kwargs: dict[str, Any] = {}
+                if token_threshold is not None:
+                    cc_kwargs["token_threshold"] = token_threshold
+                cc_kwargs.update(extras)
                 if hasattr(CompactionConfig, "model_fields"):
                     allowed = set(CompactionConfig.model_fields.keys())
                     cc_kwargs = {k: v for k, v in cc_kwargs.items() if k in allowed}
-                local_config["compaction_config"] = CompactionConfig(**cc_kwargs)
+                sdk_cc = (
+                    CompactionConfig(**cc_kwargs)
+                    if token_threshold is not None
+                    else CompactionConfig.model_construct(token_threshold=None)
+                )
+                object.__setattr__(sdk_cc, "_agy_extra_compaction", extras)
+                local_config["compaction_config"] = sdk_cc
             else:
                 local_config.pop("compaction_config", None)
         except ImportError:
@@ -402,9 +453,24 @@ def _wire_system_instructions(local_config: dict[str, Any]) -> None:
         elif isinstance(si, dict):
             if ("text" in si or "custom_instructions" in si) and "sections" not in si:
                 text_val = si.get("text") or si.get("custom_instructions") or ""
-                local_config["system_instructions"] = CustomSystemInstructions(
-                    text=text_val
+                si_kwargs: dict[str, Any] = {"text": text_val}
+                custom_title = si.get(FIELD_TITLE)
+                sdk_has_title = (
+                    hasattr(CustomSystemInstructions, "model_fields")
+                    and FIELD_TITLE in CustomSystemInstructions.model_fields
                 )
+                if custom_title and sdk_has_title:
+                    si_kwargs[FIELD_TITLE] = custom_title
+                elif custom_title:
+                    _require_sdk_proto_field(
+                        PROTO_CUSTOM_SI_PART,
+                        FIELD_TITLE,
+                        "SystemInstructions::TitledCustom",
+                    )
+                sdk_si = CustomSystemInstructions(**si_kwargs)
+                if custom_title and not sdk_has_title:
+                    object.__setattr__(sdk_si, ATTR_CUSTOM_TITLE, str(custom_title))
+                local_config["system_instructions"] = sdk_si
             elif "sections" in si or "identity" in si:
                 sections_raw = si.get("sections") or []
                 sections = [
@@ -831,30 +897,29 @@ def _setup_base_url_routing(local_config):
     if not custom_base_url:
         custom_base_url = os.environ.get("GEMINI_API_BASE_URL")
 
+    try:
+        from google.antigravity.connections.local import local_connection as _lc_mod
+        from google.antigravity.connections.local.local_connection import (
+            LocalConnectionStrategy,
+        )
+
+        _patch_subagent_inline_skills(LocalConnectionStrategy, logger)
+        _patch_harness_side_tools_proto(LocalConnectionStrategy, logger)
+        _patch_compaction_config_proto(_lc_mod, logger)
+    except ImportError:
+        LocalConnectionStrategy = None  # type: ignore[assignment,misc]
+
     if custom_base_url:
         if "gemini_config" not in local_config or not local_config["gemini_config"]:
             local_config["gemini_config"] = {}
         if not local_config["gemini_config"].get("api_key"):
             local_config["gemini_config"]["api_key"] = _PROXY_AUTH_SENTINEL
 
-        try:
-            from google.antigravity.connections.local.local_connection import (
-                LocalConnectionStrategy,
-            )
-        except ImportError:
+        if LocalConnectionStrategy is None or not hasattr(
+            LocalConnectionStrategy, "_build_harness_config"
+        ):
             logger.warning(
-                "[BASE_URL] LocalConnectionStrategy not importable — "
-                "base_url routing unavailable (SDK may have been restructured)"
-            )
-            return custom_base_url
-
-        _patch_subagent_inline_skills(LocalConnectionStrategy, logger)
-
-        if not hasattr(LocalConnectionStrategy, "_build_harness_config"):
-            logger.warning(
-                "[BASE_URL] SDK structural drift: LocalConnectionStrategy "
-                "no longer has _build_harness_config. base_url routing "
-                "cannot be applied — the SDK may have been updated."
+                "[BASE_URL] LocalConnectionStrategy missing _build_harness_config; base_url routing skipped"
             )
             return custom_base_url
 
@@ -1093,6 +1158,8 @@ def init_agent(
 
     if "gemini_config" in local_config and local_config["gemini_config"] is None:
         local_config.pop("gemini_config")
+    # Enforced Rust-side by the ToolRegistry output floor on every tool dispatch.
+    local_config.pop("tool_output_floor", None)
 
     if "session_continuation_mode" in local_config:
         scm = local_config["session_continuation_mode"]

@@ -171,12 +171,17 @@ enum Transport {
 /// emitted in sorted order (the input is a [`BTreeMap`]) so the generated
 /// argument vector is deterministic and testable.
 fn build_stdio_server(
+    name: &str,
     command: String,
     args: Vec<String>,
     env: &BTreeMap<String, String>,
 ) -> McpStdioServer {
     if env.is_empty() {
-        return McpStdioServer { command, args };
+        return McpStdioServer {
+            name: Some(name.to_owned()),
+            command,
+            args,
+        };
     }
 
     let mut wrapped = Vec::with_capacity(env.len() + 1 + args.len());
@@ -187,6 +192,7 @@ fn build_stdio_server(
     wrapped.extend(args);
 
     McpStdioServer {
+        name: Some(name.to_owned()),
         command: ENV_WRAPPER_COMMAND.to_owned(),
         args: wrapped,
     }
@@ -226,7 +232,8 @@ impl McpServerSpec {
 
     /// Convert this spec into a strongly-typed [`McpServer`].
     ///
-    /// `name` is used only to produce descriptive error messages.
+    /// `name` becomes the server's explicit [`McpServer::server_name`] and is used in
+    /// error messages.
     ///
     /// # Errors
     ///
@@ -241,7 +248,7 @@ impl McpServerSpec {
                     reason: "stdio transport requires a 'command'".to_owned(),
                 })?;
                 Ok(McpServer::Stdio(build_stdio_server(
-                    command, self.args, &self.env,
+                    name, command, self.args, &self.env,
                 )))
             }
             Transport::Sse => {
@@ -250,6 +257,7 @@ impl McpServerSpec {
                     reason: "sse transport requires a 'url'".to_owned(),
                 })?;
                 Ok(McpServer::Sse(McpSseServer {
+                    name: Some(name.to_owned()),
                     url,
                     headers: self.headers,
                 }))
@@ -260,6 +268,7 @@ impl McpServerSpec {
                     reason: "http transport requires a 'url'".to_owned(),
                 })?;
                 Ok(McpServer::Http(McpStreamableHttpServer {
+                    name: Some(name.to_owned()),
                     url,
                     headers: self.headers,
                     timeout: self.timeout.unwrap_or_else(default_mcp_timeout),
@@ -581,7 +590,13 @@ mod tests {
 
     #[test]
     fn build_stdio_server_without_env_is_verbatim() {
-        let server = build_stdio_server("cmd".to_owned(), vec!["a".to_owned()], &BTreeMap::new());
+        let server = build_stdio_server(
+            "srv",
+            "cmd".to_owned(),
+            vec!["a".to_owned()],
+            &BTreeMap::new(),
+        );
+        assert_eq!(server.name.as_deref(), Some("srv"));
         assert_eq!(server.command, "cmd");
         assert_eq!(server.args, ["a"]);
     }
@@ -591,7 +606,13 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("Z".to_owned(), "last".to_owned());
         env.insert("A".to_owned(), "first".to_owned());
-        let server = build_stdio_server("my-server".to_owned(), vec!["--flag".to_owned()], &env);
+        let server = build_stdio_server(
+            "srv",
+            "my-server".to_owned(),
+            vec!["--flag".to_owned()],
+            &env,
+        );
+        assert_eq!(server.name.as_deref(), Some("srv"));
         assert_eq!(server.command, "env");
         assert_eq!(server.args, ["A=first", "Z=last", "my-server", "--flag"]);
     }

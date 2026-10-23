@@ -766,12 +766,52 @@ fn compute_active_builtins(
 }
 
 #[cfg(feature = "python")]
+/// Reject `AgentConfig` options that only the native runtime implements.
+///
+/// `finish_on_tools` early turn termination is native-only. Failing loudly
+/// beats silently running every submission turn to completion on Python.
+fn reject_native_only_options(config: &crate::config::AgentConfig) -> Result<(), Error> {
+    if config.finish_on_tools.is_empty() {
+        return Ok(());
+    }
+    Err(Error::InvalidConfig {
+        message: format!(
+            "finish_on_tools ({:?}) is only supported by the native runtime; \
+             clear it when using the Python backend",
+            config.finish_on_tools
+        ),
+    })
+}
+
+#[cfg(feature = "python")]
+/// Write each MCP server's canonical [`server_name`](crate::config::McpServer::server_name)
+/// into the serialized config so the Python SDK uses the same name as the native runtime.
+fn inject_mcp_server_names(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    servers: &[crate::config::McpServer],
+) {
+    let Some(serde_json::Value::Array(entries)) = map.get_mut("mcp_servers") else {
+        return;
+    };
+    for (entry, server) in entries.iter_mut().zip(servers) {
+        if let serde_json::Value::Object(obj) = entry {
+            obj.insert(
+                "name".to_owned(),
+                serde_json::Value::String(server.server_name()),
+            );
+        }
+    }
+}
+
+#[cfg(feature = "python")]
 impl crate::agent::Runtime for PythonRuntime {
     async fn create_agent(
         &self,
         agent_id: u64,
         config: crate::config::AgentConfig,
     ) -> Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error> {
+        reject_native_only_options(&config)?;
+
         // The local harness persists the trajectory to `save_dir` only if that
         // directory already exists; neither it nor the Python SDK creates it.
         // A missing directory means persistence is silently skipped, so a later
@@ -799,6 +839,7 @@ impl crate::agent::Runtime for PythonRuntime {
                 message: format!("Failed to serialize AgentConfig: {e}"),
             })?;
             if let serde_json::Value::Object(ref mut map) = val {
+                inject_mcp_server_names(map, &config.mcp_servers);
                 map.insert(
                     "_backend_log_level".to_owned(),
                     serde_json::Value::String(self.config.backend_log_level.as_str().to_owned()),

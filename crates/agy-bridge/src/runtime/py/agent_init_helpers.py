@@ -1,9 +1,4 @@
-# DRY helpers shared across hook context serialization and SDK monkeypatches.
-#
-# These module-level helpers are pure and importable without the live
-# antigravity SDK (all SDK imports happen lazily inside the section-wiring
-# functions and inside `init_agent`), so they can be unit-tested with plain
-# pytest.
+# Pure module-level helpers for hook context serialization and SDK monkeypatches.
 
 from __future__ import annotations
 
@@ -16,26 +11,16 @@ if os.name == "nt" and not os.environ.get("USERPROFILE"):
 
     os.environ["USERPROFILE"] = os.environ.get("HOME") or tempfile.gettempdir()
 
-# Hook points whose callbacks must return a `HookResult` (allow/deny gate).
 RESULT_HOOK_POINTS: tuple[str, ...] = (
     "pre_turn",
     "pre_tool_call_decide",
     "on_interaction",
 )
-
-# Placeholder API key used when a custom base_url (proxy/gateway) handles auth
-# itself, so no real key is required. It only needs to satisfy the SDK's
-# non-empty API-key validation; it is cleared in `_build_harness_config` before
-# the actual RPC, so its literal value is arbitrary and never sent anywhere.
 _PROXY_AUTH_SENTINEL: str = "__agy_proxy_auth__"
 
 
 def _to_dict(obj: Any) -> Any:
-    """Best-effort conversion of a pydantic-like object to a plain dict.
-
-    Falls back to returning the object unchanged when it exposes neither
-    `model_dump` (pydantic v2) nor `dict` (pydantic v1).
-    """
+    """Convert a pydantic-like object to a plain dict when possible."""
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
     elif hasattr(obj, "dict"):
@@ -44,10 +29,7 @@ def _to_dict(obj: Any) -> Any:
 
 
 def _normalize_tool_name(name: Any) -> str:
-    """Normalize a tool name to a plain string.
-
-    Handles enum-like values (`.value`) and non-string names (`str()`).
-    """
+    """Normalize a tool name to a plain string."""
     if hasattr(name, "value"):
         return str(name.value)
     elif not isinstance(name, str):
@@ -185,11 +167,7 @@ def _serialize_on_tool_error_ctx(
 
 
 def _serialize_session_ctx(local_config: dict[str, Any], agent_id: int) -> str:
-    """Serialize an on_session_start/on_session_end payload to a JSON string.
-
-    Falls back to a workspace-derived or `default_session` conversation id when
-    the config does not carry one.
-    """
+    """Serialize an on_session_start/on_session_end payload to a JSON string."""
     import json
 
     conversation_id = local_config.get("conversation_id")
@@ -265,11 +243,7 @@ def _serialize_stop_args(ctx: Any) -> str:
 
 
 def _serialize_generic_ctx(ctx: Any) -> str:
-    """Serialize an arbitrary hook context to a JSON string.
-
-    Handles plain strings, pydantic models (`model_dump_json`), dicts, and an
-    opaque `str()` fallback.
-    """
+    """Serialize an arbitrary hook context to a JSON string."""
     import json
 
     if isinstance(ctx, str):
@@ -288,11 +262,7 @@ def _build_model_target(
     base_url: str | None = None,
     is_image: bool = False,
 ) -> Any:
-    """Convert a serialized Rust `ModelEntry` dict or model name string into an SDK `ModelTarget`.
-
-    Falls back to returning the plain model string when the SDK types module is
-    not installed or when `entry` is already a string without extra options.
-    """
+    """Convert a serialized Rust `ModelEntry` dict or model name string into an SDK `ModelTarget`."""
     if isinstance(entry, str):
         if not is_image and not base_url:
             return entry
@@ -301,11 +271,12 @@ def _build_model_target(
     if not isinstance(entry, dict):
         return entry
 
-    name = entry.get("name") or "gemini-3-flash-preview"
+    name = entry.get("name")
     entry_api_key = entry.get("api_key") or default_api_key
     gen = entry.get("generation") or {}
 
     try:
+        from google.antigravity import models as _sdk_models
         from google.antigravity.types import (
             GeminiAPIEndpoint,
             GeminiModelOptions,
@@ -314,6 +285,13 @@ def _build_model_target(
             ServiceTier,
             ThinkingLevel,
         )
+
+        if not name:
+            name = (
+                _sdk_models.DEFAULT_IMAGE_GENERATION_MODEL
+                if is_image
+                else _sdk_models.DEFAULT_MODEL
+            )
 
         options = None
         if isinstance(gen, dict) and (
@@ -347,14 +325,7 @@ def _build_model_target(
 def _munge_config_model(
     local_config: dict[str, Any], custom_base_url: str | None = None
 ) -> None:
-    """Normalize gemini_config into LocalAgentConfig top-level fields (model, models, api_key).
-
-    In SDK 0.1.17+, `LocalAgentConfig` accepts `model: str | ModelTarget | None`
-    (single shorthand model) and `models: list[ModelTarget] | None` (explicit
-    multi-model list). Map `gemini_config.api_key` and `gemini_config.models`
-    (`default` and optional `image_generation`) to strongly-typed `ModelTarget`
-    objects and remove the obsolete `gemini_config` sub-dict.
-    """
+    """Normalize gemini_config into LocalAgentConfig top-level fields (model, models, api_key)."""
     if "gemini_config" in local_config:
         gemini_cfg = local_config.pop("gemini_config")
         if gemini_cfg:
@@ -406,21 +377,11 @@ def _munge_config_model(
 
 
 def _extract_initial_history(local_config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Pop and return `initial_history` from the config.
-
-    Extract initial_history before passing config to the SDK.
-    The SDK does not know about this field — we inject it into the
-    conversation's internal _history list after agent creation.
-    """
+    """Pop and return `initial_history` from the config."""
     return local_config.pop("initial_history", [])
 
 
-# The exact Antigravity SDK version whose LocalConnection WebSocket client calls
-# ``websockets.connect()`` WITHOUT an explicit ``max_size``, so inbound frames
-# are capped at the library default of 1 MiB.
 _WS_MAXSIZE_PATCH_SDK_VERSION = "0.1.10"
-
-# Generous but BOUNDED inbound frame cap (128 MiB).
 _WS_MAXSIZE_DEFAULT_CAP = 128 * 1024 * 1024
 
 
@@ -547,13 +508,7 @@ def _history_message_to_step(message: dict[str, Any], types_mod: Any) -> Any:
 def _seed_conversation_history(
     conversation: Any, initial_history: list[dict[str, Any]], types_mod: Any = None
 ) -> None:
-    """Seed a fresh SDK `Conversation` with prior turns (native-backend parity).
-
-    Each user message opens a turn, so `turn_count`, `history`, and
-    `last_response` reflect the seeded transcript exactly as the native
-    backend reports them. A resumed conversation (non-empty history) is left
-    untouched, since the harness already replayed its real transcript.
-    """
+    """Seed a fresh SDK `Conversation` with prior turns (native-backend parity)."""
     if types_mod is None:
         from google.antigravity import types as sdk_types
 
@@ -575,12 +530,7 @@ def _seed_conversation_history(
 
 
 def _fill_skill_proto(skill_proto: Any, skill: Any) -> None:
-    """Populate a `genai.skills.Skill` proto from an SDK `InlineSkill`.
-
-    Mirrors the SDK's top-level `skills_config` encoding so subagent-scoped and
-    agent-scoped inline skills reach `localharness` in the same wire shape (and
-    matches the native backend's `to_proto_inline_skill`).
-    """
+    """Populate a `genai.skills.Skill` proto from an SDK `InlineSkill`."""
     import json
 
     skill_proto.name = skill.name
@@ -604,12 +554,7 @@ def _fill_skill_proto(skill_proto: Any, skill: Any) -> None:
 def _subagent_skills_proto_with_inline(
     original: Any, strategy: Any, skills_config: Any
 ) -> Any:
-    """Build a subagent `SubagentSkillsConfig` proto, encoding override inline skills.
-
-    The SDK's `LocalConnectionStrategy` rejects `inline_skills` in
-    `SubagentOverrideSkillsConfig`, although `localharness` accepts them as
-    `OverrideConfig.skill_sources` (the native backend sends exactly that).
-    """
+    """Build a subagent `SubagentSkillsConfig` proto, encoding override inline skills."""
     override = getattr(skills_config, "override_config", None)
     if override is None or not override.inline_skills:
         return original(strategy, skills_config)
@@ -645,10 +590,18 @@ def _patch_subagent_inline_skills(strategy_cls: Any, logger: logging.Logger) -> 
         return True
 
 
+_SDK_PATCH_ERRORS = (
+    RuntimeError,
+    TypeError,
+    ValueError,
+    KeyError,
+    AttributeError,
+    OSError,
+)
+
+
 def _apply_sdk_monkeypatches(logger):
-    """Apply the LocalConnection monkeypatches (turn-context/idle-event race,
-    dynamic cascade_id sync, tool-result normalization).
-    """
+    """Apply LocalConnection monkeypatches (turn-context/idle race, cascade_id sync, tool normalization)."""
     with _get_monkeypatch_lock():
         try:
             import asyncio
@@ -666,11 +619,7 @@ def _apply_sdk_monkeypatches(logger):
             missing = [a for a in expected_attrs if not hasattr(LocalConnection, a)]
             if missing:
                 logger.warning(
-                    "[MONKEYPATCH] SDK structural drift detected! "
-                    "LocalConnection is missing expected attributes: %s. "
-                    "Skipping monkeypatches — the SDK may have been updated "
-                    "past the version these patches were written for.",
-                    missing,
+                    "[MONKEYPATCH] SDK structural drift detected! Missing: %s", missing
                 )
                 return
 
@@ -686,19 +635,11 @@ def _apply_sdk_monkeypatches(logger):
                 ver_parts = [int(p) for p in sdk_version.split(".") if p.isdigit()]
                 if ver_parts < min_parts:
                     raise RuntimeError(
-                        f"[SDK-VERSION] Installed google-antigravity version {sdk_version} is older than "
-                        f"minimum supported {MIN_SUPPORTED_SDK_VERSION}. Please upgrade: pip install --upgrade google-antigravity>={MIN_SUPPORTED_SDK_VERSION}."
+                        f"[SDK-VERSION] Installed google-antigravity {sdk_version} < {MIN_SUPPORTED_SDK_VERSION}."
                     )
             except RuntimeError:
                 raise
-            except (
-                ImportError,
-                TypeError,
-                ValueError,
-                KeyError,
-                AttributeError,
-                OSError,
-            ):
+            except (ImportError, *_SDK_PATCH_ERRORS):
                 sdk_version = "unknown"
 
             logger.info(
@@ -803,12 +744,7 @@ def _apply_sdk_monkeypatches(logger):
                                     globals_mod.set_agent_conversation_id(
                                         int(agent_id), str(value)
                                     )
-                                except (
-                                    RuntimeError,
-                                    TypeError,
-                                    ValueError,
-                                    AttributeError,
-                                ):
+                                except _SDK_PATCH_ERRORS:
                                     logger.exception(
                                         "[MONKEYPATCH] Failed to store SDK conversation id"
                                     )
@@ -831,12 +767,7 @@ def _apply_sdk_monkeypatches(logger):
                                     globals_mod.dispatch_rust_hook(
                                         int(agent_id), "on_session_start", ctx_json
                                     )
-                                except (
-                                    RuntimeError,
-                                    TypeError,
-                                    ValueError,
-                                    AttributeError,
-                                ):
+                                except _SDK_PATCH_ERRORS:
                                     logger.exception(
                                         "[MONKEYPATCH] Failed to sync conversation ID"
                                     )
@@ -903,12 +834,7 @@ def _apply_sdk_monkeypatches(logger):
                                             globals_mod.set_agent_conversation_id(
                                                 int(agent_id), str(value)
                                             )
-                                        except (
-                                            RuntimeError,
-                                            TypeError,
-                                            ValueError,
-                                            AttributeError,
-                                        ):
+                                        except _SDK_PATCH_ERRORS:
                                             logger.exception(
                                                 "[MONKEYPATCH] Failed to store SDK conversation id"
                                             )
@@ -933,12 +859,7 @@ def _apply_sdk_monkeypatches(logger):
                                                 "on_session_start",
                                                 ctx_json,
                                             )
-                                        except (
-                                            RuntimeError,
-                                            TypeError,
-                                            ValueError,
-                                            AttributeError,
-                                        ):
+                                        except _SDK_PATCH_ERRORS:
                                             logger.exception(
                                                 "[MONKEYPATCH] Failed to sync conversation ID"
                                             )
@@ -990,14 +911,7 @@ def _apply_sdk_monkeypatches(logger):
                                     )
                                     result = results[0]
                                     result.id = tool_call.id
-                                except (
-                                    RuntimeError,
-                                    TypeError,
-                                    ValueError,
-                                    KeyError,
-                                    AttributeError,
-                                    OSError,
-                                ) as e:
+                                except _SDK_PATCH_ERRORS as e:
                                     result = types.ToolResult(
                                         id=tool_call.id,
                                         name=tool_call.name,
@@ -1020,14 +934,7 @@ def _apply_sdk_monkeypatches(logger):
                                         await self._hook_runner.dispatch_post_tool_call(
                                             op_ctx, result
                                         )
-                                    except (
-                                        RuntimeError,
-                                        TypeError,
-                                        ValueError,
-                                        KeyError,
-                                        AttributeError,
-                                        OSError,
-                                    ) as hook_err:
+                                    except _SDK_PATCH_ERRORS as hook_err:
                                         logger.warning(
                                             "Error dispatching post_tool_call hook: %s",
                                             hook_err,
@@ -1039,14 +946,7 @@ def _apply_sdk_monkeypatches(logger):
                                     "Received tool call %s but no tool runner is configured. Yielding to user.",
                                     tool_call.name,
                                 )
-                        except (
-                            RuntimeError,
-                            TypeError,
-                            ValueError,
-                            KeyError,
-                            AttributeError,
-                            OSError,
-                        ) as e:
+                        except _SDK_PATCH_ERRORS as e:
                             logger.exception(
                                 "_handle_tool_call failed; returning error to model"
                             )

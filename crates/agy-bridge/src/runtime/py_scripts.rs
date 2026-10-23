@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 pub(crate) const MAX_DECODE_DEPTH: usize = 64;
 
 pub const PYTHON_AGENT_INIT_HELPERS_SCRIPT: &str = include_str!("py/agent_init_helpers.py");
+pub const PYTHON_SDK_PROTO_PARITY_SCRIPT: &str = include_str!("py/sdk_proto_parity.py");
 pub const PYTHON_AGENT_INIT_SCRIPT: &str = include_str!("py/agent_init.py");
 
 /// Import `module`, serialising its *first* (uncached) import across threads.

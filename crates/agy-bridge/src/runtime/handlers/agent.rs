@@ -8,7 +8,9 @@ use super::super::{
     AgentId,
     command_loop::{AGY_BRIDGE_GLOBALS_MODULE, AgentRegistry},
     dispatch_rust_policy_confirm, dispatch_rust_tool,
-    py_scripts::{PYTHON_AGENT_INIT_HELPERS_SCRIPT, PYTHON_AGENT_INIT_SCRIPT},
+    py_scripts::{
+        PYTHON_AGENT_INIT_HELPERS_SCRIPT, PYTHON_AGENT_INIT_SCRIPT, PYTHON_SDK_PROTO_PARITY_SCRIPT,
+    },
 };
 use crate::error::Error;
 
@@ -64,6 +66,13 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
         ))
     })?;
     py.run(c_helpers.as_c_str(), Some(&globals_module.dict()), None)?;
+
+    let c_parity = CString::new(PYTHON_SDK_PROTO_PARITY_SCRIPT).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Python SDK proto parity script contains null byte: {e}"
+        ))
+    })?;
+    py.run(c_parity.as_c_str(), Some(&globals_module.dict()), None)?;
 
     let c_script = CString::new(PYTHON_AGENT_INIT_SCRIPT).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(

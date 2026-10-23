@@ -744,7 +744,13 @@ def test_wire_compaction_budget_retry_and_instructions():
     if not hasattr(types, "CompactionConfig"):
         return
     cfg = {
-        "compaction_config": {"token_threshold": 50000},
+        "compaction_config": {
+            "token_threshold": 50000,
+            "checkpoint_interval_tokens": 25000,
+            "max_context_tokens": 1000000,
+            "summary_prompt_override": "Summarize key findings.",
+            "use_model_reported_token_count": True,
+        },
         "budget_config": {
             "max_tokens": 100000,
             "max_model_calls": 10,
@@ -770,6 +776,11 @@ def test_wire_compaction_budget_retry_and_instructions():
 
     assert isinstance(cfg["compaction_config"], types.CompactionConfig)
     assert cfg["compaction_config"].token_threshold == 50000
+    extras = getattr(cfg["compaction_config"], "_agy_extra_compaction", {})
+    assert extras["checkpoint_interval_tokens"] == 25000
+    assert extras["max_context_tokens"] == 1000000
+    assert extras["summary_prompt_override"] == "Summarize key findings."
+    assert extras["use_model_reported_token_count"] is True
     assert isinstance(cfg["budget_config"], types.BudgetConfig)
     assert cfg["budget_config"].scope == types.BudgetScope.FORWARD_LOOKING
     assert isinstance(cfg["retry_config"], types.RetryConfig)
@@ -777,6 +788,36 @@ def test_wire_compaction_budget_retry_and_instructions():
     assert cfg["retry_config"].model_output_retry.max_retries == 5
     assert isinstance(cfg["system_instructions"], types.CustomSystemInstructions)
     assert cfg["system_instructions"].text == "Be concise and accurate."
+
+    import logging
+
+    from google.antigravity.connections.local import local_connection as lc_mod
+
+    agent_init._patch_compaction_config_proto(lc_mod, logging.getLogger("test"))
+    proto, legacy = lc_mod.to_proto_compaction_config(cfg["compaction_config"], None)
+    assert proto.token_threshold == 50000
+    assert proto.checkpoint_interval_tokens == 25000
+    assert proto.max_context_tokens == 1000000
+    assert proto.summary_prompt_override == "Summarize key findings."
+    assert proto.use_model_reported_token_count is True
+    assert legacy == 50000
+
+    # Also test CompactionConfig without token_threshold (extras only)
+    cfg_no_thresh = {
+        "compaction_config": {
+            "max_context_tokens": 1000000,
+            "summary_prompt_override": "Only open tasks.",
+        }
+    }
+    agent_init._wire_compaction_config(cfg_no_thresh)
+    assert isinstance(cfg_no_thresh["compaction_config"], types.CompactionConfig)
+    proto2, legacy2 = lc_mod.to_proto_compaction_config(
+        cfg_no_thresh["compaction_config"], None
+    )
+    assert proto2.token_threshold == 0
+    assert proto2.max_context_tokens == 1000000
+    assert proto2.summary_prompt_override == "Only open tasks."
+    assert legacy2 == 0
 
 
 def test_v0122_inline_skills_subagent_skills_and_max_output_tokens():

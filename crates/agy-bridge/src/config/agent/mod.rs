@@ -40,6 +40,14 @@ fn default_model_name() -> String {
 pub enum SystemInstructions {
     /// Completely replace the default system instructions (advanced usage).
     Custom(String),
+    /// Completely replace the default system instructions with an optional section title.
+    TitledCustom {
+        /// The custom system instructions text.
+        text: String,
+        /// Optional title/label for the custom system instructions part.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     /// Override identity and/or append sections to the defaults (recommended).
     Templated {
         /// Optional identity string that replaces the agent's default persona.
@@ -56,6 +64,15 @@ impl SystemInstructions {
     #[must_use]
     pub fn custom(text: impl Into<String>) -> Self {
         Self::Custom(text.into())
+    }
+
+    /// Create custom system instructions with an explicit section title.
+    #[must_use]
+    pub fn custom_with_title(text: impl Into<String>, title: impl Into<String>) -> Self {
+        Self::TitledCustom {
+            text: text.into(),
+            title: Some(title.into()),
+        }
     }
 }
 
@@ -300,6 +317,25 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(into, strip_option))]
     pub session_continuation_mode: Option<SessionContinuationMode>,
+    /// Custom tool names that immediately terminate the turn upon a successful call.
+    ///
+    /// When a registered custom tool whose name is in `finish_on_tools` completes
+    /// without error (`Ok(ToolOutput)`), the runtime sends the `ToolResponse` to
+    /// the harness and immediately halts the turn, avoiding an extra post-submit
+    /// LLM round-trip. If the tool returns `Err(ToolError)`, the turn continues
+    /// so the model can correct its arguments and retry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default, setter(transform = |v: impl IntoIterator<Item = impl Into<String>>| v.into_iter().map(Into::into).collect()))]
+    pub finish_on_tools: Vec<String>,
+    /// Minimum prompt-injection sanitization applied to every custom tool output.
+    ///
+    /// Defaults to [`OutputSanitization::SanitizeTokens`](crate::tools::OutputSanitization):
+    /// LLM control tokens in tool output are neutralized even when a tool opts out.
+    /// Raise it to `Quarantine` when tools return untrusted external content. Raw
+    /// passthrough requires lowering this to `None` *and* opting the tool out.
+    #[serde(default)]
+    #[builder(default)]
+    pub tool_output_floor: crate::tools::OutputSanitization,
 }
 
 /// Controls whether an agent session resumes an existing conversation or starts fresh.

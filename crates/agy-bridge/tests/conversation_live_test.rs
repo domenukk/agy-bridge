@@ -267,7 +267,9 @@ fn live_streaming_token_delivery() {
             drop(response.text().await?);
 
             eprintln!("Streamed text chunks: {chunk_count}");
-            if std::env::var("GEMINI_API_BASE_URL").is_ok() {
+            // Resolve proxy mode exactly like the bridge does (process env, then
+            // `.env`): proxies deliver unary responses as a single SSE frame.
+            if agy_bridge::env_var("GEMINI_API_BASE_URL").is_some() {
                 assert!(
                     chunk_count >= 1,
                     "Expected at least one streaming chunk from proxy"

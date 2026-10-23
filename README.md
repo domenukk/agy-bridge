@@ -222,6 +222,26 @@ let registry = ToolRegistry::new().with_tool(SearchTool);
 assert_eq!(registry.definitions().len(), 1);
 ```
 
+#### Safe Defaults
+
+Tool output is sanitized by default. `AgentConfig::tool_output_floor` (default
+`OutputSanitization::SanitizeTokens`) is enforced on every custom tool call,
+even for tools that opt out. Raise it for tools that return external content:
+
+```rust
+use agy_bridge::{config::AgentConfig, tools::OutputSanitization};
+
+let config = AgentConfig::builder()
+    .tool_output_floor(OutputSanitization::Quarantine)
+    .build();
+assert_eq!(config.tool_output_floor, OutputSanitization::Quarantine);
+```
+
+To end the turn as soon as a submit tool succeeds (native runtime), name it by
+type so it can't drift from the registered tool: `.finish_on::<SubmitReport>()`.
+Unknown names and unsupported backends fail agent creation instead of being
+ignored.
+
 #### Tool Discovery
 
 After agent creation, inspect all available tools — custom Rust tools,
@@ -285,8 +305,11 @@ let server = McpServer::stdio("npx")
         "@modelcontextprotocol/server-postgres",
         "postgresql://postgres:postgres@localhost:5432/postgres",
     ])
+    .name("postgres")
     .build();
 
+// Same name on both runtimes; used as `ServerName` in `call_mcp_tool`.
+assert_eq!(server.server_name(), "postgres");
 let config = AgentConfig::builder().mcp_servers([server]).build();
 assert_eq!(config.mcp_servers.len(), 1);
 ```

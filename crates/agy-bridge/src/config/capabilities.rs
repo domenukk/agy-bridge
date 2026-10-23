@@ -319,6 +319,11 @@ pub struct CapabilitiesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub mcp_max_output_bytes: Option<u32>,
+    /// When true, disables the `define_subagent` tool so the agent can only invoke
+    /// pre-configured subagents.
+    #[serde(default)]
+    #[builder(default)]
+    pub disable_define_subagent_tool: bool,
 }
 
 /// Configuration for the builtin `run_command` tool.

@@ -1,6 +1,7 @@
 //! Session state for an active agent in the native runtime.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -38,6 +39,10 @@ pub(crate) struct NativeAgentSession {
     /// `false` once the harness WebSocket has closed. A disconnected session
     /// can no longer run turns; `chat` rejects new turns instead of hanging.
     pub(crate) connected: Arc<AtomicBool>,
+    /// Custom tool names that terminate the active turn on a successful call.
+    pub(crate) finish_on_tools: Arc<HashSet<String>>,
+    /// Set when a tool in `finish_on_tools` completes with `Ok` during the turn.
+    pub(crate) finished_by_tool: Arc<AtomicBool>,
     /// Storage directory associated with this session's localharness process.
     pub(crate) save_dir: PathBuf,
     /// OS command sandbox status reported by the harness.
@@ -60,6 +65,7 @@ impl NativeAgentSession {
         event_tx: mpsc::Sender<proto::localharness::InputEvent>,
         init: InitialHarnessState,
         save_dir: PathBuf,
+        finish_on_tools: HashSet<String>,
     ) -> Self {
         Self {
             event_tx,
@@ -77,6 +83,8 @@ impl NativeAgentSession {
             produced_output: Arc::new(AtomicBool::new(false)),
             turn_activity: Arc::new(AtomicBool::new(false)),
             connected: Arc::new(AtomicBool::new(true)),
+            finish_on_tools: Arc::new(finish_on_tools),
+            finished_by_tool: Arc::new(AtomicBool::new(false)),
             save_dir,
             sandbox_status: init.sandbox_status,
         }

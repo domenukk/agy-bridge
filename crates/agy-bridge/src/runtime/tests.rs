@@ -30,6 +30,25 @@ async fn test_runtime_creation_and_shutdown() {
         .expect("Shutdown failed");
 }
 
+#[tokio::test]
+async fn python_runtime_rejects_finish_on_tools() {
+    use crate::agent::Runtime as _;
+
+    let runtime = PythonRuntime::new(test_config()).expect("Failed to create runtime");
+    let config = crate::config::AgentConfig::builder()
+        .finish_on_tools(["report_submit"])
+        .build();
+    let err = runtime
+        .create_agent(crate::runtime::bridge_state::next_agent_id(), config)
+        .await
+        .expect_err("Python backend must reject unsupported finish_on_tools");
+    assert!(
+        matches!(err, Error::InvalidConfig { ref message } if message.contains("finish_on_tools")),
+        "unexpected error: {err}"
+    );
+    runtime.shutdown().await.expect("Shutdown failed");
+}
+
 #[test]
 fn runtime_config_serde_roundtrip() {
     let config = test_config();

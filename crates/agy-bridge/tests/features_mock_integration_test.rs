@@ -115,11 +115,19 @@ fn mcp_tool_call_round_trip() {
     rt.block_on(async {
         use agy_bridge::config::McpServer;
 
-        // Mock Gemini server that calls the MCP-provided "mcp_echo" tool.
+        // localharness exposes MCP tools lazily through the `call_mcp_tool`
+        // meta-tool, addressed by the canonical server name.
+        const SERVER_NAME: &str = "echo_mcp";
         let gemini = MockGeminiServer::start(vec![
             MockResponse::FunctionCall {
-                name: "mcp_echo".into(),
-                args: serde_json::json!({"message": "hello from MCP"}),
+                name: "call_mcp_tool".into(),
+                args: serde_json::json!({
+                    "ServerName": SERVER_NAME,
+                    "ToolName": "mcp_echo",
+                    "Arguments": {"message": "hello from MCP"},
+                    "toolSummary": "Echo test",
+                    "toolAction": "Echoing message",
+                }),
             },
             MockResponse::Text("MCP tool returned successfully.".into()),
         ])
@@ -158,6 +166,7 @@ for line in sys.stdin:
         pass
 ",
             ])
+            .name(SERVER_NAME)
             .build();
 
         let config = agy_bridge::config::AgentConfig::builder()
@@ -186,6 +195,19 @@ for line in sys.stdin:
 
         // Verify 2 POSTs: initial → functionCall → functionResponse → text.
         assert_eq!(gemini.post_count(), 2, "Expected 2 POSTs to Gemini");
+
+        // The second POST must carry the MCP server's real output, proving the
+        // call reached the server instead of failing as an unknown tool.
+        let posts = gemini.recorded_posts().await;
+        let follow_up = &posts.last().expect("follow-up POST").body;
+        assert!(
+            follow_up.contains("echo: hello from MCP"),
+            "MCP server output missing from functionResponse: {follow_up}"
+        );
+        assert!(
+            !follow_up.contains("unknown tool name"),
+            "MCP tool call was rejected: {follow_up}"
+        );
 
         agent.shutdown().await.expect("shutdown");
     });

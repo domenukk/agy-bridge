@@ -125,8 +125,24 @@ fn system_instructions_custom_serde() {
     let parsed: SystemInstructions = serde_json::from_str(&json).unwrap();
     match parsed {
         SystemInstructions::Custom(text) => assert_eq!(text, "Be a helpful assistant"),
-        SystemInstructions::Templated { .. } => {
-            panic!("Expected Custom, got Templated")
+        SystemInstructions::TitledCustom { .. } | SystemInstructions::Templated { .. } => {
+            panic!("Expected Custom, got {parsed:?}")
+        }
+    }
+}
+
+#[test]
+fn system_instructions_titled_custom_serde() {
+    let instr = SystemInstructions::custom_with_title("Be strict", "security_policy");
+    let json = serde_json::to_string(&instr).unwrap();
+    let parsed: SystemInstructions = serde_json::from_str(&json).unwrap();
+    match parsed {
+        SystemInstructions::TitledCustom { text, title } => {
+            assert_eq!(text, "Be strict");
+            assert_eq!(title.as_deref(), Some("security_policy"));
+        }
+        SystemInstructions::Custom(_) | SystemInstructions::Templated { .. } => {
+            panic!("Expected TitledCustom, got {parsed:?}")
         }
     }
 }
@@ -148,8 +164,8 @@ fn system_instructions_templated_serde() {
             assert_eq!(sections.len(), 1);
             assert_eq!(sections[0].content, "Always check permissions");
         }
-        SystemInstructions::Custom(_) => {
-            panic!("Expected Templated, got Custom")
+        SystemInstructions::Custom(_) | SystemInstructions::TitledCustom { .. } => {
+            panic!("Expected Templated, got {parsed:?}")
         }
     }
 }

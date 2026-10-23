@@ -22,6 +22,60 @@ pub(crate) mod mock;
 /// Unique identifier for an agent within the bridge.
 pub type AgentId = u64;
 
+/// Freeze `registry` with its output floor raised to at least `floor`.
+///
+/// Never lowers a stricter floor the caller already set on the registry.
+pub(crate) fn floored_registry(
+    mut registry: crate::tools::ToolRegistry,
+    floor: crate::tools::OutputSanitization,
+) -> Arc<crate::tools::ToolRegistry> {
+    let effective = registry.output_floor().at_least(floor);
+    registry.set_output_floor(effective);
+    Arc::new(registry)
+}
+
+/// Reject tool configurations that would silently not do what they say.
+///
+/// - every `finish_on_tools` entry must name a registered custom tool;
+/// - the registry's output floor must be at least `tool_output_floor`.
+pub(crate) fn validate_tool_config(
+    config: &AgentConfig,
+    registry: Option<&crate::tools::ToolRegistry>,
+) -> Result<(), Error> {
+    if let Some(reg) = registry {
+        let floor = reg.output_floor();
+        if floor.at_least(config.tool_output_floor) != floor {
+            return Err(Error::InvalidConfig {
+                message: format!(
+                    "ToolRegistry output floor {floor:?} is weaker than \
+                     AgentConfig.tool_output_floor {:?}; build agents via \
+                     AgyBridge::agent(..).tools(..) or call ToolRegistry::set_output_floor",
+                    config.tool_output_floor
+                ),
+            });
+        }
+    }
+    let unknown: Vec<&str> = config
+        .finish_on_tools
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !registry.is_some_and(|reg| reg.contains(name)))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<&str> = match registry {
+        Some(reg) => reg.iter().map(|(name, _)| name).collect(),
+        None => Vec::new(),
+    };
+    Err(Error::InvalidConfig {
+        message: format!(
+            "finish_on_tools names unregistered tools {unknown:?}; registered custom tools: \
+             {registered:?}"
+        ),
+    })
+}
+
 /// Trait abstracting the Python runtime interface.
 ///
 /// This allows unit tests to inject a mock runtime without requiring a live
@@ -272,6 +326,8 @@ impl<R: Runtime> AgentHandle<R> {
         hook_runner: Option<Arc<crate::hooks::Hooks>>,
         policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Self, Error> {
+        validate_tool_config(&config, registry.as_deref())?;
+
         // Allocate the (process-globally-unique) agent ID up front so we can
         // register per-agent initialization state *before* creation, keyed by
         // the ID. This avoids any process-wide lock across `create_agent`, so
@@ -836,7 +892,8 @@ impl<R: Runtime> AgentHandle<R> {
         {
             config.tools = disp.definitions();
         }
-        let arc_registry = opt_registry.map(Arc::new);
+        let arc_registry =
+            opt_registry.map(|registry| floored_registry(registry, config.tool_output_floor));
         Self::new(
             Arc::clone(&self.runtime),
             config,

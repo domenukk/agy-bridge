@@ -220,6 +220,7 @@ async fn test_handle_trajectory_state_update_flow() {
     let last_error = Arc::new(Mutex::new(None));
     let produced_output = Arc::new(AtomicBool::new(true));
     let turn_activity = Arc::new(AtomicBool::new(true));
+    let finished_by_tool = Arc::new(AtomicBool::new(false));
     let history = Arc::new(Mutex::new(Vec::new()));
     let last_response_text = Arc::new(Mutex::new(Some("Final reply".to_string())));
 
@@ -231,6 +232,7 @@ async fn test_handle_trajectory_state_update_flow() {
         last_error: &last_error,
         produced_output: &produced_output,
         turn_activity: &turn_activity,
+        finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
     };
@@ -316,6 +318,7 @@ async fn test_empty_completion_without_activity_yields_error() {
     let last_error = Arc::new(Mutex::new(None));
     let produced_output = Arc::new(AtomicBool::new(false));
     let turn_activity = Arc::new(AtomicBool::new(false));
+    let finished_by_tool = Arc::new(AtomicBool::new(false));
     let history = Arc::new(Mutex::new(Vec::new()));
     let last_response_text = Arc::new(Mutex::new(None));
 
@@ -327,6 +330,7 @@ async fn test_empty_completion_without_activity_yields_error() {
         last_error: &last_error,
         produced_output: &produced_output,
         turn_activity: &turn_activity,
+        finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
     };
@@ -361,6 +365,7 @@ async fn test_empty_completion_with_activity_is_ok() {
     let last_error = Arc::new(Mutex::new(None));
     let produced_output = Arc::new(AtomicBool::new(false));
     let turn_activity = Arc::new(AtomicBool::new(true));
+    let finished_by_tool = Arc::new(AtomicBool::new(false));
     let history = Arc::new(Mutex::new(Vec::new()));
     let last_response_text = Arc::new(Mutex::new(None));
 
@@ -372,6 +377,7 @@ async fn test_empty_completion_with_activity_is_ok() {
         last_error: &last_error,
         produced_output: &produced_output,
         turn_activity: &turn_activity,
+        finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
     };
@@ -390,4 +396,86 @@ async fn test_empty_completion_with_activity_is_ok() {
         .await
         .expect("Empty completion with harness activity must be Ok");
     assert_eq!(result.into_string(), "");
+}
+
+#[tokio::test]
+async fn test_finish_on_tools_halts_without_fabricating_assistant_text() {
+    use std::collections::HashSet;
+
+    use crate::streaming::channel_with_buffer;
+
+    const PAYLOAD: &str = r#"{"status":"submitted"}"#;
+
+    let (writer, mut handle) = channel_with_buffer(16);
+    let mut events = handle.take_event_stream().expect("event stream");
+    let active_writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+    let turn_activity = Arc::new(AtomicBool::new(false));
+    let finished_by_tool = Arc::new(AtomicBool::new(false));
+
+    let tool_ctx = ToolCallDispatchContext {
+        active_writer: Arc::clone(&active_writer),
+        event_tx,
+        turn_activity: Arc::clone(&turn_activity),
+        finish_on_tools: Arc::new(HashSet::from(["report_submit".to_string()])),
+        finished_by_tool: Arc::clone(&finished_by_tool),
+    };
+
+    emit_tool_result_event("report_submit", "call-1", PAYLOAD, "", &active_writer).await;
+    apply_finish_on_tool_completion(&tool_ctx).await;
+    assert!(finished_by_tool.load(Ordering::SeqCst));
+
+    let halt_ev = event_rx.recv().await.expect("expected HaltRequest event");
+    assert!(matches!(
+        halt_ev.event,
+        Some(proto::localharness::input_event::Event::HaltRequest(true))
+    ));
+
+    // The harness reports the client halt as an error; it must not fail the turn.
+    let turn_count = Arc::new(AtomicU32::new(0));
+    let is_idle = Arc::new(AtomicBool::new(false));
+    let idle_notify = Arc::new(Notify::new());
+    let last_error = Arc::new(Mutex::new(None));
+    let produced_output = Arc::new(AtomicBool::new(false));
+    let history = Arc::new(Mutex::new(Vec::new()));
+    let last_response_text = Arc::new(Mutex::new(None));
+    let traj_ctx = TrajectoryStateContext {
+        turn_count: &turn_count,
+        is_idle: &is_idle,
+        idle_notify: &idle_notify,
+        active_writer: &active_writer,
+        last_error: &last_error,
+        produced_output: &produced_output,
+        turn_activity: &turn_activity,
+        finished_by_tool: &finished_by_tool,
+        history: &history,
+        last_response_text: &last_response_text,
+    };
+    let state_update = proto::localharness::TrajectoryStateUpdate {
+        state: 3,
+        error: "halted by client".to_string(),
+        trajectory_id: "traj-finish-tool".to_string(),
+        ..Default::default()
+    };
+    handle_trajectory_state_update(state_update, &traj_ctx).await;
+
+    // The tool payload arrives as a ToolResult event, never as assistant text.
+    match events.recv().await.expect("tool result event") {
+        ResponseEvent::ToolResult(result) => {
+            assert_eq!(result.name, "report_submit");
+            assert_eq!(result.id.as_deref(), Some("call-1"));
+            assert_eq!(result.result, serde_json::json!({"status": "submitted"}));
+            assert!(result.error.is_none());
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+    assert!(
+        events.recv().await.is_none(),
+        "no text or error events may follow the tool result"
+    );
+    assert!(
+        history.lock().unwrap().is_empty(),
+        "tool output must not be recorded as a model message"
+    );
+    assert!(last_response_text.lock().unwrap().is_none());
 }

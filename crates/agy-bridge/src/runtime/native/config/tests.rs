@@ -60,10 +60,12 @@ fn test_build_harness_config_with_mcp_servers() {
     let config = AgentConfig {
         mcp_servers: vec![
             McpServer::Stdio(McpStdioServer {
+                name: None,
                 command: "echo-server".to_string(),
                 args: vec!["--port".to_string(), "8080".to_string()],
             }),
             McpServer::Http(McpStreamableHttpServer {
+                name: None,
                 url: "http://127.0.0.1:9090/mcp".to_string(),
                 headers: None,
                 timeout: 30.0,
@@ -78,6 +80,8 @@ fn test_build_harness_config_with_mcp_servers() {
     let harness_config = build_harness_config(&config, None, None, &policies);
 
     assert_eq!(harness_config.mcp_servers.len(), 2);
+    assert_eq!(harness_config.mcp_servers[0].name, "echo-server");
+    assert_eq!(harness_config.mcp_servers[1].name, "127_0_0_1_9090");
 }
 
 #[test]
@@ -316,5 +320,64 @@ fn test_v0122_inline_skills_subagent_skills_and_new_fields() {
             assert_eq!(opts.max_output_tokens, 32_768);
         }
         other => panic!("Unexpected endpoint: {other:?}"),
+    }
+}
+
+#[test]
+fn test_titled_custom_instructions_and_new_proto_fields() {
+    let config = AgentConfig {
+        system_instructions: Some(SystemInstructions::custom_with_title(
+            "Follow security policy.",
+            "security_rules",
+        )),
+        capabilities: Some(CapabilitiesConfig {
+            enable_subagents: true,
+            disable_define_subagent_tool: true,
+            ..CapabilitiesConfig::default()
+        }),
+        compaction_config: Some(
+            CompactionConfig::one_million().with_include_last_user_message(true),
+        ),
+        ..AgentConfig::default()
+    };
+
+    let policies = PolicySet::validated_from(vec![PolicyRule::workspace_only(["/tmp/ws_auto"])])
+        .expect("valid policy set");
+    let harness = build_harness_config(&config, None, None, &policies);
+
+    let si = harness.system_instructions.expect("system_instructions");
+    match si.r#type {
+        Some(proto::localharness::system_instructions::Type::Custom(custom)) => {
+            assert_eq!(custom.part.len(), 1);
+            assert_eq!(custom.part[0].title, "security_rules");
+            assert_eq!(
+                custom.part[0].part,
+                Some(
+                    proto::localharness::custom_system_instructions::part::Part::Text(
+                        "Follow security policy.".to_string()
+                    )
+                )
+            );
+        }
+        other => panic!("Expected Custom system instructions, got {other:?}"),
+    }
+
+    let sub_cfg = harness
+        .harness_side_tools
+        .expect("harness_side_tools")
+        .subagents
+        .expect("subagents");
+    assert!(sub_cfg.enabled);
+    assert!(sub_cfg.disable_define_subagent_tool);
+
+    let comp = harness.compaction_config.expect("compaction_config");
+    assert_eq!(comp.include_last_user_message, Some(true));
+
+    assert_eq!(harness.workspaces.len(), 1);
+    match &harness.workspaces[0].workspace_type {
+        Some(proto::localharness::workspace::WorkspaceType::FilesystemWorkspace(fs_ws)) => {
+            assert_eq!(fs_ws.directory, "/tmp/ws_auto");
+        }
+        other => panic!("Expected FilesystemWorkspace, got {other:?}"),
     }
 }

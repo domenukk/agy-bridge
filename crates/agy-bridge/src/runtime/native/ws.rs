@@ -18,9 +18,9 @@ use super::{
     NativeAgentSession, WS_CONNECT_RETRY_COUNT, WS_CONNECT_RETRY_DELAY,
     config::build_harness_config,
     events::{
-        StepUpdateContext, TrajectoryStateContext, handle_call_hook_request,
-        handle_policy_decision_request, handle_step_update, handle_tool_call,
-        handle_trajectory_state_update, handle_usage_update, to_usage_metadata,
+        StepUpdateContext, ToolCallDispatchContext, TrajectoryStateContext,
+        handle_call_hook_request, handle_policy_decision_request, handle_step_update,
+        handle_tool_call, handle_trajectory_state_update, handle_usage_update, to_usage_metadata,
     },
     proto,
     session::InitialHarnessState,
@@ -288,6 +288,8 @@ struct SessionReaderContext {
     last_error: Arc<Mutex<Option<crate::streaming::StreamError>>>,
     produced_output: Arc<AtomicBool>,
     turn_activity: Arc<AtomicBool>,
+    finish_on_tools: Arc<std::collections::HashSet<String>>,
+    finished_by_tool: Arc<AtomicBool>,
     compaction_indices: Arc<Mutex<Vec<u32>>>,
     event_tx: mpsc::Sender<proto::localharness::InputEvent>,
     turn_count: Arc<AtomicU32>,
@@ -307,6 +309,8 @@ impl SessionReaderContext {
             last_error: Arc::clone(&session.last_error),
             produced_output: Arc::clone(&session.produced_output),
             turn_activity: Arc::clone(&session.turn_activity),
+            finish_on_tools: Arc::clone(&session.finish_on_tools),
+            finished_by_tool: Arc::clone(&session.finished_by_tool),
             compaction_indices: Arc::clone(&session.compaction_indices),
             event_tx: session.event_tx.clone(),
             turn_count: Arc::clone(&session.turn_count),
@@ -394,11 +398,15 @@ async fn dispatch_output_event(
             handle_step_update(agent_id, step_update, &step_ctx).await;
         }
         proto::localharness::output_event::Event::ToolCall(tool_call) => {
-            let writer = Arc::clone(&ctx.active_writer);
-            let tx = ctx.event_tx.clone();
-            let activity = Arc::clone(&ctx.turn_activity);
+            let tool_ctx = ToolCallDispatchContext {
+                active_writer: Arc::clone(&ctx.active_writer),
+                event_tx: ctx.event_tx.clone(),
+                turn_activity: Arc::clone(&ctx.turn_activity),
+                finish_on_tools: Arc::clone(&ctx.finish_on_tools),
+                finished_by_tool: Arc::clone(&ctx.finished_by_tool),
+            };
             ctx.runtime.spawn(async move {
-                handle_tool_call(agent_id, tool_call, &writer, &tx, &activity).await;
+                handle_tool_call(agent_id, tool_call, &tool_ctx).await;
             });
         }
         proto::localharness::output_event::Event::CallHookRequest(req) => {
@@ -432,6 +440,7 @@ async fn dispatch_output_event(
                 last_error: &ctx.last_error,
                 produced_output: &ctx.produced_output,
                 turn_activity: &ctx.turn_activity,
+                finished_by_tool: &ctx.finished_by_tool,
                 history: &ctx.history,
                 last_response_text: &ctx.last_response_text,
             };

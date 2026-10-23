@@ -116,8 +116,17 @@ message SkillSource {
 }
 
 message SkillsConfig {
+  enum PresentationMode {
+    PRESENTATION_MODE_UNSPECIFIED = 0;
+    TOOL = 1;
+    FILE_SYSTEM = 2;
+  }
   bool enabled = 1;
   repeated antigravity.localharness.SkillSource skills = 2;
+  map<string, string> skill_versions = 3;
+  antigravity.localharness.SkillsConfig.PresentationMode presentation_mode = 4;
+  string materialized_skills_dir = 5;
+  repeated string preactivate_skills = 6;
 }
 
 message BudgetConfig {
@@ -140,6 +149,7 @@ message CompactionConfig {
   uint32 max_context_tokens = 3;
   string summary_prompt_override = 4;
   optional bool use_model_reported_token_count = 5;
+  optional bool include_last_user_message = 6;
 }
 
 message ModelAPIRetryConfig {
@@ -222,7 +232,9 @@ message CustomSystemInstructions {
     oneof part {
       string text = 1;
       antigravity.localharness.CustomSystemInstructions.SystemInstructionTemplate template = 2;
+      string builtin_section = 3;
     }
+    string title = 4;
   }
   message SystemInstructionTemplate {
     message Arg {
@@ -274,6 +286,7 @@ message HarnessSideTools {
 
 message RunWorkflowToolConfig {
   bool enabled = 1;
+  antigravity.localharness.ToolExecutionMode execution_mode = 2;
 }
 
 message ManageTaskToolConfig {
@@ -300,6 +313,7 @@ message SubagentsConfig {
   bool enabled = 1;
   optional int32 max_nesting_depth = 2;
   repeated string allowed_subagents = 3;
+  bool disable_define_subagent_tool = 4;
 }
 
 message UserQuestionsConfig {

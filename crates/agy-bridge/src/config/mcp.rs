@@ -7,6 +7,11 @@ use super::{default_mcp_sse_read_timeout, default_mcp_timeout, default_true};
 /// Configuration for an MCP server connected via stdio.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpStdioServer {
+    /// Server name used by the harness (e.g. `ServerName` in `call_mcp_tool`).
+    ///
+    /// Defaults to a name derived from the command / URL; see [`McpServer::server_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The command to run to start the server.
     pub command: String,
     /// Arguments to pass to the command.
@@ -17,6 +22,11 @@ pub struct McpStdioServer {
 /// Configuration for an MCP server connected via SSE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSseServer {
+    /// Server name used by the harness (e.g. `ServerName` in `call_mcp_tool`).
+    ///
+    /// Defaults to a name derived from the command / URL; see [`McpServer::server_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The URL of the SSE endpoint.
     pub url: String,
     /// Optional headers to send with the connection request.
@@ -27,6 +37,11 @@ pub struct McpSseServer {
 /// Configuration for an MCP server connected via Streamable HTTP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpStreamableHttpServer {
+    /// Server name used by the harness (e.g. `ServerName` in `call_mcp_tool`).
+    ///
+    /// Defaults to a name derived from the command / URL; see [`McpServer::server_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The URL of the HTTP endpoint.
     pub url: String,
     /// Optional headers to send with the connection request.
@@ -62,7 +77,71 @@ pub enum McpServer {
     Http(McpStreamableHttpServer),
 }
 
+/// Fallback server name when nothing usable can be derived.
+const DEFAULT_MCP_SERVER_NAME: &str = "mcp_server";
+
+/// Replace every character outside `[A-Za-z0-9_-]` with `_`.
+fn sanitize_server_name(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        DEFAULT_MCP_SERVER_NAME.to_owned()
+    } else {
+        sanitized
+    }
+}
+
+/// Derive a name from a command path: its file stem (`/usr/bin/python3` -> `python3`).
+fn name_from_command(command: &str) -> String {
+    let stem = match std::path::Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        Some(stem) => stem,
+        None => command,
+    };
+    sanitize_server_name(stem)
+}
+
+/// Derive a name from a URL: its authority (`http://127.0.0.1:9090/mcp` -> `127_0_0_1_9090`).
+fn name_from_url(url: &str) -> String {
+    let without_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    let authority = match without_scheme.split('/').next() {
+        Some(authority) => authority,
+        None => without_scheme,
+    };
+    sanitize_server_name(authority)
+}
+
 impl McpServer {
+    /// The canonical server name sent to the harness by every runtime.
+    ///
+    /// The explicit [`name`](McpStdioServer::name) wins (sanitized to `[A-Za-z0-9_-]`);
+    /// otherwise it is derived from the stdio command stem or the URL authority.
+    #[must_use]
+    pub fn server_name(&self) -> String {
+        let (explicit, derived) = match self {
+            Self::Stdio(s) => (s.name.as_deref(), name_from_command(&s.command)),
+            Self::Sse(s) => (s.name.as_deref(), name_from_url(&s.url)),
+            Self::Http(s) => (s.name.as_deref(), name_from_url(&s.url)),
+        };
+        match explicit {
+            Some(name) => sanitize_server_name(name),
+            None => derived,
+        }
+    }
+
     /// Create a stdio-transport MCP server that spawns `command` as a child process.
     #[must_use]
     pub fn stdio(command: impl Into<String>) -> McpStdioServer {
@@ -95,9 +174,17 @@ impl McpStdioServer {
     #[must_use]
     pub fn new(command: impl Into<String>) -> Self {
         Self {
+            name: None,
             command: command.into(),
             args: Vec::new(),
         }
+    }
+
+    /// Set an explicit server name (see [`McpServer::server_name`]).
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     /// Add an argument to the command.
@@ -136,9 +223,17 @@ impl McpSseServer {
     #[must_use]
     pub fn new(url: impl Into<String>) -> Self {
         Self {
+            name: None,
             url: url.into(),
             headers: None,
         }
+    }
+
+    /// Set an explicit server name (see [`McpServer::server_name`]).
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     /// Add a header to the SSE connection.
@@ -168,6 +263,7 @@ impl McpStreamableHttpServer {
     #[must_use]
     pub fn new(url: impl Into<String>) -> Self {
         Self {
+            name: None,
             url: url.into(),
             headers: None,
             timeout: default_mcp_timeout(),
@@ -182,6 +278,13 @@ impl McpStreamableHttpServer {
         self.headers
             .get_or_insert_with(std::collections::HashMap::new)
             .insert(k.into(), v.into());
+        self
+    }
+
+    /// Set an explicit server name (see [`McpServer::server_name`]).
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -247,6 +350,7 @@ mod tests {
     #[test]
     fn mcp_server_config_stdio_roundtrip() {
         let config = McpServer::Stdio(McpStdioServer {
+            name: None,
             command: "npx".to_string(),
             args: vec![
                 "-y".to_string(),
@@ -273,6 +377,7 @@ mod tests {
     #[test]
     fn mcp_server_config_sse_roundtrip() {
         let config = McpServer::Sse(McpSseServer {
+            name: None,
             url: "http://localhost:8080/sse".to_string(),
             headers: Some(std::collections::HashMap::from([(
                 "Authorization".to_string(),
@@ -298,6 +403,7 @@ mod tests {
     #[test]
     fn mcp_server_config_http_roundtrip() {
         let config = McpServer::Http(McpStreamableHttpServer {
+            name: None,
             url: "http://localhost:9090/mcp".to_string(),
             headers: None,
             timeout: 60.0,
@@ -401,5 +507,37 @@ mod tests {
             }
             _ => panic!("Expected Http"),
         }
+    }
+
+    #[test]
+    fn server_name_prefers_explicit_name_and_derives_consistently() {
+        assert_eq!(
+            McpServer::stdio("/usr/bin/python3").build().server_name(),
+            "python3"
+        );
+        assert_eq!(
+            McpServer::stdio("npx")
+                .name("file system")
+                .build()
+                .server_name(),
+            "file_system"
+        );
+        assert_eq!(
+            McpServer::http("http://127.0.0.1:9090/mcp")
+                .build()
+                .server_name(),
+            "127_0_0_1_9090"
+        );
+        assert_eq!(
+            McpServer::sse("https://mcp.example.com/sse")
+                .name("docs")
+                .build()
+                .server_name(),
+            "docs"
+        );
+        assert_eq!(
+            McpServer::stdio("").build().server_name(),
+            DEFAULT_MCP_SERVER_NAME
+        );
     }
 }

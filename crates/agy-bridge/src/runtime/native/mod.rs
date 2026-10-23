@@ -531,10 +531,16 @@ impl Runtime for NativeRuntime {
             }
 
             let available_tools = build_available_tools(&config);
+            let finish_on_tools: HashSet<String> = config.finish_on_tools.iter().cloned().collect();
             let (event_tx, event_rx) =
                 mpsc::channel::<proto::localharness::InputEvent>(EVENT_CHANNEL_BUFFER_SIZE);
 
-            let session = Arc::new(NativeAgentSession::new(event_tx, init_state, save_dir));
+            let session = Arc::new(NativeAgentSession::new(
+                event_tx,
+                init_state,
+                save_dir,
+                finish_on_tools,
+            ));
 
             spawn_session_io_tasks(&runtime, agent_id, ws, &session, event_rx);
 
@@ -591,6 +597,7 @@ impl Runtime for NativeRuntime {
 
             session.produced_output.store(false, Ordering::SeqCst);
             session.turn_activity.store(false, Ordering::SeqCst);
+            session.finished_by_tool.store(false, Ordering::SeqCst);
             match session.last_response_text.lock() {
                 Ok(mut resp_lock) => {
                     *resp_lock = None;
