@@ -1,7 +1,7 @@
 [package]
 name = "agy-bridge-test-support"
 version = "0.8.3"
-edition = "2024"
+edition.workspace = true
 rust-version = "1.95"
 description = "Shared mock-server test infrastructure for agy-bridge integration tests"
 license = "Apache-2.0 OR MIT"

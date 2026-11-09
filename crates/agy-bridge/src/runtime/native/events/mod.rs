@@ -147,7 +147,7 @@ pub(crate) fn to_domain_step(update: &proto::localharness::StepUpdate) -> Step {
             .run_workflow
             .as_ref()
             .map(|rw| crate::types::WorkflowProgress {
-                script_path: rw.script_path.clone(),
+                script_path: super::tools::normalize_wire_path(&rw.script_path),
                 script: rw.script.clone(),
                 description: rw.description.clone(),
                 output: rw.output.clone(),
@@ -415,18 +415,12 @@ async fn emit_tool_call_stream_events(
 ) {
     let guard = active_writer_clone.lock().await;
     if let Some(ref writer) = *guard {
-        let parsed_args: serde_json::Value = match serde_json::from_str(args_json) {
-            Ok(val) => val,
-            Err(e) => {
-                tracing::warn!(error = %e, tool = tool_name, "Failed to parse tool call arguments JSON");
-                serde_json::Value::Null
-            }
-        };
+        let normalized = super::tools::parse_and_normalize_tool_args(args_json, tool_name);
         let tc_event = ToolCallEvent {
             name: tool_name.to_string(),
-            args: parsed_args,
+            args: normalized.args,
             id: Some(call_id.to_string()),
-            canonical_path: None,
+            canonical_path: normalized.canonical_path,
         };
         ChatResponseWriter::fan_out(
             &writer.subs.tool_call,
@@ -482,10 +476,12 @@ async fn run_tool_pre_check(
     let hr_clone = hr_opt.cloned();
 
     let pre_check = tokio::task::spawn_blocking(move || {
+        let normalized =
+            super::tools::parse_and_normalize_tool_args(&args_json_owned, "run_tool_pre_check");
         match crate::runtime::bridge_state::check_tool_execution_allowed(
             agent_id,
             &tool_name_owned,
-            &args_json_owned,
+            &normalized.normalized_json,
         ) {
             Ok(true) => {}
             Ok(false) => {
@@ -498,7 +494,7 @@ async fn run_tool_pre_check(
             }
         }
 
-        let mut args_val = parse_json_or_null(&args_json_owned, "run_tool_pre_check");
+        let mut args_val = normalized.args;
 
         if let Some(hr) = hr_clone {
             let ctx = PreToolCallDecideContext::new(&tool_name_owned, args_val.clone());
@@ -731,7 +727,9 @@ pub(crate) async fn handle_policy_decision_request(
             Some(a) => (a.tool_name.clone(), a.arguments_json.as_str()),
             None => (String::new(), "{}"),
         };
-        let args_val = parse_json_or_null(args_str, "handle_policy_decision_request");
+        let args_val =
+            super::tools::parse_and_normalize_tool_args(args_str, "handle_policy_decision_request")
+                .args;
         let allowed = tokio::task::spawn_blocking(move || ph.confirm(&tool_name, &args_val))
             .await
             .unwrap_or_else(|e| {

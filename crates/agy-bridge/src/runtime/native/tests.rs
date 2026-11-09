@@ -102,8 +102,7 @@ fn test_build_harness_config_options_subagents_and_workspace_policy() {
     assert_eq!(cc.max_context_tokens, 1_000_000);
 
     let text_model = &harness_cfg.models[0];
-    let Some(proto::localharness::model_config::Endpoint::GeminiApiEndpoint(ref ep)) =
-        text_model.endpoint
+    let Some(proto::localharness::model_config::Endpoint::GeminiApi(ref ep)) = text_model.endpoint
     else {
         panic!("Expected GeminiApiEndpoint");
     };

@@ -187,8 +187,8 @@ fn test_md_tmpl_0106_cross_include_taint_and_heading_sanitization() {
     md_tmpl::template! {
         r#"---
 params:
-  - heading_title = untrusted str
-  - payload = untrusted str
+  - heading_title = str
+  - payload = str
 ---
 > {% tmpl child_block %}
 ---
@@ -229,8 +229,8 @@ params:
     response = r#"
 ---
 params:
-  - heading = untrusted str
-  - payload = untrusted str
+  - heading = str
+  - payload = str
 ---
 
 > {% tmpl badge %}

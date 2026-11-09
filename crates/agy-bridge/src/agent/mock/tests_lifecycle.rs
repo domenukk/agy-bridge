@@ -288,7 +288,7 @@ async fn chat_text_returns_text() {
         .expect("create agent");
 
     let text = agent.chat_text("Hello").await.expect("chat_text");
-    assert!(!text.is_empty());
+    assert_ne!(text, "");
 
     agent.shutdown().await.expect("shutdown");
 }

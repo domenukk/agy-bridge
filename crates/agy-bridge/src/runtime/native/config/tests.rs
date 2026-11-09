@@ -18,7 +18,7 @@ fn test_build_harness_config_default() {
     let harness_config = build_harness_config(&config, None, None, &policies);
 
     assert!(harness_config.system_instructions.is_none());
-    assert!(!harness_config.models.is_empty());
+    assert_ne!(harness_config.models.len(), 0);
     assert_eq!(harness_config.mcp_servers.len(), 0);
     assert_eq!(harness_config.tools.len(), 0);
 }
@@ -63,6 +63,7 @@ fn test_build_harness_config_with_mcp_servers() {
                 name: None,
                 command: "echo-server".to_string(),
                 args: vec!["--port".to_string(), "8080".to_string()],
+                ..McpStdioServer::default()
             }),
             McpServer::Http(McpStreamableHttpServer {
                 name: None,
@@ -71,6 +72,7 @@ fn test_build_harness_config_with_mcp_servers() {
                 timeout: 30.0,
                 sse_read_timeout: 60.0,
                 terminate_on_close: true,
+                ..McpStreamableHttpServer::default()
             }),
         ],
         ..Default::default()
@@ -82,6 +84,42 @@ fn test_build_harness_config_with_mcp_servers() {
     assert_eq!(harness_config.mcp_servers.len(), 2);
     assert_eq!(harness_config.mcp_servers[0].name, "echo-server");
     assert_eq!(harness_config.mcp_servers[1].name, "127_0_0_1_9090");
+
+    let env_stdio = McpServer::stdio("docker")
+        .env("GITHUB_TOKEN", "secret")
+        .args(["run", "-i", "mcp-server"])
+        .enabled_tools(["list_repos", "get_pr"])
+        .timeout_seconds(75)
+        .force_all_tools_eager(true)
+        .build();
+    assert_eq!(env_stdio.server_name(), "docker");
+    let env_proto = to_proto_mcp_server(&env_stdio);
+    assert_eq!(env_proto.enabled_tools, vec!["list_repos", "get_pr"]);
+    assert_eq!(env_proto.disabled_tools.len(), 0);
+    assert_eq!(env_proto.timeout_seconds, 75);
+    assert!(env_proto.force_all_tools_eager);
+    match env_proto.transport {
+        Some(proto::localharness::mcp_server_config::Transport::Stdio(t)) => {
+            assert_eq!(t.command, "docker");
+            assert_eq!(t.args, vec!["run", "-i", "mcp-server"]);
+            assert_eq!(
+                t.env.get("GITHUB_TOKEN").map(String::as_str),
+                Some("secret")
+            );
+        }
+        other => panic!("expected Stdio transport, got {other:?}"),
+    }
+
+    let filtered_http = McpServer::http("http://127.0.0.1:9091/mcp")
+        .disabled_tools(["admin_reset"])
+        .timeout_seconds(42)
+        .force_all_tools_eager(true)
+        .build();
+    let http_proto = to_proto_mcp_server(&filtered_http);
+    assert_eq!(http_proto.enabled_tools.len(), 0);
+    assert_eq!(http_proto.disabled_tools, vec!["admin_reset"]);
+    assert_eq!(http_proto.timeout_seconds, 42);
+    assert!(http_proto.force_all_tools_eager);
 }
 
 #[test]
@@ -315,11 +353,13 @@ fn test_v0122_inline_skills_subagent_skills_and_new_fields() {
 
     let text_endpoint = harness.models[0].endpoint.as_ref().expect("endpoint");
     match text_endpoint {
-        proto::localharness::model_config::Endpoint::GeminiApiEndpoint(ep) => {
+        proto::localharness::model_config::Endpoint::GeminiApi(ep) => {
             let opts = ep.options.as_ref().expect("options");
             assert_eq!(opts.max_output_tokens, 32_768);
         }
-        other => panic!("Unexpected endpoint: {other:?}"),
+        other @ proto::localharness::model_config::Endpoint::Vertex(_) => {
+            panic!("Unexpected endpoint: {other:?}")
+        }
     }
 }
 
@@ -380,4 +420,60 @@ fn test_titled_custom_instructions_and_new_proto_fields() {
         }
         other => panic!("Expected FilesystemWorkspace, got {other:?}"),
     }
+}
+
+#[test]
+fn test_v0123_content_proto_types() {
+    let inline = InlineSkill::builder()
+        .name("sec_audit")
+        .description("Security auditor")
+        .content("Check bounds.")
+        .build();
+    let config = AgentConfig {
+        inline_skills: vec![inline],
+        ..AgentConfig::default()
+    };
+    let harness = build_harness_config(&config, None, None, &PolicySet::default());
+    let skills_proto = harness.skills_config.expect("skills_config");
+    assert_eq!(skills_proto.skills.len(), 1);
+    match &skills_proto.skills[0].source {
+        Some(proto::localharness::skill_source::Source::Skill(s)) => {
+            assert_eq!(s.name, "sec_audit");
+        }
+        other => panic!("Expected Skill source, got {other:?}"),
+    }
+
+    let video = proto::genai::VideoContent {
+        mime_type: proto::genai::video_content::MimeType::TypeJpeg2000 as i32,
+        mime_type_string: "video/jp2".to_string(),
+        name: "clip.jp2".to_string(),
+        processing_oneof: Some(
+            proto::genai::video_content::ProcessingOneof::ProcessingConfig(
+                proto::genai::video_content::MediaProcessing {
+                    r#type: Some(proto::genai::video_content::media_processing::Type::Static(
+                        proto::genai::video_content::StaticMediaProcessing {
+                            start_offset: None,
+                            end_offset: None,
+                            fps: 2.0,
+                        },
+                    )),
+                },
+            ),
+        ),
+        ..proto::genai::VideoContent::default()
+    };
+    assert_eq!(video.mime_type_string, "video/jp2");
+    assert_eq!(video.name, "clip.jp2");
+    let sub = proto::genai::FunctionResultSubcontent {
+        r#type: Some(proto::genai::function_result_subcontent::Type::Video(video)),
+    };
+    assert!(matches!(
+        sub.r#type,
+        Some(proto::genai::function_result_subcontent::Type::Video(_))
+    ));
+    assert_eq!(
+        proto::genai::code_execution_call_content::code_execution_call_arguments::Language::Bash
+            as i32,
+        2
+    );
 }

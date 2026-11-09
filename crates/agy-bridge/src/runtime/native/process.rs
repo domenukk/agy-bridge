@@ -6,7 +6,6 @@ use std::{
     process::Stdio,
 };
 
-use prost::Message as _;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStdin, Command},

@@ -125,9 +125,7 @@ fn system_instructions_custom_serde() {
     let parsed: SystemInstructions = serde_json::from_str(&json).unwrap();
     match parsed {
         SystemInstructions::Custom(text) => assert_eq!(text, "Be a helpful assistant"),
-        SystemInstructions::TitledCustom { .. } | SystemInstructions::Templated { .. } => {
-            panic!("Expected Custom, got {parsed:?}")
-        }
+        other => panic!("Expected Custom, got {other:?}"),
     }
 }
 
@@ -141,9 +139,7 @@ fn system_instructions_titled_custom_serde() {
             assert_eq!(text, "Be strict");
             assert_eq!(title.as_deref(), Some("security_policy"));
         }
-        SystemInstructions::Custom(_) | SystemInstructions::Templated { .. } => {
-            panic!("Expected TitledCustom, got {parsed:?}")
-        }
+        other => panic!("Expected TitledCustom, got {other:?}"),
     }
 }
 
@@ -164,9 +160,7 @@ fn system_instructions_templated_serde() {
             assert_eq!(sections.len(), 1);
             assert_eq!(sections[0].content, "Always check permissions");
         }
-        SystemInstructions::Custom(_) | SystemInstructions::TitledCustom { .. } => {
-            panic!("Expected Templated, got {parsed:?}")
-        }
+        other => panic!("Expected Templated, got {other:?}"),
     }
 }
 
@@ -234,8 +228,8 @@ fn agent_config_empty_defaults_serde() {
     let parsed: AgentConfig = serde_json::from_str(json).unwrap();
     assert!(parsed.system_instructions.is_none());
     assert!(parsed.capabilities.is_none());
-    assert!(parsed.workspaces.is_empty());
-    assert!(parsed.tools.is_empty());
+    assert_eq!(parsed.workspaces.len(), 0);
+    assert_eq!(parsed.tools.len(), 0);
     assert_eq!(
         parsed.policies,
         vec![
@@ -245,7 +239,7 @@ fn agent_config_empty_defaults_serde() {
     );
     assert!(parsed.triggers.is_empty());
     assert!(parsed.hooks.is_empty());
-    assert!(parsed.skills.is_empty());
+    assert_eq!(parsed.skills.len(), 0);
 
     assert!(parsed.gemini.is_none());
 }
@@ -328,7 +322,7 @@ fn agent_config_custom_tools_only_no_builtins() {
     };
 
     let caps = config.capabilities.as_ref().unwrap();
-    assert!(caps.enabled_tools.as_ref().unwrap().is_empty());
+    assert_eq!(caps.enabled_tools.as_ref().unwrap().len(), 0);
     assert!(caps.validate().is_ok());
     assert_eq!(config.tools.len(), 1);
 }
@@ -577,7 +571,7 @@ fn effective_api_key_none_without_any_key() {
 #[test]
 fn initial_history_empty_by_default() {
     let config = AgentConfig::default();
-    assert!(config.initial_history.is_empty());
+    assert_eq!(config.initial_history.len(), 0);
 
     // Empty initial_history should be skipped in serialization.
     let json = serde_json::to_string(&config).unwrap();

@@ -240,7 +240,7 @@ async fn test_basic_mock_chat_flow() {
     let count_cleared = agent.turn_count().await.unwrap();
     assert_eq!(count_cleared, 0);
     let history_cleared = agent.history().await.unwrap();
-    assert!(history_cleared.is_empty());
+    assert_eq!(history_cleared.len(), 0);
 
     agent.shutdown().await.unwrap();
 }
@@ -278,7 +278,7 @@ async fn test_available_tools_from_runtime() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "mock_tool");
     assert_eq!(tools[0].source, agy_bridge::ToolSource::Custom);
-    assert!(!tools[0].description.is_empty());
+    assert_ne!(tools[0].description, "");
 
     let names = agent.available_tool_names();
     assert_eq!(names, vec!["mock_tool"]);

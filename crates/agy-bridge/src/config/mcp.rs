@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::{default_mcp_sse_read_timeout, default_mcp_timeout, default_true};
 
 /// Configuration for an MCP server connected via stdio.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpStdioServer {
     /// Server name used by the harness (e.g. `ServerName` in `call_mcp_tool`).
     ///
@@ -17,10 +17,27 @@ pub struct McpStdioServer {
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Explicit allowlist of MCP tool names exposed from this server.
+    ///
+    /// Mutually exclusive with [`disabled_tools`](Self::disabled_tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    /// Explicit denylist of MCP tool names hidden from this server.
+    ///
+    /// Mutually exclusive with [`enabled_tools`](Self::enabled_tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_tools: Option<Vec<String>>,
+    /// Optional timeout in seconds for connecting to the server and listing tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i32>,
+    /// When `true`, forces all tools from this server to be loaded eagerly into
+    /// the model's prompt rather than lazily via tool search.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_all_tools_eager: bool,
 }
 
 /// Configuration for an MCP server connected via SSE.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpSseServer {
     /// Server name used by the harness (e.g. `ServerName` in `call_mcp_tool`).
     ///
@@ -32,6 +49,23 @@ pub struct McpSseServer {
     /// Optional headers to send with the connection request.
     #[serde(default)]
     pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Explicit allowlist of MCP tool names exposed from this server.
+    ///
+    /// Mutually exclusive with [`disabled_tools`](Self::disabled_tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    /// Explicit denylist of MCP tool names hidden from this server.
+    ///
+    /// Mutually exclusive with [`enabled_tools`](Self::enabled_tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_tools: Option<Vec<String>>,
+    /// Optional timeout in seconds for connecting to the server and listing tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i32>,
+    /// When `true`, forces all tools from this server to be loaded eagerly into
+    /// the model's prompt rather than lazily via tool search.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_all_tools_eager: bool,
 }
 
 /// Configuration for an MCP server connected via Streamable HTTP.
@@ -56,6 +90,29 @@ pub struct McpStreamableHttpServer {
     /// Whether to terminate the connection on close.
     #[serde(default = "default_true")]
     pub terminate_on_close: bool,
+    /// Explicit allowlist of MCP tool names exposed from this server.
+    ///
+    /// Mutually exclusive with [`disabled_tools`](Self::disabled_tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    /// Explicit denylist of MCP tool names hidden from this server.
+    ///
+    /// Mutually exclusive with [`enabled_tools`](Self::enabled_tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_tools: Option<Vec<String>>,
+    /// Optional timeout in seconds for connecting to the server and listing tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i32>,
+    /// When `true`, forces all tools from this server to be loaded eagerly into
+    /// the model's prompt rather than lazily via tool search.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_all_tools_eager: bool,
+}
+
+impl Default for McpStreamableHttpServer {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
 }
 
 /// An MCP server, identified by its transport.
@@ -132,7 +189,10 @@ impl McpServer {
     #[must_use]
     pub fn server_name(&self) -> String {
         let (explicit, derived) = match self {
-            Self::Stdio(s) => (s.name.as_deref(), name_from_command(&s.command)),
+            Self::Stdio(s) => {
+                let (effective_cmd, _, _) = s.unwrap_env_wrapper();
+                (s.name.as_deref(), name_from_command(effective_cmd))
+            }
             Self::Sse(s) => (s.name.as_deref(), name_from_url(&s.url)),
             Self::Http(s) => (s.name.as_deref(), name_from_url(&s.url)),
         };
@@ -159,6 +219,71 @@ impl McpServer {
     pub fn http(url: impl Into<String>) -> McpStreamableHttpServer {
         McpStreamableHttpServer::new(url)
     }
+
+    /// Explicit allowlist of MCP tool names exposed from this server, if set.
+    #[must_use]
+    pub fn enabled_tools(&self) -> Option<&[String]> {
+        match self {
+            Self::Stdio(s) => s.enabled_tools.as_deref(),
+            Self::Sse(s) => s.enabled_tools.as_deref(),
+            Self::Http(s) => s.enabled_tools.as_deref(),
+        }
+    }
+
+    /// Explicit denylist of MCP tool names hidden from this server, if set.
+    #[must_use]
+    pub fn disabled_tools(&self) -> Option<&[String]> {
+        match self {
+            Self::Stdio(s) => s.disabled_tools.as_deref(),
+            Self::Sse(s) => s.disabled_tools.as_deref(),
+            Self::Http(s) => s.disabled_tools.as_deref(),
+        }
+    }
+
+    /// Optional timeout in seconds for connecting and listing tools on this server.
+    #[must_use]
+    pub const fn timeout_seconds(&self) -> Option<i32> {
+        match self {
+            Self::Stdio(s) => s.timeout_seconds,
+            Self::Sse(s) => s.timeout_seconds,
+            Self::Http(s) => s.timeout_seconds,
+        }
+    }
+
+    /// Whether tools from this server should be loaded eagerly into the prompt.
+    #[must_use]
+    pub const fn force_all_tools_eager(&self) -> bool {
+        match self {
+            Self::Stdio(s) => s.force_all_tools_eager,
+            Self::Sse(s) => s.force_all_tools_eager,
+            Self::Http(s) => s.force_all_tools_eager,
+        }
+    }
+
+    /// Validate structural invariants for this MCP server configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error message when both `enabled_tools` and
+    /// `disabled_tools` are set on the same server, or when `timeout_seconds`
+    /// is negative.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled_tools().is_some() && self.disabled_tools().is_some() {
+            return Err(format!(
+                "MCP server '{}' cannot set both enabled_tools and disabled_tools",
+                self.server_name()
+            ));
+        }
+        if let Some(secs) = self.timeout_seconds()
+            && secs < 0
+        {
+            return Err(format!(
+                "MCP server '{}' timeout_seconds must be non-negative, got {secs}",
+                self.server_name()
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ─── MCP Server Builders ───────────────────────────────────────────────────
@@ -177,6 +302,10 @@ impl McpStdioServer {
             name: None,
             command: command.into(),
             args: Vec::new(),
+            enabled_tools: None,
+            disabled_tools: None,
+            timeout_seconds: None,
+            force_all_tools_eager: false,
         }
     }
 
@@ -205,11 +334,127 @@ impl McpStdioServer {
         self
     }
 
+    /// Add an environment variable for the spawned MCP server subprocess.
+    ///
+    /// Stored in the portable `env KEY=VALUE … <command> <args…>` encoding on
+    /// [`McpStdioServer`] and lowered by both `NativeRuntime` and `PythonRuntime`
+    /// into the transport's native `env` dictionary (so secrets are passed via
+    /// process environment rather than `/proc/<pid>/cmdline`).
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let assignment = format!("{}={}", key.into(), value.into());
+        if self.command == "env" {
+            let env_count = self
+                .args
+                .iter()
+                .take_while(|a| is_env_assignment(a))
+                .count();
+            self.args.insert(env_count, assignment);
+        } else {
+            let real_cmd = std::mem::replace(&mut self.command, "env".to_owned());
+            let mut new_args = Vec::with_capacity(self.args.len() + 2);
+            new_args.push(assignment);
+            new_args.push(real_cmd);
+            new_args.append(&mut self.args);
+            self.args = new_args;
+        }
+        self
+    }
+
+    /// Extract `(command, args, env_map)` by unwrapping a leading `env KEY=VALUE …`
+    /// wrapper when present.
+    #[must_use]
+    pub(crate) fn unwrap_env_wrapper(
+        &self,
+    ) -> (&str, &[String], std::collections::HashMap<String, String>) {
+        if self.command == "env" {
+            let env_count = self
+                .args
+                .iter()
+                .take_while(|a| is_env_assignment(a))
+                .count();
+            if env_count > 0 && env_count < self.args.len() {
+                let mut env_map = std::collections::HashMap::with_capacity(env_count);
+                for arg in &self.args[..env_count] {
+                    if let Some((k, v)) = arg.split_once('=') {
+                        env_map.insert(k.to_owned(), v.to_owned());
+                    }
+                }
+                return (
+                    self.args[env_count].as_str(),
+                    &self.args[env_count + 1..],
+                    env_map,
+                );
+            }
+        }
+        (
+            self.command.as_str(),
+            &self.args,
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// Restrict this server to an explicit allowlist of MCP tool names.
+    ///
+    /// Clears any previously configured [`disabled_tools`](Self::disabled_tools).
+    #[must_use]
+    pub fn enabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.enabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self.disabled_tools = None;
+        self
+    }
+
+    /// Hide an explicit denylist of MCP tool names from this server.
+    ///
+    /// Clears any previously configured [`enabled_tools`](Self::enabled_tools).
+    #[must_use]
+    pub fn disabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.disabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self.enabled_tools = None;
+        self
+    }
+
+    /// Set the timeout in seconds for connecting to the server and listing tools.
+    #[must_use]
+    pub const fn timeout_seconds(mut self, seconds: i32) -> Self {
+        self.timeout_seconds = Some(seconds);
+        self
+    }
+
+    /// Force all tools from this server to be loaded eagerly into the prompt.
+    #[must_use]
+    pub const fn force_all_tools_eager(mut self, eager: bool) -> Self {
+        self.force_all_tools_eager = eager;
+        self
+    }
+
     /// Build this stdio configuration into an [`McpServer`].
     #[must_use]
     pub fn build(self) -> McpServer {
         McpServer::Stdio(self)
     }
+}
+
+fn is_env_assignment(arg: &str) -> bool {
+    let Some((key, _)) = arg.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key.bytes().enumerate().all(|(idx, b)| {
+            if idx == 0 {
+                b.is_ascii_alphabetic() || b == b'_'
+            } else {
+                b.is_ascii_alphanumeric() || b == b'_'
+            }
+        })
 }
 
 impl From<McpSseServer> for McpServer {
@@ -226,6 +471,10 @@ impl McpSseServer {
             name: None,
             url: url.into(),
             headers: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            timeout_seconds: None,
+            force_all_tools_eager: false,
         }
     }
 
@@ -242,6 +491,48 @@ impl McpSseServer {
         self.headers
             .get_or_insert_with(std::collections::HashMap::new)
             .insert(k.into(), v.into());
+        self
+    }
+
+    /// Restrict this server to an explicit allowlist of MCP tool names.
+    ///
+    /// Clears any previously configured [`disabled_tools`](Self::disabled_tools).
+    #[must_use]
+    pub fn enabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.enabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self.disabled_tools = None;
+        self
+    }
+
+    /// Hide an explicit denylist of MCP tool names from this server.
+    ///
+    /// Clears any previously configured [`enabled_tools`](Self::enabled_tools).
+    #[must_use]
+    pub fn disabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.disabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self.enabled_tools = None;
+        self
+    }
+
+    /// Set the timeout in seconds for connecting to the server and listing tools.
+    #[must_use]
+    pub const fn timeout_seconds(mut self, seconds: i32) -> Self {
+        self.timeout_seconds = Some(seconds);
+        self
+    }
+
+    /// Force all tools from this server to be loaded eagerly into the prompt.
+    #[must_use]
+    pub const fn force_all_tools_eager(mut self, eager: bool) -> Self {
+        self.force_all_tools_eager = eager;
         self
     }
 
@@ -269,6 +560,10 @@ impl McpStreamableHttpServer {
             timeout: default_mcp_timeout(),
             sse_read_timeout: default_mcp_sse_read_timeout(),
             terminate_on_close: true,
+            enabled_tools: None,
+            disabled_tools: None,
+            timeout_seconds: None,
+            force_all_tools_eager: false,
         }
     }
 
@@ -299,6 +594,48 @@ impl McpStreamableHttpServer {
     #[must_use]
     pub const fn sse_read_timeout(mut self, timeout: f64) -> Self {
         self.sse_read_timeout = timeout;
+        self
+    }
+
+    /// Restrict this server to an explicit allowlist of MCP tool names.
+    ///
+    /// Clears any previously configured [`disabled_tools`](Self::disabled_tools).
+    #[must_use]
+    pub fn enabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.enabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self.disabled_tools = None;
+        self
+    }
+
+    /// Hide an explicit denylist of MCP tool names from this server.
+    ///
+    /// Clears any previously configured [`enabled_tools`](Self::enabled_tools).
+    #[must_use]
+    pub fn disabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.disabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self.enabled_tools = None;
+        self
+    }
+
+    /// Set the timeout in seconds for connecting to the server and listing tools.
+    #[must_use]
+    pub const fn timeout_seconds(mut self, seconds: i32) -> Self {
+        self.timeout_seconds = Some(seconds);
+        self
+    }
+
+    /// Force all tools from this server to be loaded eagerly into the prompt.
+    #[must_use]
+    pub const fn force_all_tools_eager(mut self, eager: bool) -> Self {
+        self.force_all_tools_eager = eager;
         self
     }
 
@@ -356,6 +693,7 @@ mod tests {
                 "-y".to_string(),
                 "@modelcontextprotocol/server-filesystem".to_string(),
             ],
+            ..McpStdioServer::default()
         });
         let json = serde_json::to_string(&config).unwrap();
         let parsed: McpServer = serde_json::from_str(&json).unwrap();
@@ -372,6 +710,10 @@ mod tests {
         // Verify the JSON contains the "type" tag from serde.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["type"], "stdio");
+        assert!(value.get("enabled_tools").is_none());
+        assert!(value.get("disabled_tools").is_none());
+        assert!(value.get("timeout_seconds").is_none());
+        assert!(value.get("force_all_tools_eager").is_none());
     }
 
     #[test]
@@ -383,6 +725,7 @@ mod tests {
                 "Authorization".to_string(),
                 "Bearer token123".to_string(),
             )])),
+            ..McpSseServer::default()
         });
         let json = serde_json::to_string(&config).unwrap();
         let parsed: McpServer = serde_json::from_str(&json).unwrap();
@@ -409,6 +752,7 @@ mod tests {
             timeout: 60.0,
             sse_read_timeout: 120.0,
             terminate_on_close: false,
+            ..McpStreamableHttpServer::default()
         });
         let json = serde_json::to_string(&config).unwrap();
         let parsed: McpServer = serde_json::from_str(&json).unwrap();
@@ -539,5 +883,76 @@ mod tests {
             McpServer::stdio("").build().server_name(),
             DEFAULT_MCP_SERVER_NAME
         );
+    }
+
+    #[test]
+    fn per_server_tool_filtering_eager_and_validation() {
+        let stdio = McpServer::stdio("ghidra-mcp")
+            .disabled_tools(["delete_project"])
+            .enabled_tools(["decompile_function", "list_functions"])
+            .timeout_seconds(45)
+            .force_all_tools_eager(true)
+            .build();
+        stdio.validate().expect("valid stdio config");
+        assert_eq!(
+            stdio.enabled_tools(),
+            Some(["decompile_function".to_owned(), "list_functions".to_owned()].as_slice())
+        );
+        assert_eq!(stdio.disabled_tools(), None);
+        assert_eq!(stdio.timeout_seconds(), Some(45));
+        assert!(stdio.force_all_tools_eager());
+
+        let invalid_both = McpServer::Stdio(McpStdioServer {
+            name: Some("conflict".to_owned()),
+            command: "srv".to_owned(),
+            args: Vec::new(),
+            enabled_tools: Some(vec!["a".to_owned()]),
+            disabled_tools: Some(vec!["b".to_owned()]),
+            timeout_seconds: None,
+            force_all_tools_eager: false,
+        });
+        let err = invalid_both.validate().expect_err("mutually exclusive");
+        assert!(err.contains("cannot set both enabled_tools and disabled_tools"));
+
+        let negative_timeout = McpServer::http("http://127.0.0.1:9090/mcp")
+            .timeout_seconds(-5)
+            .build();
+        let err = negative_timeout.validate().expect_err("negative timeout");
+        assert!(err.contains("timeout_seconds must be non-negative"));
+    }
+
+    #[test]
+    fn stdio_env_wrapper_roundtrip_and_server_name_derivation() {
+        let stdio = McpStdioServer::new("/usr/local/bin/my-mcp-bin")
+            .arg("--port=8080")
+            .env("API_KEY", "secret=value")
+            .env("_DEBUG_MODE", "1");
+        assert_eq!(stdio.command, "env");
+        assert_eq!(
+            stdio.args,
+            [
+                "API_KEY=secret=value",
+                "_DEBUG_MODE=1",
+                "/usr/local/bin/my-mcp-bin",
+                "--port=8080"
+            ]
+        );
+        let (cmd, args, env_map) = stdio.unwrap_env_wrapper();
+        assert_eq!(cmd, "/usr/local/bin/my-mcp-bin");
+        assert_eq!(args, ["--port=8080"]);
+        assert_eq!(
+            env_map.get("API_KEY").map(String::as_str),
+            Some("secret=value")
+        );
+        assert_eq!(env_map.get("_DEBUG_MODE").map(String::as_str), Some("1"));
+
+        let server = stdio.build();
+        assert_eq!(server.server_name(), "my-mcp-bin");
+
+        let bare_env = McpStdioServer::new("env").args(["FOO=bar"]);
+        let (bare_cmd, bare_args, bare_map) = bare_env.unwrap_env_wrapper();
+        assert_eq!(bare_cmd, "env");
+        assert_eq!(bare_args, ["FOO=bar"]);
+        assert!(bare_map.is_empty());
     }
 }

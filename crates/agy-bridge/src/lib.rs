@@ -26,6 +26,7 @@ pub mod hooks;
 pub mod policies;
 /// Protobuf definitions for the native harness backend.
 #[cfg(feature = "native")]
+#[doc(hidden)]
 pub mod proto;
 /// Python runtime bridge: command dispatch over a dedicated thread.
 pub mod runtime;
@@ -50,7 +51,7 @@ pub use config::{
     McpServer, McpServerSpec, McpSseServer, McpStdioServer, McpStreamableHttpServer,
     ModelAPIRetryConfig, ModelOutputRetryConfig, RetryConfig, RunCommandConfig,
     SessionContinuationMode, SubagentCapabilities, SubagentConfig, SubagentSkillsConfig,
-    SystemInstructions, ToolOutputTruncationConfig,
+    SystemInstructionSection, SystemInstructions, ToolOutputTruncationConfig,
 };
 pub use content::{Audio, Content, ContentPrimitive, Document, Image, Video};
 pub use error::Error;
@@ -68,9 +69,10 @@ pub use runtime::{BackendLogLevel, RuntimeConfig};
 pub use streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk};
 pub use tools::{
     AvailableTool, OutputSanitization, PromptDefinition, PromptRegistry, ResourceDefinition,
-    ResourceRegistry, RustPrompt, RustResource, RustTool, Sanitized, SharedState, ToolContext,
-    ToolDefinition, ToolEffect, ToolError, ToolOutput, ToolRegistry, ToolSource,
-    is_quarantined_output, neutralize_delimiters, quarantine_tool_output, unquarantine_tool_output,
+    ResourceRegistry, RustPrompt, RustResource, RustTool, Sanitized, SharedState, SurrogateHandle,
+    SurrogateVault, ToolContext, ToolDefinition, ToolEffect, ToolError, ToolOutput, ToolProvenance,
+    ToolRegistry, ToolSource, is_quarantined_output, neutralize_delimiters, quarantine_tool_output,
+    unquarantine_tool_output,
 };
 pub use triggers::{TriggerConfig, TriggerEntry};
 pub use types::{
@@ -99,7 +101,8 @@ pub mod prelude {
             McpConfigError, McpConfigFile, McpServer, McpServerSpec, McpSseServer, McpStdioServer,
             McpStreamableHttpServer, ModelAPIRetryConfig, ModelOutputRetryConfig, RetryConfig,
             RunCommandConfig, SessionContinuationMode, SubagentCapabilities, SubagentConfig,
-            SubagentSkillsConfig, SystemInstructions, ToolOutputTruncationConfig,
+            SubagentSkillsConfig, SystemInstructionSection, SystemInstructions,
+            ToolOutputTruncationConfig,
         },
         content::{Audio, Content, ContentPrimitive, Document, Image, Video},
         error::Error,
@@ -108,9 +111,10 @@ pub mod prelude {
         runtime::BackendLogLevel,
         streaming::{ChatResponseHandle, ChatResult, ResponseEvent, StreamChunk},
         tools::{
-            AvailableTool, OutputSanitization, RustTool, Sanitized, ToolContext, ToolDefinition,
-            ToolEffect, ToolError, ToolOutput, ToolRegistry, ToolSource, is_quarantined_output,
-            neutralize_delimiters, quarantine_tool_output, unquarantine_tool_output,
+            AvailableTool, OutputSanitization, RustTool, Sanitized, SurrogateHandle,
+            SurrogateVault, ToolContext, ToolDefinition, ToolEffect, ToolError, ToolOutput,
+            ToolProvenance, ToolRegistry, ToolSource, is_quarantined_output, neutralize_delimiters,
+            quarantine_tool_output, unquarantine_tool_output,
         },
         triggers::{TriggerConfig, TriggerEntry},
         types::{

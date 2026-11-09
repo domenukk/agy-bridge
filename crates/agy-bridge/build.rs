@@ -1,8 +1,7 @@
 //! Build script for agy-bridge.
 //!
 //! When the `native` feature is enabled:
-//! 1. Compiles the hand-built protobuf definitions (`proto/content.proto`, `proto/localharness.proto`)
-//!    using `prost-build`.
+//! 1. Stages the test mock harness binary (`mock_localharness`).
 //! 2. Ensures the local proxy runtime binary (`localharness`) is available for the target platform,
 //!    downloading and extracting it from the official Google Antigravity SDK wheel on `PyPI` if not already present.
 
@@ -14,10 +13,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.22";
+use serde as _;
 
-// NOLINT: main returns Result for feature-conditional compilation
-#[allow(clippy::unnecessary_wraps)]
+const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.23";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
     if let Some(dir) = current_exe.parent()
@@ -34,9 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("cargo:rerun-if-changed=proto/content.proto");
-    println!("cargo:rerun-if-changed=proto/skill.proto");
-    println!("cargo:rerun-if-changed=proto/localharness.proto");
     println!("cargo:rerun-if-env-changed=ANTIGRAVITY_HARNESS_PATH");
     println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
     println!("cargo:rustc-env=TARGET_ANTIGRAVITY_SDK_VERSION={TARGET_ANTIGRAVITY_SDK_VERSION}");
@@ -47,7 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native")]
     {
         emit_mock_harness_bin(&current_exe)?;
-        compile_protos()?;
         resolve_or_download_binary()?;
     }
 
@@ -194,44 +189,6 @@ fn emit_mock_harness_bin(current_exe: &Path) -> Result<(), Box<dyn std::error::E
         "cargo:rustc-env=AGY_BRIDGE_MOCK_HARNESS_BIN={}",
         mock_bin_path.display()
     );
-    Ok(())
-}
-
-#[cfg(feature = "native")]
-fn compile_protos() -> Result<(), Box<dyn std::error::Error>> {
-    if env::var("PROTOC").is_err()
-        && let Ok(path) = protoc_bin_vendored::protoc_bin_path()
-    {
-        // SAFETY: build.rs is single-threaded at this point.
-        unsafe {
-            env::set_var("PROTOC", path);
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let proto_dir = manifest_dir.join("proto");
-    let content_proto = proto_dir.join("content.proto");
-    let skill_proto = proto_dir.join("skill.proto");
-    let localharness_proto = proto_dir.join("localharness.proto");
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    let descriptor_path = out_dir.join("proto_descriptor.bin");
-
-    let mut prost_config = prost_build::Config::new();
-    prost_config
-        .file_descriptor_set_path(&descriptor_path)
-        .compile_well_known_types()
-        .extern_path(".google.protobuf", "::pbjson_types");
-    prost_config.compile_protos(
-        &[localharness_proto, content_proto, skill_proto],
-        &[proto_dir],
-    )?;
-
-    let descriptor_set = std::fs::read(descriptor_path)?;
-    pbjson_build::Builder::new()
-        .register_descriptors(&descriptor_set)?
-        .build(&[".antigravity.localharness", ".genai"])?;
-
     Ok(())
 }
 
@@ -391,6 +348,22 @@ fn sync_shared_bin(versioned_bin: &Path, shared_bin: &Path) {
 }
 
 #[cfg(feature = "native")]
+#[derive(serde::Deserialize)]
+struct PypiReleaseResponse {
+    #[serde(default)]
+    urls: Vec<PypiFileEntry>,
+}
+
+#[cfg(feature = "native")]
+#[derive(serde::Deserialize)]
+struct PypiFileEntry {
+    #[serde(default)]
+    filename: String,
+    #[serde(default)]
+    url: String,
+}
+
+#[cfg(feature = "native")]
 fn download_and_extract_wheel(
     target_os: &str,
     target_arch: &str,
@@ -412,21 +385,20 @@ fn download_and_extract_wheel(
     let pypi_url =
         format!("https://pypi.org/pypi/google-antigravity/{TARGET_ANTIGRAVITY_SDK_VERSION}/json");
     let pypi_resp = ureq::get(&pypi_url).call()?;
-    let json_body: serde_json::Value = pypi_resp.into_body().read_json()?;
+    let release: PypiReleaseResponse = pypi_resp.into_body().read_json()?;
 
-    let files = json_body
-        .get("urls")
-        .and_then(|f| f.as_array())
-        .ok_or_else(|| format!("No files found for version {TARGET_ANTIGRAVITY_SDK_VERSION}"))?;
+    if release.urls.is_empty() {
+        return Err(format!("No files found for version {TARGET_ANTIGRAVITY_SDK_VERSION}").into());
+    }
 
-    let wheel_file = files
+    let wheel_file = release
+        .urls
         .iter()
         .find(|f| {
-            let filename = f.get("filename").and_then(|n| n.as_str()).unwrap_or("");
-            Path::new(filename)
+            Path::new(&f.filename)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("whl"))
-                && filename.contains(platform_tag)
+                && f.filename.contains(platform_tag)
         })
         .ok_or_else(|| {
             format!(
@@ -434,12 +406,11 @@ fn download_and_extract_wheel(
             )
         })?;
 
-    let download_url = wheel_file
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or("Missing download URL for wheel")?;
+    if wheel_file.url.is_empty() {
+        return Err("Missing download URL for wheel".into());
+    }
 
-    let wheel_resp = ureq::get(download_url).call()?;
+    let wheel_resp = ureq::get(&wheel_file.url).call()?;
     let mut wheel_bytes = Vec::new();
     wheel_resp
         .into_body()

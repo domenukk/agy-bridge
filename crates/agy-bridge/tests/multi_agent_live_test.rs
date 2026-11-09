@@ -437,11 +437,11 @@ fn same_bridge_proxy_and_direct_agents_isolation() {
             // Both respond.
             let t_proxy = proxied_agent.chat_text("Hello").await?;
             eprintln!("Proxied agent: {t_proxy}");
-            assert!(!t_proxy.is_empty());
+            assert_ne!(t_proxy, "");
 
             let t_direct = direct_agent.chat_text("Hello").await?;
             eprintln!("Direct agent: {t_direct}");
-            assert!(!t_direct.is_empty());
+            assert_ne!(t_direct, "");
 
             // Shut down the proxied agent.
             proxied_agent.shutdown().await?;
@@ -486,7 +486,7 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
             // Agent with proxy base_url.
             let proxied_config = agy_bridge::config::AgentConfig::builder()
                 .system_instructions(
-                    "Your name is PROXIED_CONCURRENT. Always output PROXIED_CONCURRENT.",
+                    "Your assigned identifier token is PROXIED_CONCURRENT. Always output PROXIED_CONCURRENT.",
                 )
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .gemini(agy_bridge::config::GeminiConfig {
@@ -499,7 +499,7 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
             // Agent with default endpoint (no proxy).
             let direct_config = agy_bridge::config::AgentConfig::builder()
                 .system_instructions(
-                    "Your name is DIRECT_CONCURRENT. Always output DIRECT_CONCURRENT.",
+                    "Your assigned identifier token is DIRECT_CONCURRENT. Always output DIRECT_CONCURRENT.",
                 )
                 .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
                 .build();
@@ -509,8 +509,10 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
             let direct_agent = bridge.agent(direct_config).await?;
 
             // Execute chat requests concurrently via tokio::join!
-            let fut_proxy = async { proxied_agent.chat_text("Say your name.").await };
-            let fut_direct = async { direct_agent.chat_text("Say your name.").await };
+            let fut_proxy =
+                async { proxied_agent.chat_text("Output your assigned identifier token.").await };
+            let fut_direct =
+                async { direct_agent.chat_text("Output your assigned identifier token.").await };
 
             let (res_proxy, res_direct) = tokio::join!(fut_proxy, fut_direct);
 

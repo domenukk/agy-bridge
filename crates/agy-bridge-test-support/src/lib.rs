@@ -507,53 +507,136 @@ fn sse_response(json_body: &str) -> String {
     )
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockModelEntry<'a> {
+    name: &'a str,
+    display_name: &'a str,
+    supported_generation_methods: [&'a str; 3],
+    input_token_limit: u32,
+    output_token_limit: u32,
+}
+
+#[derive(serde::Serialize)]
+struct MockModelListResponse<'a> {
+    models: [MockModelEntry<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+struct MockFunctionCall<'a> {
+    name: &'a str,
+    args: &'a serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockFunctionCallPart<'a> {
+    function_call: MockFunctionCall<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct MockTextPart<'a> {
+    text: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct MockCandidateContent<'a, P> {
+    parts: Vec<P>,
+    role: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockCandidate<'a, P> {
+    content: MockCandidateContent<'a, P>,
+    finish_reason: &'a str,
+    index: u32,
+}
+
+#[derive(serde::Serialize)]
+struct MockTokenCounts {
+    #[serde(rename = "promptTokenCount")]
+    prompt: u32,
+    #[serde(rename = "candidatesTokenCount")]
+    candidates: u32,
+    #[serde(rename = "totalTokenCount")]
+    total: u32,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockGenerateResponse<'a, P> {
+    candidates: [MockCandidate<'a, P>; 1],
+    usage_metadata: MockTokenCounts,
+}
+
+#[derive(serde::Serialize)]
+struct MockHttpErrorBody<'a> {
+    code: u16,
+    message: &'a str,
+    status: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct MockHttpErrorEnvelope<'a> {
+    error: MockHttpErrorBody<'a>,
+}
+
 fn model_list_json() -> String {
-    serde_json::json!({
-        "models": [{
-            "name": "models/gemini-2.0-flash",
-            "displayName": "Gemini 2.0 Flash",
-            "supportedGenerationMethods": [
-                "generateContent", "streamGenerateContent", "countTokens"
+    serde_json::to_string(&MockModelListResponse {
+        models: [MockModelEntry {
+            name: "models/gemini-2.0-flash",
+            display_name: "Gemini 2.0 Flash",
+            supported_generation_methods: [
+                "generateContent",
+                "streamGenerateContent",
+                "countTokens",
             ],
-            "inputTokenLimit": 1_048_576,
-            "outputTokenLimit": 8192
-        }]
+            input_token_limit: 1_048_576,
+            output_token_limit: 8192,
+        }],
     })
-    .to_string()
+    .expect("MockModelListResponse serializes")
 }
 
 fn function_call_json(name: &str, args: &serde_json::Value) -> String {
-    serde_json::json!({
-        "candidates": [{
-            "content": {
-                "parts": [{"functionCall": {"name": name, "args": args}}],
-                "role": "model"
+    serde_json::to_string(&MockGenerateResponse {
+        candidates: [MockCandidate {
+            content: MockCandidateContent {
+                parts: vec![MockFunctionCallPart {
+                    function_call: MockFunctionCall { name, args },
+                }],
+                role: "model",
             },
-            "finishReason": "STOP",
-            "index": 0
+            finish_reason: "STOP",
+            index: 0,
         }],
-        "usageMetadata": {
-            "promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15
-        }
+        usage_metadata: MockTokenCounts {
+            prompt: 10,
+            candidates: 5,
+            total: 15,
+        },
     })
-    .to_string()
+    .expect("MockGenerateResponse function call serializes")
 }
 
 fn text_response_json(text: &str) -> String {
-    serde_json::json!({
-        "candidates": [{
-            "content": {
-                "parts": [{"text": text}],
-                "role": "model"
+    serde_json::to_string(&MockGenerateResponse {
+        candidates: [MockCandidate {
+            content: MockCandidateContent {
+                parts: vec![MockTextPart { text }],
+                role: "model",
             },
-            "finishReason": "STOP",
-            "index": 0
+            finish_reason: "STOP",
+            index: 0,
         }],
-        "usageMetadata": {
-            "promptTokenCount": 15, "candidatesTokenCount": 10, "totalTokenCount": 25
-        }
+        usage_metadata: MockTokenCounts {
+            prompt: 15,
+            candidates: 10,
+            total: 25,
+        },
     })
-    .to_string()
+    .expect("MockGenerateResponse text serializes")
 }
 
 /// A candidate with empty content — no text parts, no function calls.
@@ -562,20 +645,22 @@ fn text_response_json(text: &str) -> String {
 /// The SDK emits it as an error step with `status=ERROR` but keeps iterating
 /// (it's recoverable, not fatal).
 fn empty_candidate_json() -> String {
-    serde_json::json!({
-        "candidates": [{
-            "content": {
-                "parts": [],
-                "role": "model"
+    serde_json::to_string(&MockGenerateResponse::<MockTextPart<'_>> {
+        candidates: [MockCandidate {
+            content: MockCandidateContent {
+                parts: Vec::new(),
+                role: "model",
             },
-            "finishReason": "STOP",
-            "index": 0
+            finish_reason: "STOP",
+            index: 0,
         }],
-        "usageMetadata": {
-            "promptTokenCount": 15, "candidatesTokenCount": 0, "totalTokenCount": 15
-        }
+        usage_metadata: MockTokenCounts {
+            prompt: 15,
+            candidates: 0,
+            total: 15,
+        },
     })
-    .to_string()
+    .expect("MockGenerateResponse empty candidate serializes")
 }
 
 /// An HTTP error response (503, 500, 429, etc.) with a JSON body.
@@ -586,14 +671,14 @@ fn http_error_response(status: u16, message: &str) -> String {
         503 => ("Service Unavailable", "UNAVAILABLE"),
         _ => ("Error", "UNKNOWN"),
     };
-    let body = serde_json::json!({
-        "error": {
-            "code": status,
-            "message": message,
-            "status": grpc_status,
-        }
+    let body = serde_json::to_string(&MockHttpErrorEnvelope {
+        error: MockHttpErrorBody {
+            code: status,
+            message,
+            status: grpc_status,
+        },
     })
-    .to_string();
+    .expect("MockHttpErrorEnvelope serializes");
     format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json\r\n\

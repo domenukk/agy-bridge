@@ -11,7 +11,6 @@ use std::{
 
 use agy_bridge::{AgyBridge, config::AgentConfig, proto};
 use futures::{SinkExt, StreamExt};
-use prost::Message as _;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -137,11 +136,11 @@ async fn handle_mock_agent_session(
 
     let step_event = proto::localharness::OutputEvent {
         event: Some(proto::localharness::output_event::Event::StepUpdate(
-            proto::localharness::StepUpdate {
+            Box::new(proto::localharness::StepUpdate {
                 text_delta: response_text.clone(),
                 text: response_text,
                 ..Default::default()
-            },
+            }),
         )),
         ..Default::default()
     };

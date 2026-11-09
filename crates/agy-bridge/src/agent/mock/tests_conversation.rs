@@ -359,8 +359,8 @@ async fn agents_on_different_runtimes_are_isolated() {
     let (res_a, res_b) = tokio::join!(a.chat("hello"), b.chat("world"));
     let text_a = res_a.expect("chat a").text().await.expect("text a");
     let text_b = res_b.expect("chat b").text().await.expect("text b");
-    assert!(!text_a.is_empty());
-    assert!(!text_b.is_empty());
+    assert_ne!(text_a, "");
+    assert_ne!(text_b, "");
 
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
@@ -421,7 +421,7 @@ async fn dropping_one_agent_preserves_others_bridge_state() {
 
     let text = b.chat("test").await.expect("chat b");
     let content = text.text().await.expect("text b");
-    assert!(!content.is_empty());
+    assert_ne!(content, "");
 
     b.shutdown().await.expect("shutdown b");
     c.shutdown().await.expect("shutdown c");
@@ -509,8 +509,8 @@ async fn subagent_has_own_available_tools() {
         .expect("spawn subagent");
 
     // Both parent and child should have available tools
-    assert!(!parent.available_tools().is_empty());
-    assert!(!child.available_tools().is_empty());
+    assert_ne!(parent.available_tools().len(), 0);
+    assert_ne!(child.available_tools().len(), 0);
 
     child.shutdown().await.expect("shutdown child");
     parent.shutdown().await.expect("shutdown parent");

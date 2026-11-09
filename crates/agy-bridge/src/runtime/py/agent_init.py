@@ -25,7 +25,6 @@ try:
         RESULT_HOOK_POINTS,
         _apply_sdk_monkeypatches,
         _build_model_target,
-        _coerce_builtin_tool,
         _extract_initial_history,
         _get_monkeypatch_lock,
         _munge_config_model,
@@ -44,24 +43,28 @@ try:
         _serialize_stop_args,
         _subagent_skills_proto_with_inline,
         _to_dict,
-        _wire_tool_proxies,
     )
 except ImportError as _imp_err:
     _INIT_LOGGER.debug("agent_init_helpers not pre-imported: %s", _imp_err)
 
 try:
     from sdk_proto_parity import (
-        ATTR_CUSTOM_TITLE,
         ATTR_DISABLE_DEFINE_SUBAGENT_TOOL,
         FIELD_DISABLE_DEFINE_SUBAGENT_TOOL,
-        FIELD_INCLUDE_LAST_USER_MESSAGE,
-        FIELD_TITLE,
-        PROTO_COMPACTION_CONFIG,
-        PROTO_CUSTOM_SI_PART,
         PROTO_SUBAGENTS_CONFIG,
+        _coerce_builtin_tool,
+        _coerce_system_instructions,
+        _parse_inline_skill,
         _patch_compaction_config_proto,
         _patch_harness_side_tools_proto,
         _require_sdk_proto_field,
+        _unwrap_stdio_env_wrapper,
+        _validate_mcp_server_parity,
+        _wire_budget_config,
+        _wire_compaction_config,
+        _wire_retry_config,
+        _wire_subagents,
+        _wire_tool_proxies,
     )
 except ImportError as _imp_err:
     _INIT_LOGGER.debug("sdk_proto_parity not pre-imported: %s", _imp_err)
@@ -72,11 +75,18 @@ __all__ = [
     "_build_model_target",
     "_get_monkeypatch_lock",
     "_normalize_tool_name",
+    "_patch_compaction_config_proto",
+    "_patch_harness_side_tools_proto",
+    "_patch_subagent_inline_skills",
     "_resolve_installed_sdk_version",
     "_resolve_ws_max_size",
     "_seed_conversation_history",
     "_subagent_skills_proto_with_inline",
     "_to_dict",
+    "_wire_budget_config",
+    "_wire_compaction_config",
+    "_wire_retry_config",
+    "_wire_subagents",
     "init_agent",
 ]
 
@@ -188,18 +198,6 @@ def _wire_capabilities(local_config: dict[str, Any]) -> None:
             _INIT_LOGGER.debug("CapabilitiesConfig coercion skipped: %s", exc)
 
 
-def _parse_inline_skill(sk: Any) -> Any:
-    """Convert a serialized InlineSkill dict into an SDK InlineSkill object."""
-    if not isinstance(sk, dict):
-        return sk
-    try:
-        from google.antigravity.types import InlineSkill
-
-        return InlineSkill(**sk)
-    except _RECOVERABLE_ERRORS:
-        return sk
-
-
 def _wire_inline_skills(local_config: dict[str, Any]) -> None:
     """Translate serialized top-level inline_skills into SDK InlineSkill objects."""
     if "inline_skills" not in local_config:
@@ -212,227 +210,6 @@ def _wire_inline_skills(local_config: dict[str, Any]) -> None:
         local_config["inline_skills"] = [_parse_inline_skill(sk) for sk in raw_skills]
 
 
-def _parse_subagent_skills_config(sc: Any) -> Any:
-    """Convert a serialized Rust `SubagentSkillsConfig` enum dict into SDK types."""
-    if sc is None:
-        return None
-    try:
-        from google.antigravity.types import (
-            SubagentInheritSkillsConfig,
-            SubagentNoneSkillsConfig,
-            SubagentOverrideSkillsConfig,
-        )
-
-        if sc == "none" or (isinstance(sc, dict) and "none" in sc):
-            return SubagentNoneSkillsConfig()
-        if isinstance(sc, dict):
-            if "inherit" in sc and isinstance(sc["inherit"], dict):
-                inh = sc["inherit"]
-                return SubagentInheritSkillsConfig(
-                    skill_names=inh.get("skill_names") or [],
-                    extra_skills_paths=[
-                        str(p) for p in (inh.get("extra_skills_paths") or [])
-                    ],
-                )
-            if "override" in sc and isinstance(sc["override"], dict):
-                ovr = sc["override"]
-                return SubagentOverrideSkillsConfig(
-                    skills_paths=[str(p) for p in (ovr.get("skills_paths") or [])],
-                    inline_skills=[
-                        _parse_inline_skill(sk)
-                        for sk in (ovr.get("inline_skills") or [])
-                    ],
-                )
-    except _RECOVERABLE_ERRORS as exc:
-        _INIT_LOGGER.debug("SubagentSkillsConfig coercion skipped: %s", exc)
-    return None
-
-
-def _wire_subagents(local_config: dict[str, Any]) -> None:
-    """Translate serialized subagent specs into SDK SubagentConfig objects."""
-    if local_config.get("subagents"):
-        try:
-            from google.antigravity.types import (
-                AgentBehavior,
-                RunCommandConfig,
-                SubagentCapabilities,
-                SubagentConfig,
-            )
-
-            if hasattr(SubagentCapabilities, "model_rebuild"):
-                SubagentCapabilities.model_rebuild()
-            if hasattr(SubagentConfig, "model_rebuild"):
-                SubagentConfig.model_rebuild()
-        except _RECOVERABLE_ERRORS:
-            return
-
-        parsed_subagents = []
-        for s in local_config["subagents"]:
-            if isinstance(s, dict):
-                caps = None
-                if s.get("capabilities"):
-                    c_dict = s["capabilities"]
-                    beh = c_dict.get("agent_behavior", "autonomous")
-                    if isinstance(beh, str):
-                        try:
-                            beh = AgentBehavior(beh.lower())
-                        except (ValueError, KeyError):
-                            beh = AgentBehavior.AUTONOMOUS
-                    rc_cfg = None
-                    if "run_command_config" in c_dict and isinstance(
-                        c_dict["run_command_config"], dict
-                    ):
-                        try:
-                            rc_cfg = RunCommandConfig(**c_dict["run_command_config"])
-                        except _RECOVERABLE_ERRORS as exc:
-                            _INIT_LOGGER.debug(
-                                "subagent RunCommandConfig coercion skipped: %s", exc
-                            )
-                    enabled = c_dict.get("enabled_tools")
-                    if isinstance(enabled, list):
-                        enabled = [_coerce_builtin_tool(t) for t in enabled]
-                    disabled = c_dict.get("disabled_tools")
-                    if isinstance(disabled, list):
-                        disabled = [_coerce_builtin_tool(t) for t in disabled]
-                    caps = SubagentCapabilities(
-                        agent_behavior=beh,
-                        allowed_subagents=c_dict.get("allowed_subagents"),
-                        enabled_tools=enabled,
-                        disabled_tools=disabled,
-                        run_command_config=rc_cfg,
-                    )
-                sub_kwargs: dict[str, Any] = {
-                    "name": s["name"],
-                    "description": s.get("description", ""),
-                    "system_instructions": s.get("system_instructions"),
-                    "capabilities": caps,
-                    "tools": s.get("tools", []),
-                }
-                if s.get("model"):
-                    sub_kwargs["model"] = s["model"]
-                skills_cfg = _parse_subagent_skills_config(s.get("skills_config"))
-                if skills_cfg is not None:
-                    sub_kwargs["skills_config"] = skills_cfg
-                if hasattr(SubagentConfig, "model_fields"):
-                    allowed = set(SubagentConfig.model_fields.keys())
-                    sub_kwargs = {k: v for k, v in sub_kwargs.items() if k in allowed}
-                parsed_subagents.append(SubagentConfig(**sub_kwargs))
-            else:
-                parsed_subagents.append(s)
-        local_config["subagents"] = parsed_subagents
-
-
-def _wire_budget_config(local_config: dict[str, Any]) -> None:
-    """Translate serialized budget config into SDK BudgetConfig object."""
-    if "budget_config" not in local_config:
-        return
-    bc = local_config["budget_config"]
-    if bc is None:
-        local_config.pop("budget_config", None)
-        return
-    if isinstance(bc, dict):
-        try:
-            from google.antigravity.types import BudgetConfig, BudgetScope
-
-            bc_copy = dict(bc)
-            if "scope" in bc_copy and isinstance(bc_copy["scope"], str):
-                try:
-                    bc_copy["scope"] = BudgetScope(bc_copy["scope"].upper())
-                except ValueError:
-                    pass
-            local_config["budget_config"] = BudgetConfig(**bc_copy)
-        except ImportError:
-            return
-
-
-def _wire_compaction_config(local_config: dict[str, Any]) -> None:
-    """Translate serialized compaction config into SDK CompactionConfig object."""
-    if "compaction_config" not in local_config:
-        return
-    cc = local_config["compaction_config"]
-    if cc is None:
-        local_config.pop("compaction_config", None)
-        return
-    if isinstance(cc, dict):
-        if cc.get(FIELD_INCLUDE_LAST_USER_MESSAGE):
-            _require_sdk_proto_field(
-                PROTO_COMPACTION_CONFIG,
-                FIELD_INCLUDE_LAST_USER_MESSAGE,
-                "CompactionConfig.include_last_user_message",
-            )
-        try:
-            from google.antigravity.types import CompactionConfig
-
-            raw_threshold = cc.get("token_threshold")
-            token_threshold = (
-                int(raw_threshold)
-                if raw_threshold is not None and int(raw_threshold) > 0
-                else None
-            )
-            extras = {
-                k: cc[k]
-                for k in (
-                    "checkpoint_interval_tokens",
-                    "max_context_tokens",
-                    "summary_prompt_override",
-                    "use_model_reported_token_count",
-                    "include_last_user_message",
-                )
-                if cc.get(k) is not None
-            }
-            if token_threshold is not None or extras:
-                cc_kwargs: dict[str, Any] = {}
-                if token_threshold is not None:
-                    cc_kwargs["token_threshold"] = token_threshold
-                cc_kwargs.update(extras)
-                if hasattr(CompactionConfig, "model_fields"):
-                    allowed = set(CompactionConfig.model_fields.keys())
-                    cc_kwargs = {k: v for k, v in cc_kwargs.items() if k in allowed}
-                sdk_cc = (
-                    CompactionConfig(**cc_kwargs)
-                    if token_threshold is not None
-                    else CompactionConfig.model_construct(token_threshold=None)
-                )
-                object.__setattr__(sdk_cc, "_agy_extra_compaction", extras)
-                local_config["compaction_config"] = sdk_cc
-            else:
-                local_config.pop("compaction_config", None)
-        except ImportError:
-            return
-
-
-def _wire_retry_config(local_config: dict[str, Any]) -> None:
-    """Translate serialized retry config into SDK RetryConfig object."""
-    if "retry_config" not in local_config:
-        return
-    rc = local_config["retry_config"]
-    if rc is None:
-        local_config.pop("retry_config", None)
-        return
-    if isinstance(rc, dict):
-        try:
-            from google.antigravity.types import (
-                ModelAPIRetryConfig,
-                ModelOutputRetryConfig,
-                RetryConfig,
-            )
-
-            api_retry = rc.get("api_retry")
-            if isinstance(api_retry, dict):
-                api_retry = ModelAPIRetryConfig(**api_retry)
-            out_retry = rc.get("model_output_retry")
-            if isinstance(out_retry, dict):
-                out_retry = ModelOutputRetryConfig(**out_retry)
-            kwargs: dict[str, Any] = {}
-            if api_retry is not None:
-                kwargs["api_retry"] = api_retry
-            if out_retry is not None:
-                kwargs["model_output_retry"] = out_retry
-            local_config["retry_config"] = RetryConfig(**kwargs)
-        except ImportError:
-            return
-
-
 def _wire_system_instructions(local_config: dict[str, Any]) -> None:
     """Translate serialized system_instructions into SDK Custom/TemplatedSystemInstructions."""
     if "system_instructions" not in local_config:
@@ -442,48 +219,7 @@ def _wire_system_instructions(local_config: dict[str, Any]) -> None:
         local_config.pop("system_instructions", None)
         return
     try:
-        from google.antigravity.types import (
-            CustomSystemInstructions,
-            SystemInstructionSection,
-            TemplatedSystemInstructions,
-        )
-
-        if isinstance(si, str):
-            local_config["system_instructions"] = CustomSystemInstructions(text=si)
-        elif isinstance(si, dict):
-            if ("text" in si or "custom_instructions" in si) and "sections" not in si:
-                text_val = si.get("text") or si.get("custom_instructions") or ""
-                si_kwargs: dict[str, Any] = {"text": text_val}
-                custom_title = si.get(FIELD_TITLE)
-                sdk_has_title = (
-                    hasattr(CustomSystemInstructions, "model_fields")
-                    and FIELD_TITLE in CustomSystemInstructions.model_fields
-                )
-                if custom_title and sdk_has_title:
-                    si_kwargs[FIELD_TITLE] = custom_title
-                elif custom_title:
-                    _require_sdk_proto_field(
-                        PROTO_CUSTOM_SI_PART,
-                        FIELD_TITLE,
-                        "SystemInstructions::TitledCustom",
-                    )
-                sdk_si = CustomSystemInstructions(**si_kwargs)
-                if custom_title and not sdk_has_title:
-                    object.__setattr__(sdk_si, ATTR_CUSTOM_TITLE, str(custom_title))
-                local_config["system_instructions"] = sdk_si
-            elif "sections" in si or "identity" in si:
-                sections_raw = si.get("sections") or []
-                sections = [
-                    SystemInstructionSection(**sec) if isinstance(sec, dict) else sec
-                    for sec in sections_raw
-                ]
-                identity_val = si.get("identity")
-                if identity_val is None and "base_instructions" in si:
-                    identity_val = si.get("base_instructions")
-                local_config["system_instructions"] = TemplatedSystemInstructions(
-                    identity=identity_val,
-                    sections=sections,
-                )
+        local_config["system_instructions"] = _coerce_system_instructions(si)
     except ImportError:
         return
 
@@ -859,30 +595,31 @@ def _wire_mcp_servers(local_config):
     """Convert serialized MCP server dicts into SDK pydantic types."""
     import logging
 
-    if local_config.get("mcp_servers"):
-        try:
-            import google.antigravity.types as agy_types
+    raw_servers = local_config.pop("mcp_servers", None)
+    if not raw_servers:
+        return
+    for mcp in raw_servers:
+        _validate_mcp_server_parity(mcp)
+    try:
+        import google.antigravity.types as agy_types
 
-            parsed_mcp = []
-            for mcp in local_config.pop("mcp_servers"):
-                typ = mcp.pop("type", None)
-                if "name" not in mcp or not mcp["name"]:
-                    mcp["name"] = "mcp_server"
-                if typ == "stdio":
-                    parsed_mcp.append(agy_types.McpStdioServer(**mcp))
-                elif typ in ("sse", "http"):
-                    parsed_mcp.append(agy_types.McpStreamableHttpServer(**mcp))
-                else:
-                    logging.getLogger("agy_bridge.mcp").warning(
-                        "Unknown MCP type %r", typ
-                    )
-            local_config["mcp_servers"] = parsed_mcp
-        except _RECOVERABLE_ERRORS as exc:
-            logging.getLogger("agy_bridge.mcp").error(
-                "Failed to parse MCP configs: %s", exc
-            )
-    else:
-        local_config.pop("mcp_servers", None)
+        parsed_mcp = []
+        for mcp in raw_servers:
+            typ = mcp.pop("type", None)
+            if "name" not in mcp or not mcp["name"]:
+                mcp["name"] = "mcp_server"
+            if typ == "stdio":
+                _unwrap_stdio_env_wrapper(mcp)
+                parsed_mcp.append(agy_types.McpStdioServer(**mcp))
+            elif typ in ("sse", "http"):
+                parsed_mcp.append(agy_types.McpStreamableHttpServer(**mcp))
+            else:
+                logging.getLogger("agy_bridge.mcp").warning("Unknown MCP type %r", typ)
+        local_config["mcp_servers"] = parsed_mcp
+    except _RECOVERABLE_ERRORS as exc:
+        logging.getLogger("agy_bridge.mcp").error(
+            "Failed to parse MCP configs: %s", exc
+        )
 
 
 def _setup_base_url_routing(local_config):

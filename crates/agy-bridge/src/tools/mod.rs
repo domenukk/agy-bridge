@@ -15,8 +15,9 @@ pub use llm_tool::md_tmpl;
 pub use llm_tool::{
     EmptyParams, Json, JsonSchema, OutputSanitization, PromptDefinition, PromptOutput,
     PromptRegistry, RegistryItem, ResourceDefinition, ResourceOutput, ResourceRegistry, RustPrompt,
-    RustResource, RustTool, Sanitized, SharedState, ToolContext, ToolDefinition, ToolEffect,
-    ToolError, ToolOutput, ToolRegistry, definition_of, is_quarantined_output, llm_prompt,
+    RustResource, RustTool, SURROGATE_TOKEN_PREFIX, SURROGATE_TOKEN_SUFFIX, Sanitized, SharedState,
+    SurrogateHandle, SurrogateVault, ToolContext, ToolDefinition, ToolEffect, ToolError,
+    ToolOutput, ToolProvenance, ToolRegistry, definition_of, is_quarantined_output, llm_prompt,
     llm_resource, llm_tool, neutralize_delimiters, quarantine_tool_output,
     unquarantine_tool_output,
 };
@@ -131,6 +132,32 @@ mod tests {
         let parsed: AvailableTool = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "view_file");
         assert_eq!(parsed.source, ToolSource::Builtin);
-        assert!(!parsed.description.is_empty());
+        assert_ne!(parsed.description, "");
+    }
+
+    #[test]
+    fn provenance_and_surrogate_vault_reexported() {
+        use crate::prelude::{
+            SurrogateHandle, SurrogateVault, ToolProvenance as PreludeProvenance,
+        };
+
+        assert_eq!(
+            ToolProvenance::UntrustedNetwork,
+            PreludeProvenance::UntrustedNetwork
+        );
+        assert!(ToolProvenance::ExternalMcp.is_untrusted_source());
+        assert_eq!(
+            ToolProvenance::ExternalMcp.default_output_sanitization(),
+            OutputSanitization::Quarantine
+        );
+
+        let vault = SurrogateVault::new();
+        let handle: SurrogateHandle = vault.mint("api_key", "sk-secret-value-123").unwrap();
+        let resolved = vault
+            .resolve_in_str(&format!("Bearer {}", handle.token()))
+            .unwrap();
+        assert_eq!(resolved, "Bearer sk-secret-value-123");
+        let err = vault.resolve_in_str("<surrogate:api_key:999>").unwrap_err();
+        assert!(err.to_string().contains("<surrogate:api_key:999>"));
     }
 }

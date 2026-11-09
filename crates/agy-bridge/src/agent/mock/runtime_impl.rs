@@ -12,6 +12,12 @@ use crate::{
     types::{ConversationMessage, MessageRole, UsageMetadata},
 };
 
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct MockAddNumbersArgs {
+    x: i64,
+    y: i64,
+}
+
 impl Runtime for ToolAwareMockRuntime {
     async fn create_agent(
         &self,
@@ -28,6 +34,13 @@ impl Runtime for ToolAwareMockRuntime {
             });
         }
         let id = agent_id;
+        let add_numbers_def = crate::tools::ToolDefinition::from_schema::<MockAddNumbersArgs>(
+            "add_numbers",
+            "Adds two numbers together.",
+        )
+        .map_err(|e| Error::InvalidConfig {
+            message: format!("Failed to build MockAddNumbersArgs schema: {e}"),
+        })?;
         let tools = vec![
             crate::tools::AvailableTool {
                 name: "run_command".to_owned(),
@@ -42,16 +55,9 @@ impl Runtime for ToolAwareMockRuntime {
                 source: crate::tools::ToolSource::Builtin,
             },
             crate::tools::AvailableTool {
-                name: "add_numbers".to_owned(),
-                description: "Adds two numbers together.".to_owned(),
-                parameter_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "x": {"type": "integer"},
-                        "y": {"type": "integer"}
-                    },
-                    "required": ["x", "y"]
-                }),
+                name: add_numbers_def.name,
+                description: add_numbers_def.description,
+                parameter_schema: add_numbers_def.parameter_schema,
                 source: crate::tools::ToolSource::Custom,
             },
         ];
@@ -85,11 +91,13 @@ impl Runtime for ToolAwareMockRuntime {
         let (writer, handle) = streaming::channel();
         if call_num == 1 {
             tokio::spawn(async move {
+                let args = serde_json::to_value(MockAddNumbersArgs { x: 2, y: 3 })
+                    .expect("MockAddNumbersArgs serializes");
                 if let Err(e) = writer
                     .tool_call_tx
                     .send(crate::streaming::ToolCallEvent {
                         name: "add_numbers".to_owned(),
-                        args: serde_json::json!({"x": 2, "y": 3}),
+                        args,
                         id: Some("call_1".to_owned()),
                         canonical_path: None,
                     })

@@ -222,7 +222,7 @@ fn test_stop_hook_types_and_runner() {
 
     let allow_res = StopHookResult::allow();
     assert_eq!(allow_res.decision, StopDecision::AllowStop);
-    assert!(allow_res.reason.is_empty());
+    assert_eq!(allow_res.reason, "");
 
     let cont_res = StopHookResult::continue_with("Keep working");
     assert_eq!(cont_res.decision, StopDecision::Continue);
@@ -255,7 +255,7 @@ fn test_stop_hook_types_and_runner() {
 #[test]
 fn test_target_antigravity_sdk_version_exported() {
     let version = env!("TARGET_ANTIGRAVITY_SDK_VERSION");
-    assert_eq!(version, "0.1.22");
+    assert_eq!(version, "0.1.23");
 }
 
 #[cfg(feature = "python")]

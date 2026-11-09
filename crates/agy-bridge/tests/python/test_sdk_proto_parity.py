@@ -176,3 +176,54 @@ def test_compaction_extras_reach_harness_and_include_last_user_message_fails_lou
             match="include_last_user_message",
         ):
             agent_init._wire_compaction_config(with_flag)
+
+
+def test_mcp_server_env_unwrapping_and_per_server_fields_reach_harness_proto():
+    from google.antigravity.connections.local import local_connection
+
+    local_cfg = {
+        "mcp_servers": [
+            {
+                "type": "stdio",
+                "name": "ghidra_mcp",
+                "command": "env",
+                "args": [
+                    "API_TOKEN=secret123",
+                    "ghidra-mcp-server",
+                    "--port",
+                    "8080",
+                ],
+                "enabled_tools": ["decompile_function", "list_functions"],
+                "timeout_seconds": 60,
+                "force_all_tools_eager": True,
+            },
+            {
+                "type": "http",
+                "name": "remote_mcp",
+                "url": "http://127.0.0.1:9090/mcp",
+                "disabled_tools": ["drop_database"],
+                "timeout_seconds": 25,
+                "force_all_tools_eager": True,
+            },
+        ]
+    }
+    agent_init._wire_mcp_servers(local_cfg)
+    assert len(local_cfg["mcp_servers"]) == 2
+
+    stdio_proto = local_connection._to_mcp_server_proto(local_cfg["mcp_servers"][0])
+    assert stdio_proto.name == "ghidra_mcp"
+    assert stdio_proto.stdio.command == "ghidra-mcp-server"
+    assert list(stdio_proto.stdio.args) == ["--port", "8080"]
+    assert dict(stdio_proto.stdio.env) == {"API_TOKEN": "secret123"}
+    assert list(stdio_proto.enabled_tools) == ["decompile_function", "list_functions"]
+    assert list(stdio_proto.disabled_tools) == []
+    assert stdio_proto.timeout_seconds == 60
+    assert stdio_proto.force_all_tools_eager is True
+
+    http_proto = local_connection._to_mcp_server_proto(local_cfg["mcp_servers"][1])
+    assert http_proto.name == "remote_mcp"
+    assert http_proto.http.url == "http://127.0.0.1:9090/mcp"
+    assert list(http_proto.enabled_tools) == []
+    assert list(http_proto.disabled_tools) == ["drop_database"]
+    assert http_proto.timeout_seconds == 25
+    assert http_proto.force_all_tools_eager is True

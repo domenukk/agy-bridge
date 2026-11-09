@@ -56,10 +56,8 @@ pub enum BuiltinTools {
 }
 
 impl BuiltinTools {
-    /// Backwards-compatible alias for [`Self::InvokeSubagent`].
-    // NOLINT: backwards-compatible alias for StartSubagent -> InvokeSubagent
-    #[allow(non_upper_case_globals)]
-    pub const StartSubagent: Self = Self::InvokeSubagent;
+    /// Backwards-compatible constant alias for [`Self::InvokeSubagent`].
+    pub const START_SUBAGENT: Self = Self::InvokeSubagent;
 
     #[must_use]
     /// Returns tools that only read (no writes, no command execution).
@@ -403,6 +401,29 @@ impl CapabilitiesConfig {
         }
         Ok(())
     }
+
+    /// Resolve which builtin tools are active for `caps`.
+    ///
+    /// - `enabled_tools: Some(list)` → only those tools are active.
+    /// - `disabled_tools: Some(list)` → all builtin tools minus the disabled ones.
+    /// - Neither set (or `caps` is `None`) → all builtin tools are active.
+    #[must_use]
+    pub fn resolve_active_builtins(caps: Option<&Self>) -> Vec<BuiltinTools> {
+        let Some(c) = caps else {
+            return BuiltinTools::all_tools().to_vec();
+        };
+        if let Some(enabled) = c.enabled_tools.as_ref() {
+            return enabled.clone();
+        }
+        if let Some(disabled) = c.disabled_tools.as_ref() {
+            return BuiltinTools::all_tools()
+                .iter()
+                .copied()
+                .filter(|t| !disabled.contains(t))
+                .collect();
+        }
+        BuiltinTools::all_tools().to_vec()
+    }
 }
 
 impl Default for CapabilitiesConfig {
@@ -517,7 +538,7 @@ mod tests {
         assert!(!read_only.contains(&BuiltinTools::CreateFile));
         assert!(!read_only.contains(&BuiltinTools::EditFile));
         assert!(!read_only.contains(&BuiltinTools::RunCommand));
-        assert!(!read_only.contains(&BuiltinTools::StartSubagent));
+        assert!(!read_only.contains(&BuiltinTools::START_SUBAGENT));
         assert!(!read_only.contains(&BuiltinTools::GenerateImage));
         assert!(!read_only.contains(&BuiltinTools::AskQuestion));
     }
@@ -562,7 +583,7 @@ mod tests {
         assert_eq!(json, "\"invoke_subagent\"");
         let legacy: BuiltinTools = serde_json::from_str("\"start_subagent\"").unwrap();
         assert_eq!(legacy, BuiltinTools::InvokeSubagent);
-        assert_eq!(BuiltinTools::StartSubagent, BuiltinTools::InvokeSubagent);
+        assert_eq!(BuiltinTools::START_SUBAGENT, BuiltinTools::InvokeSubagent);
 
         let tool = BuiltinTools::GenerateImage;
         let json = serde_json::to_string(&tool).unwrap();
@@ -578,7 +599,7 @@ mod tests {
             ..CapabilitiesConfig::default()
         };
         assert!(caps_empty.validate().is_ok());
-        assert!(caps_empty.enabled_tools.as_ref().unwrap().is_empty());
+        assert_eq!(caps_empty.enabled_tools.as_ref().unwrap().len(), 0);
 
         let caps_none = CapabilitiesConfig::default();
         assert!(caps_none.enabled_tools.is_none());
@@ -616,7 +637,7 @@ mod tests {
     fn capabilities_with_tools_enables_subagents() {
         let caps = CapabilitiesConfig::with_tools(vec![
             BuiltinTools::ViewFile,
-            BuiltinTools::StartSubagent,
+            BuiltinTools::START_SUBAGENT,
         ]);
         assert!(caps.enable_subagents);
         assert_eq!(caps.enabled_tools.as_ref().unwrap().len(), 2);
@@ -634,10 +655,10 @@ mod tests {
         let caps = CapabilitiesConfig::read_only();
         assert!(caps.enable_subagents);
         let tools = caps.enabled_tools.as_ref().unwrap();
-        // read_only tools should NOT include StartSubagent
+        // read_only tools should NOT include START_SUBAGENT
         assert!(
-            !tools.contains(&BuiltinTools::StartSubagent),
-            "read_only should not include StartSubagent in enabled_tools"
+            !tools.contains(&BuiltinTools::START_SUBAGENT),
+            "read_only should not include START_SUBAGENT in enabled_tools"
         );
     }
 
@@ -645,25 +666,25 @@ mod tests {
     fn capabilities_custom_tools_only_enables_subagents() {
         let caps = CapabilitiesConfig::custom_tools_only();
         assert!(caps.enable_subagents);
-        assert!(caps.enabled_tools.as_ref().unwrap().is_empty());
+        assert_eq!(caps.enabled_tools.as_ref().unwrap().len(), 0);
     }
 
     #[test]
     fn start_subagent_in_all_tools_and_nondestructive() {
         let all = BuiltinTools::all_tools();
         assert!(
-            all.contains(&BuiltinTools::StartSubagent),
-            "all_tools() must include StartSubagent"
+            all.contains(&BuiltinTools::START_SUBAGENT),
+            "all_tools() must include START_SUBAGENT"
         );
         let nondestructive = BuiltinTools::nondestructive();
         assert!(
-            nondestructive.contains(&BuiltinTools::StartSubagent),
-            "nondestructive() must include StartSubagent"
+            nondestructive.contains(&BuiltinTools::START_SUBAGENT),
+            "nondestructive() must include START_SUBAGENT"
         );
         let read_only = BuiltinTools::read_only();
         assert!(
-            !read_only.contains(&BuiltinTools::StartSubagent),
-            "read_only() must NOT include StartSubagent"
+            !read_only.contains(&BuiltinTools::START_SUBAGENT),
+            "read_only() must NOT include START_SUBAGENT"
         );
     }
 
@@ -780,5 +801,32 @@ mod tests {
             Some(vec!["sub1".to_string(), "sub2".to_string()])
         );
         assert_eq!(parsed.command_timeout_ms, Some(60_000));
+    }
+
+    #[test]
+    fn resolve_active_builtins_covers_none_default_enabled_and_disabled() {
+        assert_eq!(
+            CapabilitiesConfig::resolve_active_builtins(None),
+            BuiltinTools::all_tools()
+        );
+        let default_caps = CapabilitiesConfig::default();
+        assert_eq!(
+            CapabilitiesConfig::resolve_active_builtins(Some(&default_caps)),
+            BuiltinTools::all_tools()
+        );
+        let enabled_caps =
+            CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile, BuiltinTools::Finish]);
+        assert_eq!(
+            CapabilitiesConfig::resolve_active_builtins(Some(&enabled_caps)),
+            vec![BuiltinTools::ViewFile, BuiltinTools::Finish]
+        );
+        let disabled_caps = CapabilitiesConfig {
+            disabled_tools: Some(vec![BuiltinTools::RunCommand, BuiltinTools::AskQuestion]),
+            ..CapabilitiesConfig::default()
+        };
+        let resolved = CapabilitiesConfig::resolve_active_builtins(Some(&disabled_caps));
+        assert_eq!(resolved.len(), BuiltinTools::all_tools().len() - 2);
+        assert!(!resolved.contains(&BuiltinTools::RunCommand));
+        assert!(!resolved.contains(&BuiltinTools::AskQuestion));
     }
 }

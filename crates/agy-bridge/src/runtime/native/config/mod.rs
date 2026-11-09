@@ -11,7 +11,7 @@ use llm_tool::ToolDefinition;
 use crate::{
     config::{
         AgentConfig, BuiltinTools, CapabilitiesConfig, McpServer, McpStdioServer,
-        SystemInstructionSection, SystemInstructions,
+        SystemInstructionSection, SystemInstructions, ToolOutputTruncationConfig,
     },
     hooks::Hooks,
     policies::{PolicyRule, PolicySet},
@@ -112,7 +112,6 @@ pub(crate) fn build_harness_config(
         budget_config,
         compaction_config,
         skills_config,
-        rules_config: None,
         mcp_max_output_bytes,
     }
 }
@@ -222,7 +221,7 @@ fn to_proto_inline_skill(skill: &crate::config::InlineSkill) -> proto::localharn
         }
     }
     proto::localharness::SkillSource {
-        source: Some(proto::localharness::skill_source::Source::Skill(
+        source: Some(proto::localharness::skill_source::Source::Skill(Box::new(
             proto::skill::Skill {
                 name: skill.name.clone(),
                 skill_id: String::new(),
@@ -232,7 +231,7 @@ fn to_proto_inline_skill(skill: &crate::config::InlineSkill) -> proto::localharn
                 metadata,
                 resources: None,
             },
-        )),
+        ))),
     }
 }
 
@@ -245,10 +244,6 @@ fn to_proto_skills_config(
     Some(proto::localharness::SkillsConfig {
         enabled: true,
         skills: inline_skills.iter().map(to_proto_inline_skill).collect(),
-        skill_versions: HashMap::new(),
-        presentation_mode: 0,
-        materialized_skills_dir: String::new(),
-        preactivate_skills: Vec::new(),
     })
 }
 
@@ -256,24 +251,24 @@ fn to_proto_subagent_skills_config(
     cfg: &crate::config::SubagentSkillsConfig,
 ) -> proto::localharness::SubagentSkillsConfig {
     use proto::localharness::subagent_skills_config::{
-        Config, InheritConfig, NoneConfig, OverrideConfig,
+        InheritConfig, Mode, NoneConfig, OverrideConfig,
     };
-    let config = match cfg {
+    let mode = match cfg {
         crate::config::SubagentSkillsConfig::Inherit {
             skill_names,
             extra_skills_paths,
-        } => Some(Config::InheritConfig(InheritConfig {
+        } => Some(Mode::Inherit(InheritConfig {
             extra_skills_paths: extra_skills_paths
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
             skill_names: skill_names.clone(),
         })),
-        crate::config::SubagentSkillsConfig::None => Some(Config::NoneConfig(NoneConfig {})),
+        crate::config::SubagentSkillsConfig::None => Some(Mode::None(NoneConfig {})),
         crate::config::SubagentSkillsConfig::Override {
             skills_paths,
             inline_skills,
-        } => Some(Config::OverrideConfig(OverrideConfig {
+        } => Some(Mode::Override(OverrideConfig {
             skills_paths: skills_paths
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
@@ -281,7 +276,7 @@ fn to_proto_subagent_skills_config(
             skill_sources: inline_skills.iter().map(to_proto_inline_skill).collect(),
         })),
     };
-    proto::localharness::SubagentSkillsConfig { config }
+    proto::localharness::SubagentSkillsConfig { mode }
 }
 
 fn to_proto_subagent_harness_side_tools(
@@ -474,26 +469,35 @@ fn extract_compaction_config(
     }
 }
 
+fn to_proto_tool_output_truncation(
+    trunc: ToolOutputTruncationConfig,
+) -> proto::localharness::ToolOutputTruncation {
+    proto::localharness::ToolOutputTruncation {
+        strategy: Some(
+            proto::localharness::tool_output_truncation::Strategy::Truncate(
+                proto::localharness::tool_output_truncation::TruncateStrategy {
+                    max_tokens: match i32::try_from(trunc.max_tokens) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "truncation max_tokens exceeds i32::MAX; saturating"
+                            );
+                            i32::MAX
+                        }
+                    },
+                    save_full_output: trunc.save_full_output,
+                },
+            ),
+        ),
+    }
+}
+
 fn extract_tool_output_truncation(
     caps: Option<&CapabilitiesConfig>,
 ) -> Option<proto::localharness::ToolOutputTruncation> {
-    caps.and_then(|c| c.tool_output_truncation_config.as_ref())
-        .map(|trunc| proto::localharness::ToolOutputTruncation {
-            strategy: Some(
-                proto::localharness::tool_output_truncation::Strategy::Truncate(
-                    proto::localharness::tool_output_truncation::TruncateStrategy {
-                        max_tokens: match i32::try_from(trunc.max_tokens) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::debug!(error = %e, "truncation max_tokens exceeds i32::MAX; saturating");
-                                i32::MAX
-                            }
-                        },
-                        save_full_output: trunc.save_full_output,
-                    },
-                ),
-            ),
-        })
+    caps.and_then(|c| c.tool_output_truncation_config)
+        .map(to_proto_tool_output_truncation)
 }
 
 fn dirs_or_default_app_data_dir() -> String {
@@ -597,22 +601,10 @@ fn to_proto_harness_side_tools(
     caps: Option<&CapabilitiesConfig>,
     enforce_workspace_validation: bool,
 ) -> proto::localharness::HarnessSideTools {
-    let all_tools = BuiltinTools::all_tools();
-    let enabled_tools: std::collections::HashSet<BuiltinTools> = if let Some(c) = caps {
-        if let Some(ref enabled) = c.enabled_tools {
-            enabled.iter().copied().collect()
-        } else if let Some(ref disabled) = c.disabled_tools {
-            all_tools
-                .iter()
-                .copied()
-                .filter(|t| !disabled.contains(t))
-                .collect()
-        } else {
-            all_tools.iter().copied().collect()
-        }
-    } else {
-        all_tools.iter().copied().collect()
-    };
+    let enabled_tools: std::collections::HashSet<BuiltinTools> =
+        CapabilitiesConfig::resolve_active_builtins(caps)
+            .into_iter()
+            .collect();
 
     let subagents_flag = caps.is_none_or(|c| c.enable_subagents);
     let subagents_enabled = subagents_flag && enabled_tools.contains(&BuiltinTools::InvokeSubagent);
@@ -745,7 +737,9 @@ fn build_model_config(
     proto::localharness::ModelConfig {
         name,
         types: vec![model_type as i32],
-        endpoint: Some(proto::localharness::model_config::Endpoint::GeminiApiEndpoint(endpoint)),
+        endpoint: Some(proto::localharness::model_config::Endpoint::GeminiApi(
+            endpoint,
+        )),
     }
 }
 
@@ -816,21 +810,22 @@ fn build_models_proto(config: &AgentConfig) -> Vec<proto::localharness::ModelCon
 }
 
 fn stdio_mcp_server(name: String, stdio: &McpStdioServer) -> proto::localharness::McpServerConfig {
-    proto::localharness::McpServerConfig {
+    let (command, args, env) = stdio.unwrap_env_wrapper();
+    let mut cfg = proto::localharness::McpServerConfig {
         name,
         transport: Some(proto::localharness::mcp_server_config::Transport::Stdio(
             proto::localharness::McpStdioTransport {
-                command: stdio.command.clone(),
-                args: stdio.args.clone(),
-                env: HashMap::new(),
+                command: command.to_owned(),
+                args: args.to_vec(),
+                env,
             },
         )),
-        enabled_tools: Vec::new(),
-        disabled_tools: Vec::new(),
-        timeout_seconds: 0,
-        auth_provider_type: 0,
-        force_all_tools_eager: false,
+        ..proto::localharness::McpServerConfig::default()
+    };
+    if let Some(secs) = stdio.timeout_seconds {
+        cfg.timeout_seconds = secs;
     }
+    cfg
 }
 
 fn http_mcp_server(
@@ -851,24 +846,38 @@ fn http_mcp_server(
         transport: Some(proto::localharness::mcp_server_config::Transport::Http(
             http_transport,
         )),
-        enabled_tools: Vec::new(),
-        disabled_tools: Vec::new(),
         timeout_seconds,
-        auth_provider_type: 0,
-        force_all_tools_eager: false,
+        ..proto::localharness::McpServerConfig::default()
     }
 }
 
 fn to_proto_mcp_server(s: &McpServer) -> proto::localharness::McpServerConfig {
     let name = s.server_name();
-    match s {
+    let mut cfg = match s {
         McpServer::Stdio(stdio) => stdio_mcp_server(name, stdio),
-        McpServer::Sse(sse) => http_mcp_server(name, sse.url.clone(), sse.headers.as_ref(), 0),
+        McpServer::Sse(sse) => {
+            let mut timeout_secs = 0;
+            if let Some(secs) = sse.timeout_seconds {
+                timeout_secs = secs;
+            }
+            http_mcp_server(name, sse.url.clone(), sse.headers.as_ref(), timeout_secs)
+        }
         McpServer::Http(http) => {
-            let timeout_secs = f64_to_timeout_seconds(http.timeout);
+            let timeout_secs = match http.timeout_seconds {
+                Some(secs) => secs,
+                None => f64_to_timeout_seconds(http.timeout),
+            };
             http_mcp_server(name, http.url.clone(), http.headers.as_ref(), timeout_secs)
         }
+    };
+    if let Some(tools) = s.enabled_tools() {
+        cfg.enabled_tools = tools.to_vec();
     }
+    if let Some(tools) = s.disabled_tools() {
+        cfg.disabled_tools = tools.to_vec();
+    }
+    cfg.force_all_tools_eager = s.force_all_tools_eager();
+    cfg
 }
 
 fn f64_to_timeout_seconds(timeout: f64) -> i32 {

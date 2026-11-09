@@ -165,6 +165,14 @@ fn handle_on_interaction(
     })
 }
 
+#[derive(serde::Serialize)]
+struct PreToolCallDecideWire<'a> {
+    #[serde(flatten)]
+    result: &'a crate::hooks::HookResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transformed_args: Option<&'a serde_json::Value>,
+}
+
 fn handle_pre_tool_call_decide(
     hook_runner: &crate::hooks::Hooks,
     context_json: &str,
@@ -177,16 +185,11 @@ fn handle_pre_tool_call_decide(
         })?;
     let transformed_args = hook_runner.run_transform_tool_input(&ctx);
     let hook_result = hook_runner.run_pre_tool_call_decide(&ctx);
-    let mut result_val =
-        serde_json::to_value(&hook_result).map_err(|e| crate::error::Error::BackendError {
-            message: format!("Failed to serialize PreToolCallDecide result: {e}"),
-        })?;
-    if transformed_args != ctx.tool_args
-        && let serde_json::Value::Object(ref mut map) = result_val
-    {
-        map.insert("transformed_args".to_owned(), transformed_args);
-    }
-    serde_json::to_string(&result_val).map_err(|e| crate::error::Error::BackendError {
+    let wire = PreToolCallDecideWire {
+        result: &hook_result,
+        transformed_args: (transformed_args != ctx.tool_args).then_some(&transformed_args),
+    };
+    serde_json::to_string(&wire).map_err(|e| crate::error::Error::BackendError {
         message: format!("Failed to serialize PreToolCallDecide result: {e}"),
     })
 }
@@ -475,8 +478,7 @@ mod merge_tests {
         let captured = super::super::bridge_state::CapturedToolError::from_tool_error(
             serde_json::Value::Null,
             &error,
-        )
-        .expect("ToolError serializes");
+        );
         assert_eq!(captured.metadata, None);
         let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
         assert_eq!(ctx.metadata, serde_json::Value::Null);
@@ -489,8 +491,7 @@ mod merge_tests {
         let captured = super::super::bridge_state::CapturedToolError::from_tool_error(
             serde_json::json!({"a": 1}),
             &error,
-        )
-        .expect("ToolError serializes");
+        );
         assert_eq!(captured.tool_args, serde_json::json!({"a": 1}));
         let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
         assert_eq!(ctx.metadata["status_code"], 503);
@@ -508,8 +509,7 @@ mod merge_tests {
         let captured = super::super::bridge_state::CapturedToolError::from_tool_error(
             serde_json::Value::Null,
             &error,
-        )
-        .expect("ToolError serializes");
+        );
         let ctx = merge_tool_error_metadata(base_ctx(), Some(captured));
         assert!(ctx.is_not_found());
     }

@@ -38,11 +38,10 @@
 //! servers.  These are **process-launch** variables, not MCP protocol fields:
 //! they should be set in the environment of the spawned server subprocess.
 //!
-//! The Antigravity Python SDK's `McpStdioServer` only exposes `command` and
-//! `args` (no `env` field), so we lower the env map into a portable POSIX
-//! `env KEY=VALUE … <command> <args…>` wrapper.  The SDK spawns that wrapper
-//! command verbatim, and the `env(1)` utility applies the variables before
-//! exec-ing the real server binary.
+//! We encode the `env` map into a portable `env KEY=VALUE … <command> <args…>`
+//! wrapper on [`McpStdioServer`], which both `NativeRuntime` and
+//! `PythonRuntime` unwrap into the transport's native `env` dictionary (so
+//! secrets are passed via process environment rather than `/proc/<pid>/cmdline`).
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -55,12 +54,6 @@ use super::{
     McpServer, McpSseServer, McpStdioServer, McpStreamableHttpServer, default_mcp_sse_read_timeout,
     default_mcp_timeout,
 };
-
-/// The POSIX command used to wrap stdio servers that declare per-server `env`.
-///
-/// `env(1)` applies the supplied `KEY=VALUE` assignments and then `exec`s the
-/// real command, making it a transparent, portable wrapper.
-const ENV_WRAPPER_COMMAND: &str = "env";
 
 /// Errors that can occur while loading a standardized `mcp.json` file.
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +147,27 @@ pub struct McpServerSpec {
     /// `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminate_on_close: Option<bool>,
+
+    /// Explicit allowlist of MCP tool names exposed from this server.
+    ///
+    /// Mutually exclusive with `disabled_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+
+    /// Explicit denylist of MCP tool names hidden from this server.
+    ///
+    /// Mutually exclusive with `enabled_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_tools: Option<Vec<String>>,
+
+    /// Optional timeout in seconds for connecting to the server and listing tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i32>,
+
+    /// When `true`, forces all tools from this server to be loaded eagerly into
+    /// the model's prompt rather than lazily via tool search.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_all_tools_eager: bool,
 }
 
 /// The transport a [`McpServerSpec`] resolves to.
@@ -176,26 +190,11 @@ fn build_stdio_server(
     args: Vec<String>,
     env: &BTreeMap<String, String>,
 ) -> McpStdioServer {
-    if env.is_empty() {
-        return McpStdioServer {
-            name: Some(name.to_owned()),
-            command,
-            args,
-        };
-    }
-
-    let mut wrapped = Vec::with_capacity(env.len() + 1 + args.len());
+    let mut server = McpStdioServer::new(command).name(name).args(args);
     for (key, value) in env {
-        wrapped.push(format!("{key}={value}"));
+        server = server.env(key, value);
     }
-    wrapped.push(command);
-    wrapped.extend(args);
-
-    McpStdioServer {
-        name: Some(name.to_owned()),
-        command: ENV_WRAPPER_COMMAND.to_owned(),
-        args: wrapped,
-    }
+    server
 }
 
 impl McpServerSpec {
@@ -241,33 +240,40 @@ impl McpServerSpec {
     /// resolved or a field required by the resolved transport is missing.
     pub fn into_server(self, name: &str) -> Result<McpServer, McpConfigError> {
         let transport = self.resolve_transport(name)?;
-        match transport {
+        let server = match transport {
             Transport::Stdio => {
                 let command = self.command.ok_or_else(|| McpConfigError::InvalidServer {
                     name: name.to_owned(),
                     reason: "stdio transport requires a 'command'".to_owned(),
                 })?;
-                Ok(McpServer::Stdio(build_stdio_server(
-                    name, command, self.args, &self.env,
-                )))
+                let mut server = build_stdio_server(name, command, self.args, &self.env);
+                server.enabled_tools = self.enabled_tools;
+                server.disabled_tools = self.disabled_tools;
+                server.timeout_seconds = self.timeout_seconds;
+                server.force_all_tools_eager = self.force_all_tools_eager;
+                McpServer::Stdio(server)
             }
             Transport::Sse => {
                 let url = self.url.ok_or_else(|| McpConfigError::InvalidServer {
                     name: name.to_owned(),
                     reason: "sse transport requires a 'url'".to_owned(),
                 })?;
-                Ok(McpServer::Sse(McpSseServer {
+                McpServer::Sse(McpSseServer {
                     name: Some(name.to_owned()),
                     url,
                     headers: self.headers,
-                }))
+                    enabled_tools: self.enabled_tools,
+                    disabled_tools: self.disabled_tools,
+                    timeout_seconds: self.timeout_seconds,
+                    force_all_tools_eager: self.force_all_tools_eager,
+                })
             }
             Transport::Http => {
                 let url = self.url.ok_or_else(|| McpConfigError::InvalidServer {
                     name: name.to_owned(),
                     reason: "http transport requires a 'url'".to_owned(),
                 })?;
-                Ok(McpServer::Http(McpStreamableHttpServer {
+                McpServer::Http(McpStreamableHttpServer {
                     name: Some(name.to_owned()),
                     url,
                     headers: self.headers,
@@ -279,9 +285,20 @@ impl McpServerSpec {
                     // (`default_true`): the SDK terminates connections on close
                     // unless the user explicitly opts out.
                     terminate_on_close: self.terminate_on_close.unwrap_or_else(super::default_true),
-                }))
+                    enabled_tools: self.enabled_tools,
+                    disabled_tools: self.disabled_tools,
+                    timeout_seconds: self.timeout_seconds,
+                    force_all_tools_eager: self.force_all_tools_eager,
+                })
             }
-        }
+        };
+        server
+            .validate()
+            .map_err(|reason| McpConfigError::InvalidServer {
+                name: name.to_owned(),
+                reason,
+            })?;
+        Ok(server)
     }
 }
 
@@ -615,5 +632,72 @@ mod tests {
         assert_eq!(server.name.as_deref(), Some("srv"));
         assert_eq!(server.command, "env");
         assert_eq!(server.args, ["A=first", "Z=last", "my-server", "--flag"]);
+    }
+
+    #[test]
+    fn parses_per_server_tool_filters_timeout_seconds_and_eager_loading() {
+        let json = r#"{
+          "mcpServers": {
+            "ghidra": {
+              "command": "ghidra-mcp",
+              "enabled_tools": ["decompile_function", "list_functions"],
+              "timeout_seconds": 90,
+              "force_all_tools_eager": true
+            },
+            "remote": {
+              "url": "https://example.com/mcp",
+              "disabled_tools": ["admin_drop"],
+              "timeout_seconds": 15
+            }
+          }
+        }"#;
+        let servers = McpConfigFile::from_json_str(json)
+            .unwrap()
+            .into_servers()
+            .unwrap();
+        assert_eq!(
+            servers[0].1.enabled_tools(),
+            Some(["decompile_function".to_owned(), "list_functions".to_owned()].as_slice())
+        );
+        assert_eq!(servers[0].1.timeout_seconds(), Some(90));
+        assert!(servers[0].1.force_all_tools_eager());
+        assert_eq!(
+            servers[1].1.disabled_tools(),
+            Some(["admin_drop".to_owned()].as_slice())
+        );
+        assert_eq!(servers[1].1.timeout_seconds(), Some(15));
+        assert!(!servers[1].1.force_all_tools_eager());
+    }
+
+    #[test]
+    fn rejects_mutually_exclusive_tool_lists_and_negative_timeout_in_mcp_json() {
+        let both_lists = r#"{
+          "mcpServers": {
+            "bad": {
+              "command": "srv",
+              "enabled_tools": ["a"],
+              "disabled_tools": ["b"]
+            }
+          }
+        }"#;
+        let err = McpConfigFile::from_json_str(both_lists)
+            .unwrap()
+            .into_servers()
+            .unwrap_err();
+        assert!(matches!(err, McpConfigError::InvalidServer { .. }));
+
+        let negative_timeout = r#"{
+          "mcpServers": {
+            "bad": {
+              "command": "srv",
+              "timeout_seconds": -1
+            }
+          }
+        }"#;
+        let err = McpConfigFile::from_json_str(negative_timeout)
+            .unwrap()
+            .into_servers()
+            .unwrap_err();
+        assert!(matches!(err, McpConfigError::InvalidServer { .. }));
     }
 }

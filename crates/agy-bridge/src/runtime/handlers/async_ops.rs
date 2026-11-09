@@ -343,7 +343,7 @@ mod tests {
 
         // lock_registry should recover gracefully.
         let guard = lock_registry(&registry);
-        assert!(guard.is_empty());
+        assert_eq!(guard.len(), 0);
     }
 
     /// Confirm that `handle_cancel` returns a `BackendError` when the agent is
@@ -473,12 +473,12 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let guard = lock_registry(&registry);
-        assert!(guard.is_empty());
+        assert_eq!(guard.len(), 0);
         drop(guard);
 
         // Can lock again after dropping.
         let guard2 = lock_registry(&registry);
-        assert!(guard2.is_empty());
+        assert_eq!(guard2.len(), 0);
     }
 
     /// Confirm that `handle_delete` returns a `BackendError` when the agent is

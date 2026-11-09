@@ -1,16 +1,13 @@
 # agy-bridge
 
-Rust SDK for building LLM agents with tools, hooks, policies, streaming,
-subagents, and multimodal input on top of the
-[Google Antigravity SDK](https://github.com/Google-Antigravity/antigravity-sdk-python)
-(`localharness`).
+Rust client for the
+[Google Antigravity SDK](https://github.com/Google-Antigravity/antigravity-sdk-python).
 
-Supports two runtime backends behind a unified API:
+Supports two backends with the same API:
 
-- **`native` (default)**: Pure-Rust client that communicates directly with the
-  standalone `localharness` binary over stdio protobuf and WebSocket JSON
-  without a Python interpreter.
-- **`python`**: In-process bridge to the Python `google-antigravity` package via
+- **`native` (default)**: Pure Rust client that talks directly to the
+  `localharness` binary. No Python or `protoc` required.
+- **`python`**: Calls the Python `google-antigravity` package via
   [PyO3](https://pyo3.rs).
 
 ## Installation
@@ -31,8 +28,9 @@ Python interpreter.
 
 ### Option 2: Python Backend
 
-Drives the Python SDK in-process via `PyO3`. Choose this if you need features
-the native harness does not implement yet (triggers, initial history):
+Drives the Python `google-antigravity` SDK in-process via `PyO3`. Both `native`
+and `python` backends support the full agent, tool, hook, policy, subagent,
+skill, trigger, and initial-history API surface:
 
 ```toml
 [dependencies]
@@ -57,7 +55,7 @@ Set your API key (or put it in a `.env` file):
 export GEMINI_API_KEY="your-key-here"
 ```
 
-For custom gateways or local proxies (e.g. Beyond proxy):
+For custom gateways or local proxies:
 
 ```bash
 export GEMINI_API_BASE_URL="http://127.0.0.1:8642"
@@ -222,19 +220,37 @@ let registry = ToolRegistry::new().with_tool(SearchTool);
 assert_eq!(registry.definitions().len(), 1);
 ```
 
-#### Safe Defaults
+#### Output Sanitization & Secret Tokens
 
 Tool output is sanitized by default. `AgentConfig::tool_output_floor` (default
-`OutputSanitization::SanitizeTokens`) is enforced on every custom tool call,
-even for tools that opt out. Raise it for tools that return external content:
+`OutputSanitization::SanitizeTokens`) applies to every custom tool call. Set
+`#[llm_tool(provenance = "...")]` to mark external tools (`external_mcp` and
+`untrusted_network` wrap output in `<untrusted_tool_output>` tags by default),
+and use `SurrogateVault` to replace secret values with placeholders:
 
 ```rust
-use agy_bridge::{config::AgentConfig, tools::OutputSanitization};
+use agy_bridge::{
+    config::AgentConfig,
+    tools::{OutputSanitization, SurrogateVault, ToolContext, ToolProvenance},
+};
 
 let config = AgentConfig::builder()
     .tool_output_floor(OutputSanitization::Quarantine)
     .build();
 assert_eq!(config.tool_output_floor, OutputSanitization::Quarantine);
+assert_eq!(
+    ToolProvenance::ExternalMcp.default_output_sanitization(),
+    OutputSanitization::Quarantine
+);
+
+let vault = SurrogateVault::new();
+let ctx = ToolContext::new().with_surrogate_vault(vault);
+let handle = ctx.mint_surrogate("api_key", "sk-live-secret").unwrap();
+assert_eq!(handle.token(), "<surrogate:api_key:1>");
+assert_eq!(
+    ctx.redact_surrogates("Bearer sk-live-secret").unwrap(),
+    "Bearer <surrogate:api_key:1>"
+);
 ```
 
 To end the turn as soon as a submit tool succeeds (native runtime), name it by

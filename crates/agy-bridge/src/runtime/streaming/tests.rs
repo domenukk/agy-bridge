@@ -170,7 +170,7 @@ fn dedup_model_text_non_streaming_emits_content() {
 fn error_status_is_detected() {
     let step = step_with(StepStatus::Error, "", "some content");
     assert_eq!(step.status, StepStatus::Error);
-    assert!(step.error.is_empty());
+    assert_eq!(step.error, "");
     let has_error_status = step.status == StepStatus::Error;
     let has_error_field = !step.error.is_empty();
     assert!(has_error_status || has_error_field);

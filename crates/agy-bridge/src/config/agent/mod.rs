@@ -31,9 +31,6 @@ fn default_model_name() -> String {
 }
 
 /// System instruction configuration, mirroring the Python SDK's union type.
-///
-/// Uses internal tagging via `#[serde(untagged)]` so each variant is
-/// distinguishable by its `"mode"` field in JSON (e.g. `{"mode": "Custom", "text": "..."}`).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]

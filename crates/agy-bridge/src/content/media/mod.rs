@@ -254,18 +254,46 @@ pub mod mime {
     }
 }
 
+/// Normalize a MIME type string by trimming surrounding whitespace and
+/// lowercasing ASCII letters, matching `google.antigravity.types._BaseMedia`.
+fn normalize_mime_type(raw: impl Into<String>) -> String {
+    raw.into().trim().to_ascii_lowercase()
+}
+
+/// Expand a leading `~` or `~/...` path component to the user's home directory,
+/// matching `Path.expanduser()` in `google.antigravity.types`.
+fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if raw == "~" {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return std::path::PathBuf::from(home);
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"))
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    path.to_path_buf()
+}
+
 /// Shared implementation for loading media from a file path.
 ///
-/// Extracts the file extension, looks up the MIME type, validates the prefix,
-/// reads the file, and returns `(data, mime_type)`.
+/// Expands leading `~`, extracts the file extension, looks up the MIME type,
+/// validates the prefix, reads the file, and returns `(data, mime_type)`.
 fn from_file_inner(
     path: &std::path::Path,
     type_label: &str,
     mime_prefixes: &[&str],
 ) -> std::io::Result<(Vec<u8>, String)> {
-    let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
-    })?;
+    let expanded = expand_tilde(path);
+    let ext = expanded
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
+        })?;
     let mime_type = mime::from_extension(ext).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -281,7 +309,7 @@ fn from_file_inner(
             format!("MIME type '{mime_type}' is not {type_label} type"),
         ));
     }
-    let data = std::fs::read(path)?;
+    let data = std::fs::read(&expanded)?;
     Ok((data, mime_type.to_owned()))
 }
 
@@ -304,7 +332,7 @@ impl Image {
     pub fn new(data: Vec<u8>, mime_type: impl Into<String>) -> Self {
         Self {
             data,
-            mime_type: mime_type.into(),
+            mime_type: normalize_mime_type(mime_type),
             description: None,
         }
     }
@@ -383,7 +411,7 @@ impl Document {
     pub fn new(data: Vec<u8>, mime_type: impl Into<String>) -> Self {
         Self {
             data,
-            mime_type: mime_type.into(),
+            mime_type: normalize_mime_type(mime_type),
             description: None,
         }
     }
@@ -448,7 +476,7 @@ impl Audio {
     pub fn new(data: Vec<u8>, mime_type: impl Into<String>) -> Self {
         Self {
             data,
-            mime_type: mime_type.into(),
+            mime_type: normalize_mime_type(mime_type),
             description: None,
         }
     }
@@ -526,7 +554,7 @@ impl Video {
     pub fn new(data: Vec<u8>, mime_type: impl Into<String>) -> Self {
         Self {
             data,
-            mime_type: mime_type.into(),
+            mime_type: normalize_mime_type(mime_type),
             description: None,
         }
     }

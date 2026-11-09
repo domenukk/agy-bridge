@@ -143,7 +143,7 @@ mod tests {
         drop(writer);
 
         let text = handle.text().await.expect("should succeed");
-        assert!(text.is_empty());
+        assert_eq!(&*text, "");
     }
 
     #[tokio::test]
@@ -319,7 +319,7 @@ mod tests {
         drop(writer);
 
         let text = handle.text().await.expect("should succeed");
-        assert!(text.is_empty());
+        assert_eq!(&*text, "");
     }
 
     #[tokio::test]
@@ -771,7 +771,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(handle.text()).unwrap();
         let s: String = result.into();
-        assert!(s.is_empty());
+        assert_eq!(s, "");
     }
 
     #[tokio::test]

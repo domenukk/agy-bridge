@@ -235,10 +235,15 @@ impl OnToolErrorContext {
     /// without matching on message strings.
     #[must_use]
     pub fn is_not_found(&self) -> bool {
-        self.metadata
-            .get(llm_tool::ToolError::ERROR_KIND_KEY)
-            .and_then(serde_json::Value::as_str)
-            == Some(llm_tool::ToolError::KIND_NOT_REGISTERED)
+        matches!(
+            &self.metadata,
+            serde_json::Value::Object(map)
+                if matches!(
+                    map.get(llm_tool::ToolError::ERROR_KIND_KEY),
+                    Some(serde_json::Value::String(kind))
+                        if kind == llm_tool::ToolError::KIND_NOT_REGISTERED
+                )
+        )
     }
 }
 /// Identifies the point in the agent lifecycle where a hook fires.

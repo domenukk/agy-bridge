@@ -321,18 +321,18 @@ fn test_step_minimal_deserialization() {
     assert_eq!(step.source, StepSource::Unknown);
     assert_eq!(step.target, StepTarget::Unknown);
     assert_eq!(step.status, StepStatus::Unknown);
-    assert!(step.content.is_empty());
-    assert!(step.content_delta.is_empty());
-    assert!(step.thinking.is_empty());
-    assert!(step.thinking_delta.is_empty());
-    assert!(step.tool_calls.is_empty());
-    assert!(step.error.is_empty());
+    assert_eq!(step.content, "");
+    assert_eq!(step.content_delta, "");
+    assert_eq!(step.thinking, "");
+    assert_eq!(step.thinking_delta, "");
+    assert_eq!(step.tool_calls.len(), 0);
+    assert_eq!(step.error, "");
     assert!(step.is_complete_response.is_none());
     assert!(step.structured_output.is_none());
     assert!(step.usage_metadata.is_none());
     // No trajectory info => defaults to a primary (non-subagent) step.
-    assert!(step.trajectory_id.is_empty());
-    assert!(step.cascade_id.is_empty());
+    assert_eq!(step.trajectory_id, "");
+    assert_eq!(step.cascade_id, "");
     assert!(!step.is_subagent_step());
 }
 

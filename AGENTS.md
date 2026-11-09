@@ -38,10 +38,12 @@ Rust caller ──▶ AgentHandle                                      localharn
 ### Workspace Crates & Directory Layout
 
 - `crates/agy-bridge/` — Primary published library crate (`agy-bridge`):
-  - `build.rs` — Compiles `proto/{content,skill,localharness}.proto` via
-    `prost-build` + `pbjson-build` and provisions the version-pinned
-    `localharness` binary (`TARGET_ANTIGRAVITY_SDK_VERSION = "0.1.22"`) into
+  - `build.rs` — Provisions the version-pinned `localharness` binary
+    (`TARGET_ANTIGRAVITY_SDK_VERSION = "0.1.23"`) into
     `~/.gemini/antigravity/bin/`.
+  - `src/proto/` — Pure-Rust `serde` (`ProtoJSON`) and binary Protobuf wire
+    handshake models for `genai`, `genai.skills`, and
+    `antigravity.localharness`.
   - `src/agent/` — `AgentHandle`, `AgentBuilder`, `AgentId`, and `MockRuntime`
     lifecycle (`create` → `chat` / `send` → `shutdown` / `disconnect` /
     `delete`).
@@ -82,18 +84,14 @@ Rust caller ──▶ AgentHandle                                      localharn
 
 ## 2. Golden Rules (The 12 Non-Negotiable Engineering Pillars)
 
-1. **No Unjustified Lint Suppressions at Any Scope**:
-   - Fix the underlying code rather than silencing warnings. File- or
-     module-level suppressions (`#![allow(...)]`, `#![expect(...)]`,
-     `# flake8: noqa`, `# type: ignore` blanket headers) and `lint_hygiene.py`
-     path allowlists are forbidden (except on generated protobuf bindings in
-     `src/proto/mod.rs`).
-   - **Escape hatch**: Only when a check is a genuine, locally unavoidable
-     false positive, place `// NOLINT: <specific reason>` on the line
-     immediately above the item. Bare `// NOLINT` without a reason and stale
-     `// NOLINT` comments fail `scripts/lint_hygiene.py`.
-   - **Non-suppressible structural lints (`suppressible=False`)**: Never
-     suppress `clippy::too_many_lines`, `clippy::too_many_arguments`,
+1. **Zero Lint Suppressions at Any Scope**:
+   - Fix the underlying code rather than silencing warnings. All Rust and Python
+     lint suppressions (`#[allow(...)]`, `#![allow(...)]`, `#[expect(...)]`,
+     `#![expect(...)]`, `# noqa`, `NOLINT` comments, `# type: ignore` blanket
+     headers) and `lint_hygiene.py` path allowlists are unconditionally banned
+     across production code, `build.rs`, examples, and tests (`#[cfg(test)]` /
+     `tests/`).
+   - Never suppress `clippy::too_many_lines`, `clippy::too_many_arguments`,
      `clippy::type_complexity`, `clippy::cognitive_complexity`, or
      `#[path = "..."]` module overrides. Refactor functions into helpers,
      introduce context structs, and use `<module>/mod.rs` + `<module>/tests.rs`
@@ -102,7 +100,7 @@ Rust caller ──▶ AgentHandle                                      localharn
    - Define protocol constants, wire enum values, environment variable names,
      default models, and timeouts as named constants (`pub const` / `const` in
      Rust, `Final` in Python).
-   - Never hardcode developer-specific paths (`/usr/local/google/home/...`,
+   - Never hardcode developer-specific paths (`/home/alice/...`,
      `/Users/...`) in source, tests, or documentation.
    - Never fabricate telemetry: represent unmeasured token counts or absent
      structured output as `Option::None`, and fail loudly on invalid or missing
@@ -112,7 +110,7 @@ Rust caller ──▶ AgentHandle                                      localharn
      never panic (`todo!()`, `unimplemented!()`, or unchecked `.unwrap()` in
      production paths).
    - **Never discard return values**: `let _ = ...` in Rust and `_ = fn()` in
-     Python are banned unless explicitly justified with `// NOLINT: <reason>`.
+     Python are banned; handle, assert, or propagate every result explicitly.
    - **Never silently swallow errors**: `.ok()`, `.is_ok()` / `.is_err()`
      outside boolean conditions/assertions, `.unwrap_or_default()`,
      `.unwrap_or(())`, `.unwrap_or(0)`, `.unwrap_or(false)`,
@@ -152,7 +150,8 @@ Rust caller ──▶ AgentHandle                                      localharn
      `capabilities`, `retry_config`, `budget`, `policies`, `hooks`, `tools`).
    - When `md-tmpl` (`feature = "md-tmpl"`) is used, keep prompt and tool
      templates in `.tmpl.md` files with multiline YAML frontmatter and
-     `untrusted str` / `sanitize` defenses for untrusted inputs.
+     safe-by-default `str` (untrusted) / `sanitize` defenses for untrusted
+     inputs (use `trusted str` only for trusted literals).
 7. **Boundary & Identifier Normalization**:
    - Normalize MCP server names (`sanitize_mcp_server_name`), environment keys,
      and workspace paths consistently at configuration boundaries.
@@ -195,8 +194,8 @@ Rust caller ──▶ AgentHandle                                      localharn
 
 | Language             | Typing & Data Modeling                                                                                                                   | Error & Resource Handling                                                                                                                                      | Linter / Formatter / Gate                                                                                                                                                                                    |
 | :------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Rust**             | Typed config builders (`TypedBuilder`), domain enums over `String`/`bool`, `#[llm_tool]`, `JsonSchema::from_schema::<T>()`, `fast_rands` | Typed `Error` (`thiserror`), zero `todo!()`/`unimplemented!()`/`let _ =`/`.ok()`/`.unwrap_or_default()` without `// NOLINT:`, deterministic child process reap | `cargo +nightly fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc`                                                                             |
-| **Python**           | Type annotations (`from __future__ import annotations`), `mypy --strict` on tooling, `google-antigravity>=0.1.22`                        | Specific exception handling, zero bare `except:` or silent `except Exception: pass`, zero `inspect.getsource()`                                                | `uv run black --check .`, `uv run ruff check .`, `uv run mypy --strict scripts/lint_hygiene.py`, `uv run mypy .`, `uv run python scripts/lint_hygiene.py`, `uv run pytest crates/agy-bridge/tests/python -q` |
+| **Rust**             | Typed config builders (`TypedBuilder`), domain enums over `String`/`bool`, `#[llm_tool]`, `JsonSchema::from_schema::<T>()`, `fast_rands` | Typed `Error` (`thiserror`), zero `todo!()`/`unimplemented!()`/`let _ =`/`.ok()`/`.unwrap_or_default()`, deterministic child process reap | `cargo +nightly fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc`                                                                             |
+| **Python**           | Type annotations (`from __future__ import annotations`), `mypy --strict` on tooling, `google-antigravity>=0.1.23`                        | Specific exception handling, zero bare `except:` or silent `except Exception: pass`, zero `inspect.getsource()`                                                | `uv run black --check .`, `uv run ruff check .`, `uv run mypy --strict scripts/lint_hygiene.py`, `uv run mypy .`, `uv run python scripts/lint_hygiene.py`, `uv run pytest crates/agy-bridge/tests/python -q` |
 | **TOML / MD / Just** | Workspace lint inheritance in `Cargo.toml`, synced `pyproject.toml` & `build.rs` SDK version                                             | Validated formatting and link structure across all manifests and docs                                                                                          | `taplo check`, `npx markdownlint-cli2 '**/*.md'`, `just --fmt --unstable --check`                                                                                                                            |
 
 ---

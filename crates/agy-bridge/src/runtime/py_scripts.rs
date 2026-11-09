@@ -116,6 +116,36 @@ pub fn to_dict_py<'py>(ob: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     }
 }
 
+const MEDIA_TYPES_MODULE: &str = "google.antigravity.types";
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OptionalStringField {
+    String(String),
+    NonString(serde::de::IgnoredAny),
+}
+
+impl OptionalStringField {
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::String(s) => Some(s),
+            Self::NonString(_) => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MediaObjectCandidate {
+    #[serde(default, rename = "type")]
+    media_type: Option<OptionalStringField>,
+    #[serde(default)]
+    data: Option<OptionalStringField>,
+    #[serde(default)]
+    mime_type: Option<OptionalStringField>,
+    #[serde(default)]
+    description: Option<OptionalStringField>,
+}
+
 fn decode_content_value<'py>(
     py: Python<'py>,
     value: &serde_json::Value,
@@ -136,31 +166,45 @@ fn decode_content_value<'py>(
             Ok(py_list.into_any())
         }
         serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::String(typ)) = map.get("type")
-                && matches!(typ.as_str(), "Image" | "Document" | "Audio" | "Video")
-            {
-                let data_b64 = map.get("data").and_then(|v| v.as_str()).ok_or_else(|| {
+            let candidate =
+                serde_json::from_value::<MediaObjectCandidate>(value.clone()).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!(
-                        "{typ} content is missing required 'data' field"
+                        "Failed to inspect media object candidate: {e}"
                     ))
                 })?;
+            if let Some(typ) = candidate
+                .media_type
+                .and_then(OptionalStringField::into_string)
+                && matches!(typ.as_str(), "Image" | "Document" | "Audio" | "Video")
+            {
+                let data_b64 = candidate
+                    .data
+                    .and_then(OptionalStringField::into_string)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "{typ} content is missing required 'data' field"
+                        ))
+                    })?;
                 let raw_bytes = STANDARD.decode(data_b64).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!("Invalid base64: {e}"))
                 })?;
-                let mime_type = map
-                    .get("mime_type")
-                    .and_then(|v| v.as_str())
+                let mime_type = candidate
+                    .mime_type
+                    .and_then(OptionalStringField::into_string)
                     .ok_or_else(|| {
                         pyo3::exceptions::PyValueError::new_err(format!(
                             "{typ} content is missing required 'mime_type' field"
                         ))
                     })?;
 
-                let types_mod = import_serialized(py, "google.antigravity.types")?;
+                let types_mod = import_serialized(py, MEDIA_TYPES_MODULE)?;
                 let kwargs = pyo3::types::PyDict::new(py);
                 kwargs.set_item("data", pyo3::types::PyBytes::new(py, &raw_bytes))?;
                 kwargs.set_item("mime_type", mime_type)?;
-                if let Some(serde_json::Value::String(desc)) = map.get("description") {
+                if let Some(desc) = candidate
+                    .description
+                    .and_then(OptionalStringField::into_string)
+                {
                     kwargs.set_item("description", desc)?;
                 }
                 let obj = types_mod.getattr(typ.as_str())?.call((), Some(&kwargs))?;

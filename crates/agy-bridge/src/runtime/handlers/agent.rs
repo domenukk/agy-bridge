@@ -313,10 +313,10 @@ fn warn_missing_tool_metadata(infos: &[RawToolInfo]) {
                 "Tool has no description — consider adding a docstring"
             );
         }
-        let schema_is_empty_object = info
-            .parameter_schema
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty);
+        let schema_is_empty_object = matches!(
+            &info.parameter_schema,
+            serde_json::Value::Object(map) if map.is_empty()
+        );
         if info.parameter_schema.is_null() || schema_is_empty_object {
             tracing::warn!(
                 tool = %info.name,

@@ -395,7 +395,7 @@ async fn dispatch_output_event(
                 turn_activity: &ctx.turn_activity,
                 compaction_indices: &ctx.compaction_indices,
             };
-            handle_step_update(agent_id, step_update, &step_ctx).await;
+            handle_step_update(agent_id, *step_update, &step_ctx).await;
         }
         proto::localharness::output_event::Event::ToolCall(tool_call) => {
             let tool_ctx = ToolCallDispatchContext {

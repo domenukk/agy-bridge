@@ -164,7 +164,7 @@ fn test_dispatch_pre_turn_and_pre_tool_hooks() {
         name: "pre_turn".to_string(),
         r#type: 3,
         client_id: String::new(),
-        args: Some(proto::localharness::call_hook_request::Args::PreTurnArgs(
+        args: Some(proto::localharness::call_hook_request::Args::PreTurn(
             proto::localharness::PreTurnArgs {
                 user_input: Some(proto::localharness::UserInput {
                     parts: vec![proto::localharness::user_input::Part {
@@ -179,7 +179,7 @@ fn test_dispatch_pre_turn_and_pre_tool_hooks() {
     };
     let turn_outcome = dispatch_pre_turn_hook(&hooks, &turn_req, 1);
     match turn_outcome {
-        proto::localharness::call_hook_response::Result::PreTurnResult(res) => {
+        proto::localharness::call_hook_response::Result::PreTurn(res) => {
             assert_eq!(res.decision, 1); // ALLOW
         }
         other => panic!("Expected PreTurnResult, got: {other:?}"),
@@ -190,7 +190,7 @@ fn test_dispatch_pre_turn_and_pre_tool_hooks() {
         name: "pre_tool".to_string(),
         r#type: 5,
         client_id: String::new(),
-        args: Some(proto::localharness::call_hook_request::Args::PreToolArgs(
+        args: Some(proto::localharness::call_hook_request::Args::PreTool(
             proto::localharness::PreToolArgs {
                 tool_name: "write_file".to_string(),
                 arguments_json: "{}".to_string(),
@@ -203,7 +203,7 @@ fn test_dispatch_pre_turn_and_pre_tool_hooks() {
     };
     let tool_outcome = dispatch_pre_tool_hook(&hooks, &tool_req);
     match tool_outcome {
-        proto::localharness::call_hook_response::Result::PreToolResult(res) => {
+        proto::localharness::call_hook_response::Result::PreTool(res) => {
             assert_eq!(res.decision, 2); // DENY
             assert_eq!(res.reason, "blocked");
         }
@@ -272,7 +272,7 @@ async fn test_compaction_step_and_hook_dispatch() {
     let res = dispatch_on_compaction_hook(&hooks);
     assert!(matches!(
         res,
-        proto::localharness::call_hook_response::Result::EmptyResult(_)
+        proto::localharness::call_hook_response::Result::Empty(_)
     ));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
 

@@ -60,73 +60,7 @@ impl TriggerConfig {
     /// Minimum allowed interval for an `Every` trigger.
     const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-    /// Create an `Every` trigger from a number of seconds.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `secs` is 0.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use `try_every(Duration::from_secs(secs))` instead, which returns Result"
-    )]
-    #[must_use]
-    pub const fn every_secs(secs: u64) -> Self {
-        assert!(secs >= 1, "trigger interval must be at least 1 second");
-        Self::Every {
-            interval: Duration::from_secs(secs),
-        }
-    }
-
-    /// Create an `Every` trigger with a specific Duration.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the duration is less than 1 second.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use `try_every()` instead, which returns Result"
-    )]
-    #[must_use]
-    pub fn every(duration: Duration) -> Self {
-        assert!(
-            duration >= Self::MIN_INTERVAL,
-            "trigger interval must be at least 1 second, got {duration:?}"
-        );
-        Self::Every { interval: duration }
-    }
-
     /// Create an `OnFileChange` trigger watching the given directory.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `path` is empty, relative, or contains `..`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use `try_on_file_change()` instead, which returns Result"
-    )]
-    #[must_use]
-    pub fn on_file_change(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        assert!(
-            !path.as_os_str().is_empty(),
-            "on_file_change path must not be empty"
-        );
-        assert!(
-            path.has_root(),
-            "on_file_change path must be absolute, got: {}",
-            path.display()
-        );
-        assert!(
-            !path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir),
-            "on_file_change path must not contain '..', got: {}",
-            path.display()
-        );
-        Self::OnFileChange { path }
-    }
-
-    /// Fallible version of [`on_file_change`](Self::on_file_change).
     ///
     /// # Errors
     ///
@@ -161,7 +95,7 @@ impl TriggerConfig {
         Ok(Self::OnFileChange { path })
     }
 
-    /// Fallible version of [`every`](Self::every).
+    /// Create an `Every` trigger with a specific [`Duration`].
     ///
     /// # Errors
     ///
@@ -173,6 +107,15 @@ impl TriggerConfig {
             });
         }
         Ok(Self::Every { interval: duration })
+    }
+
+    /// Create an `Every` trigger from a number of whole seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] if `secs` is `0`.
+    pub fn try_every_secs(secs: u64) -> Result<Self, Error> {
+        Self::try_every(Duration::from_secs(secs))
     }
 
     /// Human-readable description for logging.
@@ -438,26 +381,32 @@ mod duration_secs {
 }
 
 #[cfg(test)]
-// NOLINT: tests must exercise the deprecated constructors until they are removed.
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
+    fn every_secs(secs: u64) -> TriggerConfig {
+        TriggerConfig::try_every_secs(secs).expect("valid every_secs interval")
+    }
+
+    fn on_file_change(path: &str) -> TriggerConfig {
+        TriggerConfig::try_on_file_change(path).expect("valid on_file_change path")
+    }
+
     #[test]
     fn every_trigger_description() {
-        let t = TriggerConfig::every_secs(30);
+        let t = every_secs(30);
         assert_eq!(t.description(), "every(30s)");
     }
 
     #[test]
     fn on_file_change_trigger_description() {
-        let t = TriggerConfig::on_file_change("/workspace/threads");
+        let t = on_file_change("/workspace/threads");
         assert_eq!(t.description(), "on_file_change(/workspace/threads)");
     }
 
     #[test]
     fn every_fires_at_expected_interval() {
-        let t = TriggerConfig::every_secs(60);
+        let t = every_secs(60);
         match t {
             TriggerConfig::Every { interval } => {
                 assert_eq!(interval, Duration::from_mins(1));
@@ -470,7 +419,7 @@ mod tests {
 
     #[test]
     fn on_file_change_detects_path() {
-        let t = TriggerConfig::on_file_change("/workspace/sessions/bug123/threads");
+        let t = on_file_change("/workspace/sessions/bug123/threads");
         match t {
             TriggerConfig::OnFileChange { path } => {
                 assert_eq!(path, PathBuf::from("/workspace/sessions/bug123/threads"));
@@ -483,10 +432,7 @@ mod tests {
 
     #[test]
     fn trigger_config_serde_roundtrip() {
-        let configs = vec![
-            TriggerConfig::every_secs(10),
-            TriggerConfig::on_file_change("/tmp/watch"),
-        ];
+        let configs = vec![every_secs(10), on_file_change("/tmp/watch")];
         for config in &configs {
             let json = serde_json::to_string(config).expect("serialize");
             let parsed: TriggerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -501,13 +447,13 @@ mod tests {
 
         set.push(TriggerEntry {
             name: "poll_threads".to_owned(),
-            config: TriggerConfig::every_secs(30),
+            config: every_secs(30),
             message_template: "Check threads for updates".to_owned(),
         })
         .unwrap();
         set.push(TriggerEntry {
             name: "watch_threads".to_owned(),
-            config: TriggerConfig::on_file_change("/workspace/threads"),
+            config: on_file_change("/workspace/threads"),
             message_template: "New files in threads: {changes}".to_owned(),
         })
         .unwrap();
@@ -521,7 +467,7 @@ mod tests {
     fn trigger_entry_serde_roundtrip() {
         let entry = TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(15),
+            config: every_secs(15),
             message_template: "time to poll".to_owned(),
         };
         let json = serde_json::to_string(&entry).expect("serialize");
@@ -536,13 +482,13 @@ mod tests {
         let mut set = TriggerSet::new();
         set.push(TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(60),
+            config: every_secs(60),
             message_template: "poll now".to_owned(),
         })
         .unwrap();
         set.push(TriggerEntry {
             name: "watch".to_owned(),
-            config: TriggerConfig::on_file_change("/tmp"),
+            config: on_file_change("/tmp"),
             message_template: "files changed: {changes}".to_owned(),
         })
         .unwrap();
@@ -558,7 +504,7 @@ mod tests {
         let mut set = TriggerSet::new();
         set.push(TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(60),
+            config: every_secs(60),
             message_template: "poll now".to_owned(),
         })
         .unwrap();
@@ -573,7 +519,7 @@ mod tests {
 
         let entry = TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(60),
+            config: every_secs(60),
             message_template: "poll now".to_owned(),
         };
         let set_from_arr = TriggerSet::from([entry.clone()]);
@@ -587,7 +533,7 @@ mod tests {
     fn try_from_vec_valid_entries() {
         let entries = vec![TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(60),
+            config: every_secs(60),
             message_template: "poll now".to_owned(),
         }];
         let set = TriggerSet::try_from_iter(entries).expect("valid entries");
@@ -598,7 +544,7 @@ mod tests {
     fn try_from_iter_array_valid_entries() {
         let entry = TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(60),
+            config: every_secs(60),
             message_template: "poll now".to_owned(),
         };
         let set = TriggerSet::try_from_iter([entry]).expect("valid entries");
@@ -609,7 +555,7 @@ mod tests {
     fn try_from_iter_array_invalid_entry_is_err() {
         let entry = TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(10),
+            config: every_secs(10),
             message_template: "  ".to_owned(),
         };
         assert!(TriggerSet::try_from_iter([entry]).is_err());
@@ -620,12 +566,12 @@ mod tests {
         let entries = vec![
             TriggerEntry {
                 name: "poll".to_owned(),
-                config: TriggerConfig::every_secs(60),
+                config: every_secs(60),
                 message_template: "poll now".to_owned(),
             },
             TriggerEntry {
                 name: String::new(),
-                config: TriggerConfig::every_secs(10),
+                config: every_secs(10),
                 message_template: "msg".to_owned(),
             },
         ];
@@ -640,20 +586,29 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "trigger interval must be at least 1 second")]
-    fn every_trigger_zero_seconds_panics() {
-        eprintln!("{:?}", TriggerConfig::every_secs(0));
+    fn every_trigger_zero_seconds_rejected() {
+        let err = TriggerConfig::try_every_secs(0).expect_err("zero seconds must be rejected");
+        assert!(
+            err.to_string()
+                .contains("trigger interval must be at least 1 second"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "trigger interval must be at least 1 second")]
-    fn every_trigger_sub_second_panics() {
-        eprintln!("{:?}", TriggerConfig::every(Duration::from_millis(500)));
+    fn every_trigger_sub_second_rejected() {
+        let err = TriggerConfig::try_every(Duration::from_millis(500))
+            .expect_err("sub-second interval must be rejected");
+        assert!(
+            err.to_string()
+                .contains("trigger interval must be at least 1 second"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn duration_secs_serializes_as_number() {
-        let config = TriggerConfig::every_secs(120);
+        let config = every_secs(120);
         let json = serde_json::to_string(&config).expect("serialize");
         // The interval should serialize as a number
         assert!(json.contains("120"), "Expected '120' in {json}");
@@ -666,7 +621,7 @@ mod tests {
         let json = r#"{"Every":{"interval":0.5}}"#;
         let err = serde_json::from_str::<TriggerConfig>(json)
             .expect_err("Sub-second interval should be rejected during deserialization");
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     #[test]
@@ -700,23 +655,34 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "on_file_change path must not be empty")]
-    fn on_file_change_empty_path_panics() {
-        eprintln!("{:?}", TriggerConfig::on_file_change(""));
+    fn on_file_change_empty_path_rejected_with_message() {
+        let err = TriggerConfig::try_on_file_change("").expect_err("empty path must fail");
+        assert!(
+            err.to_string()
+                .contains("on_file_change path must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "on_file_change path must be absolute")]
-    fn on_file_change_relative_path_panics() {
-        eprintln!("{:?}", TriggerConfig::on_file_change("relative/path"));
+    fn on_file_change_relative_path_rejected_with_message() {
+        let err = TriggerConfig::try_on_file_change("relative/path")
+            .expect_err("relative path must fail");
+        assert!(
+            err.to_string()
+                .contains("on_file_change path must be absolute"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "on_file_change path must not contain '..'")]
-    fn on_file_change_parent_traversal_panics() {
-        eprintln!(
-            "{:?}",
-            TriggerConfig::on_file_change("/workspace/../etc/passwd")
+    fn on_file_change_parent_traversal_rejected_with_message() {
+        let err = TriggerConfig::try_on_file_change("/workspace/../etc/passwd")
+            .expect_err("parent traversal must fail");
+        assert!(
+            err.to_string()
+                .contains("on_file_change path must not contain '..'"),
+            "unexpected error: {err}"
         );
     }
 
@@ -724,7 +690,7 @@ mod tests {
     fn trigger_entry_validate_empty_name() {
         let entry = TriggerEntry {
             name: "  ".to_owned(),
-            config: TriggerConfig::every_secs(10),
+            config: every_secs(10),
             message_template: "msg".to_owned(),
         };
         assert!(entry.validate().is_err());
@@ -734,7 +700,7 @@ mod tests {
     fn trigger_entry_validate_empty_template() {
         let entry = TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(10),
+            config: every_secs(10),
             message_template: "  ".to_owned(),
         };
         assert!(entry.validate().is_err());
@@ -744,7 +710,7 @@ mod tests {
     fn trigger_entry_validate_ok() {
         let entry = TriggerEntry {
             name: "poll".to_owned(),
-            config: TriggerConfig::every_secs(10),
+            config: every_secs(10),
             message_template: "poll now".to_owned(),
         };
         assert!(entry.validate().is_ok());
@@ -752,25 +718,16 @@ mod tests {
 
     #[test]
     fn trigger_config_equality() {
-        assert_eq!(TriggerConfig::every_secs(30), TriggerConfig::every_secs(30));
-        assert_ne!(TriggerConfig::every_secs(30), TriggerConfig::every_secs(60));
-        assert_ne!(
-            TriggerConfig::every_secs(30),
-            TriggerConfig::on_file_change("/tmp")
-        );
-        assert_eq!(
-            TriggerConfig::on_file_change("/a"),
-            TriggerConfig::on_file_change("/a")
-        );
-        assert_ne!(
-            TriggerConfig::on_file_change("/a"),
-            TriggerConfig::on_file_change("/b")
-        );
+        assert_eq!(every_secs(30), every_secs(30));
+        assert_ne!(every_secs(30), every_secs(60));
+        assert_ne!(every_secs(30), on_file_change("/tmp"));
+        assert_eq!(on_file_change("/a"), on_file_change("/a"));
+        assert_ne!(on_file_change("/a"), on_file_change("/b"));
     }
 
     #[test]
     fn trigger_large_interval() {
-        let t = TriggerConfig::every_secs(86400); // 24h
+        let t = every_secs(86400); // 24h
         assert_eq!(t.description(), "every(86400s)");
     }
 

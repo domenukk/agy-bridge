@@ -105,7 +105,7 @@ fn test_policy_set_validated_from_rejects_invalid() {
         PolicyRule::DenyAll,
     ])
     .expect_err("Expected validation error for empty tool name");
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 }
 
 #[test]

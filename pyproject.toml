@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
   # Needed by `cargo test --features python`: the embedded interpreter imports
   # `google.antigravity.*`, and the SDK pulls in `watchfiles` for triggers.
-  "google-antigravity>=0.1.22",
+  "google-antigravity>=0.1.23",
   "watchfiles",
 ]
 

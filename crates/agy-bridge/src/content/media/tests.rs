@@ -614,3 +614,32 @@ fn mime_from_extension_unknown_returns_none() {
     assert_eq!(mime::from_extension("tga"), None);
     assert_eq!(mime::from_extension(""), None);
 }
+
+#[test]
+fn media_constructors_normalize_mime_types() {
+    let img = Image::new(vec![1], "  Image/PNG \n");
+    assert_eq!(img.mime_type, "image/png");
+    let doc = Document::new(vec![2], "\tApplication/PDF ");
+    assert_eq!(doc.mime_type, "application/pdf");
+    let audio = Audio::new(vec![3], " AUDIO/MPEG ");
+    assert_eq!(audio.mime_type, "audio/mpeg");
+    let video = Video::new(vec![4], " Video/MP4\r\n");
+    assert_eq!(video.mime_type, "video/mp4");
+}
+
+#[test]
+fn expand_tilde_resolves_home_prefix() {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(home_dir) = home {
+        let expected_root = std::path::PathBuf::from(&home_dir);
+        assert_eq!(expand_tilde(std::path::Path::new("~")), expected_root);
+        assert_eq!(
+            expand_tilde(std::path::Path::new("~/sub/photo.png")),
+            expected_root.join("sub/photo.png")
+        );
+    }
+    assert_eq!(
+        expand_tilde(std::path::Path::new("/abs/photo.png")),
+        std::path::PathBuf::from("/abs/photo.png")
+    );
+}

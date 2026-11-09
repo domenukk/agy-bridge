@@ -22,6 +22,61 @@ struct MediaPayload<'a> {
     description: Option<&'a str>,
 }
 
+impl<'a> MediaPayload<'a> {
+    fn from_media<T: MediaContent>(media: &'a T) -> Self {
+        Self {
+            media_type: T::TYPE_NAME,
+            data: BASE64.encode(media.data()),
+            mime_type: media.mime_type(),
+            description: media.description(),
+        }
+    }
+}
+
+/// Wire representation of a single [`ContentPrimitive`] without intermediate `Value` allocation.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum PrimitiveWire<'a> {
+    Text(&'a str),
+    Media(MediaPayload<'a>),
+}
+
+impl<'a> From<&'a ContentPrimitive> for PrimitiveWire<'a> {
+    fn from(prim: &'a ContentPrimitive) -> Self {
+        match prim {
+            ContentPrimitive::Text { text } => Self::Text(text),
+            ContentPrimitive::Image(m) => Self::Media(MediaPayload::from_media(m)),
+            ContentPrimitive::Document(m) => Self::Media(MediaPayload::from_media(m)),
+            ContentPrimitive::Audio(m) => Self::Media(MediaPayload::from_media(m)),
+            ContentPrimitive::Video(m) => Self::Media(MediaPayload::from_media(m)),
+        }
+    }
+}
+
+/// Wire representation of [`Content`] for the Python helper script.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ContentWire<'a> {
+    Text(&'a str),
+    Media(MediaPayload<'a>),
+    Multi(Vec<PrimitiveWire<'a>>),
+}
+
+impl<'a> From<&'a Content> for ContentWire<'a> {
+    fn from(content: &'a Content) -> Self {
+        match content {
+            Content::Text { text } => Self::Text(text),
+            Content::Image(m) => Self::Media(MediaPayload::from_media(m)),
+            Content::Document(m) => Self::Media(MediaPayload::from_media(m)),
+            Content::Audio(m) => Self::Media(MediaPayload::from_media(m)),
+            Content::Video(m) => Self::Media(MediaPayload::from_media(m)),
+            Content::Multi { parts } => {
+                Self::Multi(parts.iter().map(PrimitiveWire::from).collect())
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Python-side serialization helpers
 // =============================================================================
@@ -38,84 +93,10 @@ struct MediaPayload<'a> {
 ///
 /// Returns [`Error::BackendError`] if serialization fails.
 pub(crate) fn content_to_json(content: &Content) -> Result<String, crate::error::Error> {
-    let value = content_to_value(content).map_err(|e| crate::error::Error::BackendError {
-        message: format!("Content serialization failed: {e}"),
-    })?;
-    serde_json::to_string(&value).map_err(|e| crate::error::Error::BackendError {
+    let wire = ContentWire::from(content);
+    serde_json::to_string(&wire).map_err(|e| crate::error::Error::BackendError {
         message: format!("Content JSON encoding failed: {e}"),
     })
-}
-
-/// Convert a [`Content`] to a `serde_json::Value` for the Python helper.
-///
-/// # Errors
-///
-/// Returns `serde_json::Error` if any media payload fails to serialize.
-pub(crate) fn content_to_value(content: &Content) -> Result<serde_json::Value, serde_json::Error> {
-    match content {
-        Content::Text { text } => Ok(serde_json::Value::String(text.clone())),
-        Content::Image(m) => serialize_typed_media(m),
-        Content::Document(m) => serialize_typed_media(m),
-        Content::Audio(m) => serialize_typed_media(m),
-        Content::Video(m) => serialize_typed_media(m),
-        Content::Multi { parts } => {
-            let items: Result<Vec<serde_json::Value>, _> =
-                parts.iter().map(serialize_primitive).collect();
-            items.map(serde_json::Value::Array)
-        }
-    }
-}
-
-/// Convert a [`ContentPrimitive`] to a `serde_json::Value`.
-///
-/// # Errors
-///
-/// Returns `serde_json::Error` if the media payload fails to serialize.
-fn serialize_primitive(prim: &ContentPrimitive) -> Result<serde_json::Value, serde_json::Error> {
-    match prim {
-        ContentPrimitive::Text { text } => Ok(serde_json::Value::String(text.clone())),
-        ContentPrimitive::Image(m) => serialize_typed_media(m),
-        ContentPrimitive::Document(m) => serialize_typed_media(m),
-        ContentPrimitive::Audio(m) => serialize_typed_media(m),
-        ContentPrimitive::Video(m) => serialize_typed_media(m),
-    }
-}
-
-/// Serialize any [`MediaContent`] implementor to a JSON value with
-/// base64-encoded data.
-///
-/// # Errors
-///
-/// Returns `serde_json::Error` if the payload fails to serialize.
-fn serialize_typed_media<T: MediaContent>(
-    media: &T,
-) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_media(
-        T::TYPE_NAME,
-        media.data(),
-        media.mime_type(),
-        media.description(),
-    )
-}
-
-/// Build a JSON value for a media primitive with base64-encoded data.
-///
-/// # Errors
-///
-/// Returns `serde_json::Error` if `serde_json::to_value` fails.
-fn serialize_media(
-    type_name: &str,
-    data: &[u8],
-    mime_type: &str,
-    description: Option<&str>,
-) -> Result<serde_json::Value, serde_json::Error> {
-    let payload = MediaPayload {
-        media_type: type_name,
-        data: BASE64.encode(data),
-        mime_type,
-        description,
-    };
-    serde_json::to_value(&payload)
 }
 
 #[cfg(test)]

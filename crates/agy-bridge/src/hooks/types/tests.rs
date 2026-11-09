@@ -6,7 +6,7 @@ use super::*;
 fn hook_result_allow() {
     let r = HookResult::allow();
     assert!(r.allow);
-    assert!(r.message.is_empty());
+    assert_eq!(r.message, "");
 }
 
 #[test]
