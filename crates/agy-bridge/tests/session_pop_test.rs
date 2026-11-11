@@ -34,6 +34,7 @@
 //! ```sh
 //! cargo test --test session_pop_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge_test_support::*;
 

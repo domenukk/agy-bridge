@@ -13,7 +13,7 @@ use crate::{
     hooks::{Hooks, PreToolCallDecideContext},
     proto,
     runtime::bridge_state::bridge_state,
-    streaming::{ChatResponseWriter, ResponseEvent, StreamChunk, ToolCallEvent},
+    streaming::{ChatResponseWriter, ResponseEvent, ToolCallEvent},
     tools::{ToolContext, ToolRegistry},
     types::{
         ConversationMessage, MessageRole, Step, StepSource, StepStatus, StepType, UsageMetadata,
@@ -220,27 +220,7 @@ async fn dispatch_text_delta(
 ) {
     let guard = active_writer_clone.lock().await;
     if let Some(ref writer) = *guard {
-        ChatResponseWriter::fan_out(
-            &writer.subs.text,
-            &writer.text_tx,
-            delta.to_string(),
-            "text",
-        )
-        .await;
-        ChatResponseWriter::fan_out(
-            &writer.subs.chunk,
-            &writer.chunk_tx,
-            StreamChunk::Text(delta.to_string()),
-            "chunk",
-        )
-        .await;
-        ChatResponseWriter::fan_out(
-            &writer.subs.event,
-            &writer.event_tx,
-            ResponseEvent::TextChunk(delta.to_string()),
-            "event",
-        )
-        .await;
+        writer.emit_text(delta).await;
     }
 }
 
@@ -250,27 +230,7 @@ async fn dispatch_thinking_delta(
 ) {
     let guard = active_writer_clone.lock().await;
     if let Some(ref writer) = *guard {
-        ChatResponseWriter::fan_out(
-            &writer.subs.thought,
-            &writer.thought_tx,
-            delta.to_string(),
-            "thought",
-        )
-        .await;
-        ChatResponseWriter::fan_out(
-            &writer.subs.chunk,
-            &writer.chunk_tx,
-            StreamChunk::Thought(delta.to_string()),
-            "chunk",
-        )
-        .await;
-        ChatResponseWriter::fan_out(
-            &writer.subs.event,
-            &writer.event_tx,
-            ResponseEvent::ThoughtChunk(delta.to_string()),
-            "event",
-        )
-        .await;
+        writer.emit_thought(delta).await;
     }
 }
 
@@ -403,7 +363,7 @@ pub(crate) async fn handle_step_update(
     let step = to_domain_step(&step_update);
     let guard = ctx.active_writer.lock().await;
     if let Some(ref writer) = *guard {
-        ChatResponseWriter::fan_out(&writer.subs.step, &writer.step_tx, step, "step").await;
+        writer.emit_step(step).await;
     }
 }
 
@@ -422,27 +382,7 @@ async fn emit_tool_call_stream_events(
             id: Some(call_id.to_string()),
             canonical_path: normalized.canonical_path,
         };
-        ChatResponseWriter::fan_out(
-            &writer.subs.tool_call,
-            &writer.tool_call_tx,
-            tc_event.clone(),
-            "tool_call",
-        )
-        .await;
-        ChatResponseWriter::fan_out(
-            &writer.subs.chunk,
-            &writer.chunk_tx,
-            StreamChunk::ToolCall(tc_event.clone()),
-            "chunk",
-        )
-        .await;
-        ChatResponseWriter::fan_out(
-            &writer.subs.event,
-            &writer.event_tx,
-            ResponseEvent::ToolCall(tc_event),
-            "event",
-        )
-        .await;
+        writer.emit_tool_call(tc_event).await;
     }
 }
 
@@ -605,13 +545,9 @@ async fn emit_tool_result_event(
         result: parse_json_or_null(response_json, "emit_tool_result_event"),
         error: (!error_msg.is_empty()).then(|| error_msg.to_string()),
     };
-    ChatResponseWriter::fan_out(
-        &writer.subs.event,
-        &writer.event_tx,
-        ResponseEvent::ToolResult(tool_result),
-        "event",
-    )
-    .await;
+    writer
+        .emit_event(ResponseEvent::ToolResult(tool_result))
+        .await;
 }
 
 /// End the active turn after a `finish_on_tools` tool succeeded.

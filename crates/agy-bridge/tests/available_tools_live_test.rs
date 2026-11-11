@@ -8,6 +8,7 @@
 //! ```sh
 //! GEMINI_API_KEY="..." cargo test --test available_tools_live_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 mod common;
 

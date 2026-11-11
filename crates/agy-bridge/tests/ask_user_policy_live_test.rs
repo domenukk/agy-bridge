@@ -5,6 +5,7 @@
 //! 2. The Python policy helper delegates the confirmation back to the Rust-registered `AskUserHandler` via `PyO3`.
 //! 3. Allowing the confirmation successfully proceeds with tool execution.
 //! 4. Denying the confirmation blocks tool execution and returns a denial error.
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::{
     config::AgentConfig,

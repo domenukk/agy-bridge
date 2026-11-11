@@ -310,6 +310,7 @@ fn test_python_sdk_v017_types() {
 }
 
 #[test]
+#[cfg(any(feature = "native", feature = "python"))]
 fn test_v017_lightweight_compaction_budget_retry_mock_server_turn() {
     use agy_bridge::{
         config::{
@@ -480,6 +481,7 @@ fn test_v0_1_22_sdk_features_roundtrip() {
     assert_eq!(wf_parsed, wf);
 }
 
+#[cfg(any(feature = "native", feature = "python"))]
 fn v0_1_22_agent_config(base_url: String) -> AgentConfig {
     use agy_bridge::{
         BuiltinTools, ConversationMessage, InlineSkill, MessageRole, SubagentConfig,
@@ -562,6 +564,7 @@ fn v0_1_22_agent_config(base_url: String) -> AgentConfig {
 }
 
 #[test]
+#[cfg(any(feature = "native", feature = "python"))]
 fn test_v0_1_22_real_localharness_turn_with_inline_skills_and_compaction() {
     use agy_bridge_test_support::*;
 

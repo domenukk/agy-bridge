@@ -3,12 +3,14 @@
 Rust client for the
 [Google Antigravity SDK](https://github.com/Google-Antigravity/antigravity-sdk-python).
 
-Supports two backends with the same API:
+Supports three backend modes with the same API:
 
 - **`native` (default)**: Pure Rust client that talks directly to the
   `localharness` binary. No Python or `protoc` required.
 - **`python`**: Calls the Python `google-antigravity` package via
   [PyO3](https://pyo3.rs).
+- **Custom `Runtime` (`default-features = false`)**: Plug in an external
+  `Runtime` crate (such as `flm-agy-bridge`) via `AgyBridge::with_runtime`.
 
 ## Installation
 
@@ -46,6 +48,31 @@ pip install google-antigravity watchfiles
 
 > `watchfiles` is only needed for file-change triggers; timer triggers
 > work without it.
+
+### Option 3: Custom Runtime (`default-features = false`)
+
+Disable both built-in backends when supplying an external
+`agy_bridge::agent::Runtime` implementation (such as `flm-agy-bridge`):
+
+```toml
+[dependencies]
+agy-bridge = { version = "0.16", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Construct the bridge with `AgyBridge::with_runtime(...)`:
+
+```rust,no_run
+use agy_bridge::{AgyBridge, agent::Runtime, error::Error};
+
+async fn run_with_backend<R: Runtime + 'static>(runtime: R) -> Result<(), Error> {
+    let bridge = AgyBridge::with_runtime(runtime);
+    let agent = bridge.default_agent().await?;
+    let reply = agent.chat_text("Hello!").await?;
+    println!("{reply}");
+    agent.shutdown().await
+}
+```
 
 ### API Key & Endpoint Setup
 

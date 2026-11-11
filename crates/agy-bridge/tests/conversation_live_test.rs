@@ -5,6 +5,7 @@
 //! ```sh
 //! GEMINI_API_KEY="..." cargo test --test conversation_live_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::tools::JsonSchema;
 use serde::Deserialize;

@@ -137,6 +137,11 @@ jobs:
           AGY_BRIDGE_SKIP_LIVE_TESTS: "1"
         run: just test-native
 
+      - name: Run custom-runtime (--no-default-features) tests
+        env:
+          AGY_BRIDGE_SKIP_LIVE_TESTS: "1"
+        run: just test-no-default-features
+
       # The default feature set (`native`) is what downstream users get, and
       # it is the only configuration that exercises the README doctests.
       - name: Run default-feature workspace tests

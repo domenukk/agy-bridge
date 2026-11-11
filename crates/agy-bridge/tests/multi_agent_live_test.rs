@@ -1,3 +1,5 @@
+#![cfg(any(feature = "native", feature = "python"))]
+
 mod common;
 
 /// Returns the effective base URL for live test agents.

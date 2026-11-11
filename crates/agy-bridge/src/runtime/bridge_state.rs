@@ -29,7 +29,8 @@ impl std::fmt::Display for AgentId {
 static AGENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Allocate a new, process-globally-unique agent ID.
-pub(crate) fn next_agent_id() -> u64 {
+#[must_use]
+pub fn next_agent_id() -> u64 {
     AGENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -76,29 +77,25 @@ pub(crate) struct AgentBridgeState {
     /// Cached structured output from the most recent successful custom tool
     /// call on this agent.
     ///
-    /// When a Rust tool returns `Ok(ToolOutput)` in the native backend, its
-    /// arguments and structured metadata are stored here so that the
-    /// subsequent `PostTool` hook request from `localharness` can enrich
-    /// [`PostToolCallContext`](crate::hooks::PostToolCallContext) with the full
-    /// structured metadata and arguments.
-    #[cfg(feature = "native")]
+    /// When a Rust tool returns `Ok(ToolOutput)`, its arguments and structured
+    /// metadata are stored here so that the subsequent post-tool hook dispatch
+    /// can enrich [`PostToolCallContext`](crate::hooks::PostToolCallContext)
+    /// with the full structured metadata and arguments.
     pub(crate) last_tool_output: std::sync::Mutex<Option<CapturedToolOutput>>,
 }
 
 /// Structured snapshot of the most recent successful custom tool dispatch.
-#[cfg(feature = "native")]
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CapturedToolOutput {
+pub struct CapturedToolOutput {
     /// Arguments the tool was invoked with.
-    pub(crate) tool_args: serde_json::Value,
+    pub tool_args: serde_json::Value,
     /// Structured [`ToolOutput`](llm_tool::ToolOutput) metadata (`Null` when empty).
-    pub(crate) metadata: serde_json::Value,
+    pub metadata: serde_json::Value,
 }
 
 /// Cache `(tool_args, metadata)` from a successful custom tool call in the
-/// agent's [`last_tool_output`](AgentBridgeState::last_tool_output) slot.
-#[cfg(feature = "native")]
-pub(crate) fn record_last_tool_output(
+/// agent's last-tool-output slot.
+pub fn record_last_tool_output(
     agent_id: u64,
     tool_args: serde_json::Value,
     metadata: serde_json::Value,
@@ -111,16 +108,14 @@ pub(crate) fn record_last_tool_output(
     });
 }
 
-/// Remove and return the agent's cached
-/// [`last_tool_output`](AgentBridgeState::last_tool_output), if present.
-#[cfg(feature = "native")]
-pub(crate) fn take_last_tool_output(agent_id: u64) -> Option<CapturedToolOutput> {
+/// Remove and return the agent's cached [`CapturedToolOutput`], if present.
+#[must_use]
+pub fn take_last_tool_output(agent_id: u64) -> Option<CapturedToolOutput> {
     let mut taken = None;
     with_last_tool_output_slot(agent_id, "take", |slot| taken = slot.take());
     taken
 }
 
-#[cfg(feature = "native")]
 fn with_last_tool_output_slot(
     agent_id: u64,
     op: &str,
@@ -164,20 +159,18 @@ fn with_last_tool_output_slot(
 /// Captured on the dispatch error path so the `on_tool_error` hook can
 /// receive the same arguments and structured metadata as `post_tool_call`.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CapturedToolError {
+pub struct CapturedToolError {
     /// Arguments the failing tool was invoked with (`Null` when unknown).
-    pub(crate) tool_args: serde_json::Value,
+    pub tool_args: serde_json::Value,
     /// Structured [`ToolError`](llm_tool::ToolError) metadata, or `None` when
     /// the error carried no metadata.
-    pub(crate) metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl CapturedToolError {
     /// Capture `error` (and the arguments that produced it) directly from [`llm_tool::ToolError::metadata`].
-    pub(crate) fn from_tool_error(
-        tool_args: serde_json::Value,
-        error: &llm_tool::ToolError,
-    ) -> Self {
+    #[must_use]
+    pub fn from_tool_error(tool_args: serde_json::Value, error: &llm_tool::ToolError) -> Self {
         let metadata = (!error.metadata().is_empty()).then(|| {
             error
                 .metadata()
@@ -193,13 +186,12 @@ impl CapturedToolError {
 }
 
 /// Snapshot a [`ToolError`](llm_tool::ToolError) and cache it in the agent's
-/// [`last_tool_error`](AgentBridgeState::last_tool_error) slot.
+/// last-tool-error slot.
 ///
 /// Called from the tool dispatch error path. Failures to look up the agent are
-/// logged (never silently swallowed) rather than propagated, since the caller
-/// is about to raise the model-facing `PyErr` regardless and losing metadata
-/// must not mask the original tool failure.
-pub(crate) fn record_last_tool_error(
+/// logged (never silently swallowed) rather than propagated, since losing
+/// metadata must not mask the original tool failure.
+pub fn record_last_tool_error(
     agent_id: u64,
     tool_args: serde_json::Value,
     error: &llm_tool::ToolError,
@@ -208,15 +200,15 @@ pub(crate) fn record_last_tool_error(
     with_last_tool_error_slot(agent_id, "record", |slot| *slot = Some(captured));
 }
 
-/// Clear the agent's cached [`last_tool_error`](AgentBridgeState::last_tool_error),
-/// preventing a previous failure from leaking into a later hook invocation.
-pub(crate) fn clear_last_tool_error(agent_id: u64) {
+/// Clear the agent's cached [`CapturedToolError`], preventing a previous
+/// failure from leaking into a later hook invocation.
+pub fn clear_last_tool_error(agent_id: u64) {
     with_last_tool_error_slot(agent_id, "clear", |slot| *slot = None);
 }
 
-/// Remove and return the agent's cached
-/// [`last_tool_error`](AgentBridgeState::last_tool_error), if present.
-pub(crate) fn take_last_tool_error(agent_id: u64) -> Option<CapturedToolError> {
+/// Remove and return the agent's cached [`CapturedToolError`], if present.
+#[must_use]
+pub fn take_last_tool_error(agent_id: u64) -> Option<CapturedToolError> {
     let mut taken = None;
     with_last_tool_error_slot(agent_id, "take", |slot| taken = slot.take());
     taken
@@ -304,7 +296,12 @@ pub(crate) fn initializing_hook_runners()
 }
 
 /// Store a conversation ID assigned to an agent.
-pub(crate) fn set_agent_conversation_id(
+///
+/// # Errors
+///
+/// Returns [`Error::BackendError`](crate::error::Error::BackendError) if the
+/// bridge-state `RwLock` or per-agent `conversation_id` mutex is poisoned.
+pub fn set_agent_conversation_id(
     agent_id: u64,
     conversation_id: String,
 ) -> Result<(), crate::error::Error> {
@@ -343,8 +340,8 @@ pub(crate) fn set_agent_conversation_id(
 }
 
 /// Look up the current conversation ID for an agent, if set.
-#[cfg(feature = "native")]
-pub(crate) fn get_agent_conversation_id(agent_id: u64) -> Option<String> {
+#[must_use]
+pub fn get_agent_conversation_id(agent_id: u64) -> Option<String> {
     let map = match bridge_state().read() {
         Ok(m) => m,
         Err(e) => {
@@ -362,8 +359,156 @@ pub(crate) fn get_agent_conversation_id(agent_id: u64) -> Option<String> {
     }
 }
 
+/// Look up the custom [`ToolRegistry`](crate::tools::ToolRegistry) registered
+/// for `agent_id`, if any.
+#[must_use]
+pub fn agent_registry(agent_id: u64) -> Option<Arc<crate::tools::ToolRegistry>> {
+    match bridge_state().read() {
+        Ok(map) => map.get(&agent_id).and_then(|entry| entry.registry.clone()),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_registry"
+            );
+            None
+        }
+    }
+}
+
+/// Look up the [`Hooks`](crate::hooks::Hooks) runner registered for `agent_id`,
+/// if any.
+///
+/// Checks the active bridge-state map first and falls back to the per-agent
+/// initializing hook registry so `on_session_start` callbacks resolve during
+/// [`Runtime::create_agent`](crate::agent::Runtime::create_agent).
+#[must_use]
+pub fn agent_hooks(agent_id: u64) -> Option<Arc<crate::hooks::Hooks>> {
+    match bridge_state().read() {
+        Ok(map) => {
+            if let Some(hooks) = map
+                .get(&agent_id)
+                .and_then(|entry| entry.hook_runner.clone())
+            {
+                return Some(hooks);
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_hooks"
+            );
+        }
+    }
+    match initializing_hook_runners().read() {
+        Ok(init_map) => init_map.get(&agent_id).cloned(),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "INITIALIZING_HOOK_RUNNERS read lock poisoned in agent_hooks"
+            );
+            None
+        }
+    }
+}
+
+/// Look up a clone of the [`PolicySet`](crate::policies::PolicySet) configured
+/// for `agent_id`, if the agent is registered in bridge state.
+#[must_use]
+pub fn agent_policies(agent_id: u64) -> Option<crate::policies::PolicySet> {
+    match bridge_state().read() {
+        Ok(map) => map.get(&agent_id).map(|entry| entry.policies.clone()),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_policies"
+            );
+            None
+        }
+    }
+}
+
+/// Look up the interactive [`AskUserHandler`](crate::policies::AskUserHandler)
+/// registered for `agent_id`, if any.
+#[must_use]
+pub fn agent_policy_handler(agent_id: u64) -> Option<Arc<dyn crate::policies::AskUserHandler>> {
+    match bridge_state().read() {
+        Ok(map) => map
+            .get(&agent_id)
+            .and_then(|entry| entry.policy_handler.clone()),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_policy_handler"
+            );
+            None
+        }
+    }
+}
+
+/// Look up the shared per-agent [`SharedState`](llm_tool::SharedState) used
+/// across custom tool dispatches for `agent_id`, if registered.
+#[must_use]
+pub fn agent_tool_state(agent_id: u64) -> Option<llm_tool::SharedState> {
+    match bridge_state().read() {
+        Ok(map) => map.get(&agent_id).map(|entry| entry.tool_state.clone()),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_tool_state"
+            );
+            None
+        }
+    }
+}
+
+/// Remove `agent_id` from both the active bridge-state registry and the
+/// initializing hook-runner registry.
+///
+/// External [`Runtime`](crate::agent::Runtime) implementations should call this
+/// from [`Runtime::try_shutdown_agent`](crate::agent::Runtime::try_shutdown_agent)
+/// after firing any `on_session_end` hooks when cleaning up an un-awaited drop.
+pub fn remove_agent_bridge_state(agent_id: u64) {
+    match bridge_state().write() {
+        Ok(mut map) => {
+            map.remove(&agent_id);
+        }
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE write lock poisoned in remove_agent_bridge_state"
+            );
+        }
+    }
+    match initializing_hook_runners().write() {
+        Ok(mut init_map) => {
+            init_map.remove(&agent_id);
+        }
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "INITIALIZING_HOOK_RUNNERS write lock poisoned in remove_agent_bridge_state"
+            );
+        }
+    }
+}
+
 /// Evaluates policies and registered handlers to check if a tool execution is allowed.
-pub(crate) fn check_tool_execution_allowed(
+///
+/// # Errors
+///
+/// Returns [`Error::BackendError`](crate::error::Error::BackendError) if the
+/// bridge-state lock is poisoned, `agent_id` is not registered, or `args_json`
+/// fails JSON parsing when an [`AskUserHandler`](crate::policies::AskUserHandler)
+/// must be consulted.
+pub fn check_tool_execution_allowed(
     agent_id: u64,
     name: &str,
     args_json: &str,
@@ -450,5 +595,40 @@ mod tests {
             all_ids.len(),
             "concurrent allocations must be collision-free"
         );
+    }
+
+    #[test]
+    fn agent_hooks_falls_back_to_initializing_registry_and_removes_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let agent_id = next_agent_id();
+        assert!(agent_hooks(agent_id).is_none());
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+        let hooks = Arc::new(crate::hooks::Hooks::new().with_session_start(
+            "init-test",
+            move |_ctx| {
+                fired_clone.store(true, Ordering::SeqCst);
+            },
+        ));
+
+        initializing_hook_runners()
+            .write()
+            .expect("initializing_hook_runners write lock")
+            .insert(agent_id, Arc::clone(&hooks));
+
+        let resolved = agent_hooks(agent_id).expect("must resolve from initializing registry");
+        resolved.run_on_session_start(&crate::hooks::OnSessionStartContext {
+            session: crate::hooks::SessionContext {
+                session_id: format!("agent-{agent_id}"),
+                agent_id,
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+            },
+        });
+        assert!(fired.load(Ordering::SeqCst));
+
+        remove_agent_bridge_state(agent_id);
+        assert!(agent_hooks(agent_id).is_none());
     }
 }

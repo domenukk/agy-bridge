@@ -3,8 +3,9 @@
 
 use agy_bridge::{
     prelude::*,
-    tools::{RustTool, ToolContext, ToolRegistry},
+    tools::{RustTool, ToolContext},
 };
+#[cfg(any(feature = "native", feature = "python"))]
 use agy_bridge_test_support::*;
 use serde::Serialize;
 
@@ -78,7 +79,9 @@ async fn test_tool_template_rendering_execution() {
 }
 
 #[test]
+#[cfg(any(feature = "native", feature = "python"))]
 fn test_template_tool_in_mock_server_agent() {
+    use agy_bridge::tools::ToolRegistry;
     let rt = multi_thread_rt();
     rt.block_on(async {
         let server = MockGeminiServer::start(vec![

@@ -8,6 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+pub use crate::DefaultRuntime;
 use crate::{
     config::AgentConfig,
     content::Content,
@@ -34,11 +35,42 @@ pub(crate) fn floored_registry(
     Arc::new(registry)
 }
 
+/// Validate [`AgentConfig`] capabilities, response schema, and MCP server specs
+/// before creating an agent session.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`] if `capabilities`, `response_schema`, or
+/// any `mcp_servers` entry fails structural validation.
+pub fn validate_create_config(config: &AgentConfig) -> Result<(), Error> {
+    if let Some(ref caps) = config.capabilities {
+        caps.validate().map_err(|msg| Error::InvalidConfig {
+            message: msg.to_string(),
+        })?;
+    }
+    if let Some(ref schema) = config.response_schema {
+        schema.validate().map_err(|msg| Error::InvalidConfig {
+            message: msg.to_string(),
+        })?;
+    }
+    for mcp in &config.mcp_servers {
+        mcp.validate()
+            .map_err(|message| Error::InvalidConfig { message })?;
+    }
+    Ok(())
+}
+
 /// Reject tool configurations that would silently not do what they say.
 ///
 /// - every `finish_on_tools` entry must name a registered custom tool;
 /// - the registry's output floor must be at least `tool_output_floor`.
-pub(crate) fn validate_tool_config(
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`] if `finish_on_tools` names an unregistered
+/// tool or the `ToolRegistry` output sanitization floor is weaker than
+/// `config.tool_output_floor`.
+pub fn validate_tool_config(
     config: &AgentConfig,
     registry: Option<&crate::tools::ToolRegistry>,
 ) -> Result<(), Error> {
@@ -417,7 +449,6 @@ impl<R: Runtime> AgentHandle<R> {
             tool_state: llm_tool::SharedState::new(),
             conversation_id: Arc::clone(&conversation_id),
             last_tool_error: std::sync::Mutex::new(None),
-            #[cfg(feature = "native")]
             last_tool_output: std::sync::Mutex::new(None),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
@@ -551,6 +582,12 @@ impl<R: Runtime> AgentHandle<R> {
     #[must_use]
     pub const fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Return a reference to the underlying runtime `Arc`.
+    #[must_use]
+    pub const fn runtime(&self) -> &Arc<R> {
+        &self.runtime
     }
 
     /// Return all tools available to this agent, with metadata.

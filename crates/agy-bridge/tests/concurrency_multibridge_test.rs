@@ -1,6 +1,7 @@
 //! OS-thread parallelism and multi-bridge concurrency tests.
 //!
 //! Uses mock TCP servers — no API key required.
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::sync::{
     Arc,

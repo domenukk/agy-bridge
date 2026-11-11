@@ -3,12 +3,12 @@ members = ["crates/agy-bridge", "crates/agy-bridge-test-support"]
 resolver = "3"
 
 [workspace.package]
-version = "0.16.6"
+version = "0.16.7"
 edition = "2024"
 
 [workspace.dependencies]
 # workspace crates
-agy-bridge = { path = "crates/agy-bridge", version = "0.16.6", default-features = false }
+agy-bridge = { path = "crates/agy-bridge", version = "0.16.7", default-features = false }
 agy-bridge-test-support = { path = "crates/agy-bridge-test-support", default-features = false }
 llm-tool = { version = "0.10.6" }
 llm-tool-macros = { version = "0.10.6" }

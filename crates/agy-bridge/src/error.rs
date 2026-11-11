@@ -49,6 +49,14 @@ pub enum Error {
     /// The agent was not started or has been shut down before an operation was requested.
     #[error("Agent is not started or has been shut down")]
     AgentNotStarted,
+
+    /// No backend runtime was configured (neither `native` nor `python` feature enabled,
+    /// and no custom [`Runtime`](crate::agent::Runtime) supplied).
+    #[error(
+        "No backend runtime configured; enable the `native` or `python` feature or construct `AgyBridge::with_runtime(...)`"
+    )]
+    RuntimeNotStarted,
+
     /// An exception was raised in the backend.
     #[error("Backend error: {message}")]
     BackendError {

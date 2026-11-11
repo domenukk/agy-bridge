@@ -2,6 +2,7 @@
 //!
 //! Spins up a mock Gemini server and spawns multiple agents in concurrent tasks
 //! that execute chat turns concurrently to verify there are no deadlocks.
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::sync::{
     Arc,

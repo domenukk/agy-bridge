@@ -43,7 +43,6 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use tokio::sync::{mpsc, oneshot};
 
-#[cfg(feature = "python")]
 use crate::error::Error;
 
 #[cfg(feature = "native")]
@@ -79,16 +78,158 @@ mod tests;
 // Re-export items used by sibling modules and external crate consumers.
 #[cfg(feature = "python")]
 pub(crate) use bridge_state::AgentId;
-#[cfg(test)]
-pub(crate) use bridge_state::set_agent_conversation_id;
-pub(crate) use bridge_state::{
-    AgentBridgeState, bridge_state, initializing_hook_runners, next_agent_id,
+pub(crate) use bridge_state::{AgentBridgeState, bridge_state, initializing_hook_runners};
+pub use bridge_state::{
+    CapturedToolError, CapturedToolOutput, agent_hooks, agent_policies, agent_policy_handler,
+    agent_registry, agent_tool_state, check_tool_execution_allowed, clear_last_tool_error,
+    get_agent_conversation_id, next_agent_id, record_last_tool_error, record_last_tool_output,
+    remove_agent_bridge_state, set_agent_conversation_id, take_last_tool_error,
+    take_last_tool_output,
 };
 pub use config::{BackendLogLevel, RuntimeConfig};
 #[cfg(feature = "python")]
 pub(crate) use ffi_dispatch::{
     dispatch_rust_hook, dispatch_rust_policy_confirm, dispatch_rust_tool,
 };
+
+pub use crate::agent::{validate_create_config, validate_tool_config};
+
+/// Placeholder [`Runtime`](crate::agent::Runtime) used as [`DefaultRuntime`](crate::DefaultRuntime)
+/// when `agy-bridge` is compiled with `--no-default-features` (neither `native`
+/// nor `python` enabled).
+///
+/// Every operation fails with [`Error::RuntimeNotStarted`]. External runtime
+/// crates construct [`AgyBridge::with_runtime`](crate::AgyBridge::with_runtime)
+/// with their own [`Runtime`](crate::agent::Runtime) implementation instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnconfiguredRuntime;
+
+impl UnconfiguredRuntime {
+    /// Returns `false` because no backend runtime has been started.
+    #[must_use]
+    pub const fn is_alive(&self) -> bool {
+        false
+    }
+
+    /// Always fails with [`Error::RuntimeNotStarted`] when no backend is active.
+    pub fn active_agent_count(
+        &self,
+    ) -> impl std::future::Future<Output = Result<usize, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
+    }
+}
+
+impl crate::agent::Runtime for UnconfiguredRuntime {
+    async fn create_agent(
+        &self,
+        _agent_id: u64,
+        _config: crate::config::AgentConfig,
+    ) -> Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn chat(
+        &self,
+        _agent_id: crate::agent::AgentId,
+        _content: &crate::content::Content,
+    ) -> Result<crate::streaming::ChatResponseHandle, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn shutdown_agent(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn cancel(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn wait_for_idle(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn send(
+        &self,
+        _agent_id: crate::agent::AgentId,
+        _content: &crate::content::Content,
+    ) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn signal_idle(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn wait_for_wakeup(
+        &self,
+        _agent_id: crate::agent::AgentId,
+        _timeout: Duration,
+    ) -> Result<bool, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn history(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> Result<Vec<crate::types::ConversationMessage>, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn turn_count(&self, _agent_id: crate::agent::AgentId) -> Result<u32, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn total_usage(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> Result<crate::types::UsageMetadata, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn last_turn_usage(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> Result<crate::types::UsageMetadata, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn clear_history(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn last_response(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> Result<Option<String>, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn compaction_indices(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> Result<Vec<u32>, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn delete(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn disconnect(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn is_idle(&self, _agent_id: crate::agent::AgentId) -> Result<bool, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+
+    async fn sandbox_status(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> Result<Option<crate::types::SandboxStatus>, Error> {
+        Err(Error::RuntimeNotStarted)
+    }
+}
 
 /// Default delay between successive chat commands to prevent burst requests.
 pub const DEFAULT_INTER_AGENT_DELAY: Duration = Duration::from_millis(500);

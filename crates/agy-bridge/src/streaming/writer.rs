@@ -13,6 +13,13 @@ use super::types::{
 };
 use crate::types::Step;
 
+const CHANNEL_TEXT: &str = "text";
+const CHANNEL_THOUGHT: &str = "thought";
+const CHANNEL_TOOL_CALL: &str = "tool_call";
+const CHANNEL_CHUNK: &str = "chunk";
+const CHANNEL_EVENT: &str = "event";
+const CHANNEL_STEP: &str = "step";
+
 /// Error returned when sending to a [`ChatResponseWriter`] channel fails.
 ///
 /// This wraps the underlying channel error to avoid leaking the
@@ -131,10 +138,10 @@ impl ChatResponseWriter {
         }
     }
 
-    /// Return true if all receiver channels on the paired [`ChatResponseHandle`]
+    /// Return true if all receiver channels on the paired [`ChatResponseHandle`](super::handle::ChatResponseHandle)
     /// have been dropped (i.e. the caller dropped the handle without draining).
-    #[cfg(feature = "native")]
-    pub(crate) fn is_abandoned(&self) -> bool {
+    #[must_use]
+    pub fn is_abandoned(&self) -> bool {
         self.text_tx.is_closed()
             && self.thought_tx.is_closed()
             && self.tool_call_tx.is_closed()
@@ -142,6 +149,181 @@ impl ChatResponseWriter {
             && self.event_tx.is_closed()
             && self.step_tx.is_closed()
             && self.chunk_tx.is_closed()
+    }
+
+    fn can_deliver<T>(
+        subscribed: &AtomicBool,
+        tx: &mpsc::Sender<T>,
+        channel: &'static str,
+    ) -> bool {
+        if tx.is_closed() {
+            if subscribed.swap(false, Ordering::AcqRel) {
+                tracing::debug!(channel, "fan-out receiver closed; unsubscribing view");
+            }
+            return false;
+        }
+        subscribed.load(Ordering::Acquire) || tx.capacity() > 0
+    }
+
+    async fn fan_out_triple<T: Clone>(
+        &self,
+        primary_sub: &AtomicBool,
+        primary_tx: &mpsc::Sender<T>,
+        primary_channel: &'static str,
+        to_chunk: impl FnOnce(T) -> StreamChunk,
+        to_event: impl FnOnce(T) -> ResponseEvent,
+        make_value: impl FnOnce() -> T,
+    ) {
+        let want_primary = Self::can_deliver(primary_sub, primary_tx, primary_channel);
+        let want_chunk = Self::can_deliver(&self.subs.chunk, &self.chunk_tx, CHANNEL_CHUNK);
+        let want_event = Self::can_deliver(&self.subs.event, &self.event_tx, CHANNEL_EVENT);
+        match (want_primary, want_chunk, want_event) {
+            (false, false, false) => {}
+            (true, false, false) => {
+                Self::fan_out(primary_sub, primary_tx, make_value(), primary_channel).await;
+            }
+            (false, true, false) => {
+                Self::fan_out(
+                    &self.subs.chunk,
+                    &self.chunk_tx,
+                    to_chunk(make_value()),
+                    CHANNEL_CHUNK,
+                )
+                .await;
+            }
+            (false, false, true) => {
+                Self::fan_out(
+                    &self.subs.event,
+                    &self.event_tx,
+                    to_event(make_value()),
+                    CHANNEL_EVENT,
+                )
+                .await;
+            }
+            (true, true, false) => {
+                let val = make_value();
+                Self::fan_out(primary_sub, primary_tx, val.clone(), primary_channel).await;
+                Self::fan_out(
+                    &self.subs.chunk,
+                    &self.chunk_tx,
+                    to_chunk(val),
+                    CHANNEL_CHUNK,
+                )
+                .await;
+            }
+            (true, false, true) => {
+                let val = make_value();
+                Self::fan_out(primary_sub, primary_tx, val.clone(), primary_channel).await;
+                Self::fan_out(
+                    &self.subs.event,
+                    &self.event_tx,
+                    to_event(val),
+                    CHANNEL_EVENT,
+                )
+                .await;
+            }
+            (false, true, true) => {
+                let val = make_value();
+                Self::fan_out(
+                    &self.subs.chunk,
+                    &self.chunk_tx,
+                    to_chunk(val.clone()),
+                    CHANNEL_CHUNK,
+                )
+                .await;
+                Self::fan_out(
+                    &self.subs.event,
+                    &self.event_tx,
+                    to_event(val),
+                    CHANNEL_EVENT,
+                )
+                .await;
+            }
+            (true, true, true) => {
+                let val = make_value();
+                Self::fan_out(primary_sub, primary_tx, val.clone(), primary_channel).await;
+                Self::fan_out(
+                    &self.subs.chunk,
+                    &self.chunk_tx,
+                    to_chunk(val.clone()),
+                    CHANNEL_CHUNK,
+                )
+                .await;
+                Self::fan_out(
+                    &self.subs.event,
+                    &self.event_tx,
+                    to_event(val),
+                    CHANNEL_EVENT,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Fan out a text delta across the text, chunk, and ordered event streams.
+    ///
+    /// Unsubscribed views use non-blocking `try_send` so an undrained stream
+    /// never stalls the turn, and full or closed views skip cloning entirely.
+    pub async fn emit_text(&self, delta: impl Into<String>) {
+        self.fan_out_triple(
+            &self.subs.text,
+            &self.text_tx,
+            CHANNEL_TEXT,
+            StreamChunk::Text,
+            ResponseEvent::TextChunk,
+            || delta.into(),
+        )
+        .await;
+    }
+
+    /// Fan out a thinking delta across the thought, chunk, and ordered event streams.
+    ///
+    /// Unsubscribed views use non-blocking `try_send` so an undrained stream
+    /// never stalls the turn, and full or closed views skip cloning entirely.
+    pub async fn emit_thought(&self, delta: impl Into<String>) {
+        self.fan_out_triple(
+            &self.subs.thought,
+            &self.thought_tx,
+            CHANNEL_THOUGHT,
+            StreamChunk::Thought,
+            ResponseEvent::ThoughtChunk,
+            || delta.into(),
+        )
+        .await;
+    }
+
+    /// Fan out a tool call event across the tool-call, chunk, and ordered event streams.
+    ///
+    /// Unsubscribed views use non-blocking `try_send` so an undrained stream
+    /// never stalls the turn, and full or closed views skip cloning entirely.
+    pub async fn emit_tool_call(&self, event: ToolCallEvent) {
+        self.fan_out_triple(
+            &self.subs.tool_call,
+            &self.tool_call_tx,
+            CHANNEL_TOOL_CALL,
+            StreamChunk::ToolCall,
+            ResponseEvent::ToolCall,
+            || event,
+        )
+        .await;
+    }
+
+    /// Fan out a step update to the step stream.
+    ///
+    /// Unsubscribed views use non-blocking `try_send` so an undrained stream
+    /// never stalls the turn.
+    pub async fn emit_step(&self, step: Step) {
+        if Self::can_deliver(&self.subs.step, &self.step_tx, CHANNEL_STEP) {
+            Self::fan_out(&self.subs.step, &self.step_tx, step, CHANNEL_STEP).await;
+        }
+    }
+
+    /// Fan out a [`ResponseEvent`] (such as [`ResponseEvent::ToolResult`]) to
+    /// the ordered event stream without blocking when unsubscribed.
+    pub async fn emit_event(&self, event: ResponseEvent) {
+        if Self::can_deliver(&self.subs.event, &self.event_tx, CHANNEL_EVENT) {
+            Self::fan_out(&self.subs.event, &self.event_tx, event, CHANNEL_EVENT).await;
+        }
     }
 
     /// Send a text token.

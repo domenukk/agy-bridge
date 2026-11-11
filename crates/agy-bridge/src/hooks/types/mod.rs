@@ -73,6 +73,16 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
+    /// Create a new session context for `session_id` and `agent_id`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, agent_id: u64, started_at: SystemTime) -> Self {
+        Self {
+            session_id: session_id.into(),
+            agent_id,
+            started_at,
+        }
+    }
+
     /// Fallback value when `started_at` is absent from the JSON payload.
     fn default_started_at() -> SystemTime {
         SystemTime::UNIX_EPOCH
@@ -87,6 +97,14 @@ pub struct OnSessionStartContext {
     pub session: SessionContext,
 }
 
+impl OnSessionStartContext {
+    /// Create a new session-start hook context.
+    #[must_use]
+    pub const fn new(session: SessionContext) -> Self {
+        Self { session }
+    }
+}
+
 /// Context passed to [`HookPoint::OnSessionEnd`] hooks.
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -95,10 +113,26 @@ pub struct OnSessionEndContext {
     pub session: SessionContext,
 }
 
+impl OnSessionEndContext {
+    /// Create a new session-end hook context.
+    #[must_use]
+    pub const fn new(session: SessionContext) -> Self {
+        Self { session }
+    }
+}
+
 /// Context passed to [`HookPoint::OnCompaction`] hooks.
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OnCompactionContext {}
+
+impl OnCompactionContext {
+    /// Create a new compaction hook context.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {}
+    }
+}
 
 /// Context passed to [`HookPoint::OnInteraction`] hooks.
 #[non_exhaustive]
@@ -106,6 +140,16 @@ pub struct OnCompactionContext {}
 pub struct OnInteractionContext {
     /// The interaction message content.
     pub message: String,
+}
+
+impl OnInteractionContext {
+    /// Create a new interaction hook context.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 /// Context passed to [`HookPoint::PreTurn`] hooks.
@@ -137,6 +181,17 @@ pub struct PostTurnContext {
     pub response_text: String,
     /// The 1-based turn number.
     pub turn_number: u32,
+}
+
+impl PostTurnContext {
+    /// Create a new post-turn context.
+    #[must_use]
+    pub fn new(response_text: impl Into<String>, turn_number: u32) -> Self {
+        Self {
+            response_text: response_text.into(),
+            turn_number,
+        }
+    }
 }
 
 /// Context passed to [`HookPoint::PreToolCallDecide`] hooks.
@@ -177,6 +232,24 @@ pub struct PostToolCallContext {
     /// Structured metadata from the tool response (if any).
     #[serde(default)]
     pub metadata: serde_json::Value,
+}
+
+impl PostToolCallContext {
+    /// Create a new post-tool-call context.
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        tool_args: serde_json::Value,
+        result: impl Into<String>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            tool_args,
+            result: result.into(),
+            metadata,
+        }
+    }
 }
 
 /// Context passed to [`HookPoint::OnToolError`] hooks.
@@ -224,6 +297,22 @@ pub struct OnToolErrorContext {
 }
 
 impl OnToolErrorContext {
+    /// Create a new tool-error hook context.
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        tool_args: serde_json::Value,
+        error: impl Into<String>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            tool_args,
+            error: error.into(),
+            metadata,
+        }
+    }
+
     /// Whether the error denotes a registry-lookup miss, i.e. the model asked
     /// for a tool that isn't registered.
     ///

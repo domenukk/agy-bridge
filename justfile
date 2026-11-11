@@ -47,7 +47,7 @@ fmt-toml:
 
 # Format Markdown files with prettier
 fmt-markdown:
-    if command -v npx >/dev/null 2>&1; then npx -y prettier@latest --write '**/*.md'; fi
+    if command -v npx >/dev/null 2>&1; then npx -y prettier@latest --write '**/*.md' '!AGENT.md' '!crates/agy-bridge/README.md'; fi
 
 # Format Python files with black
 fmt-python:
@@ -67,6 +67,8 @@ lint-rust:
     cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets --no-default-features --features native -- -D warnings
     cargo clippy --all-targets --no-default-features --features python -- -D warnings
+    cargo clippy --all-targets --no-default-features -- -D warnings
+    cargo clippy --all-targets --no-default-features --features md-tmpl -- -D warnings
 
 # Lint Rust formatting
 lint-rust-fmt:
@@ -97,8 +99,8 @@ lint-hygiene:
 
 # ── Test ──────────────────────────────────────────────────────────────
 
-# Run all tests (Rust python backend + native backend + default features + md-tmpl + Python)
-test: test-rust test-native test-default test-md-tmpl test-python
+# Run all tests (Rust python backend + native backend + no-default-features + default features + md-tmpl + Python)
+test: test-rust test-native test-no-default-features test-default test-md-tmpl test-python
 
 # Run Rust tests for python backend
 test-rust:
@@ -107,6 +109,11 @@ test-rust:
 # Run Rust tests for native pure-Rust backend
 test-native:
     cargo test -p agy-bridge --no-default-features --features native
+
+# Run Rust tests with neither built-in backend enabled (custom Runtime mode)
+test-no-default-features:
+    cargo test -p agy-bridge --no-default-features
+    cargo test -p agy-bridge --no-default-features --features md-tmpl
 
 # Run the whole workspace with the crates' DEFAULT feature set.
 #

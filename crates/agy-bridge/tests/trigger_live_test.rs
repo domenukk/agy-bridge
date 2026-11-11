@@ -10,6 +10,7 @@
 //! 1. `TriggerEntry`/`TriggerConfig` serialization roundtrips correctly
 //! 2. The triggers field is accepted by the SDK's `LocalAgentConfig`
 //! 3. Agent creation with triggers succeeds (SDK parses them)
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::prelude::*;
 

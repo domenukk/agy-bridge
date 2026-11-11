@@ -33,6 +33,7 @@
 //! ```sh
 //! cargo test --test features_mock_multimodal_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::content::{Content, ContentPrimitive, Image};
 use agy_bridge_test_support::*;

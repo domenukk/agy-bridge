@@ -11,6 +11,7 @@
 //! ```sh
 //! cargo test --test recoverable_error_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge_test_support::*;
 

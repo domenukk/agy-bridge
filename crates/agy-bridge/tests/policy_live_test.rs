@@ -4,6 +4,7 @@
 //! ```sh
 //! GEMINI_API_KEY="..." cargo test --test policy_live_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::tools::{RustTool, ToolError, ToolOutput, ToolRegistry};
 

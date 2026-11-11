@@ -13,6 +13,7 @@
 //! ```sh
 //! cargo test --test concurrency_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::sync::{
     Arc, LazyLock,

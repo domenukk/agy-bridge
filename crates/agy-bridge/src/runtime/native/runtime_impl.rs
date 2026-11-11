@@ -17,14 +17,14 @@ use super::{
     ws::{remove_persisted_conversation_files, spawn_session_io_tasks},
 };
 use crate::{
-    agent::{AgentId, Runtime},
+    agent::{AgentId, Runtime, validate_create_config},
     config::AgentConfig,
     content::Content,
     error::Error,
     hooks::{Hooks, OnSessionEndContext, OnSessionStartContext, SessionContext},
     policies::PolicySet,
     proto,
-    runtime::bridge_state::bridge_state,
+    runtime::bridge_state::{agent_hooks, bridge_state},
     streaming::{ChatResponseHandle, ChatResponseWriter, channel_with_buffer},
     tools::AvailableTool,
     types::{ConversationMessage, MessageRole, UsageMetadata},
@@ -122,35 +122,6 @@ async fn acquire_session_turn(
     }
 }
 
-fn validate_create_config(config: &AgentConfig) -> Result<(), Error> {
-    if let Some(ref caps) = config.capabilities {
-        caps.validate().map_err(|msg| Error::InvalidConfig {
-            message: msg.to_string(),
-        })?;
-    }
-    if let Some(ref schema) = config.response_schema {
-        schema.validate().map_err(|msg| Error::InvalidConfig {
-            message: msg.to_string(),
-        })?;
-    }
-    for mcp in &config.mcp_servers {
-        mcp.validate()
-            .map_err(|message| Error::InvalidConfig { message })?;
-    }
-    Ok(())
-}
-
-fn extract_initializing_hook_runner(agent_id: u64) -> Option<Arc<Hooks>> {
-    let init_hooks = crate::runtime::initializing_hook_runners();
-    match init_hooks.read() {
-        Ok(guard) => guard.get(&agent_id).cloned(),
-        Err(e) => {
-            tracing::error!(error = %e, "Poisoned initializing_hook_runners lock");
-            None
-        }
-    }
-}
-
 fn extract_hook_runner_and_conv_id(agent_id: AgentId) -> (Option<Arc<Hooks>>, Option<String>) {
     match bridge_state().write() {
         Ok(mut map) => {
@@ -192,7 +163,7 @@ impl Runtime for NativeRuntime {
 
         async move {
             validate_create_config(&config)?;
-            let hook_runner = extract_initializing_hook_runner(agent_id);
+            let hook_runner = agent_hooks(agent_id);
             let policies = PolicySet::validated_from(config.policies.clone())?;
 
             let save_dir = config.save_dir.clone().unwrap_or_else(std::env::temp_dir);

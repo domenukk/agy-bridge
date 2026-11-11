@@ -87,7 +87,7 @@ impl ChatResponseHandle {
     ///     println!("step: {:?}", step.step_type);
     /// }
     /// # });
-    pub fn receive_steps(&mut self) -> Option<impl tokio_stream::Stream<Item = Step>> {
+    pub fn receive_steps(&mut self) -> Option<impl tokio_stream::Stream<Item = Step> + use<>> {
         self.subs.step.store(true, Ordering::Release);
         self.rx.step.take().map(ReceiverStream::new)
     }
@@ -115,7 +115,9 @@ impl ChatResponseHandle {
     ///     }
     /// }
     /// # });
-    pub fn receive_chunks(&mut self) -> Option<impl tokio_stream::Stream<Item = StreamChunk>> {
+    pub fn receive_chunks(
+        &mut self,
+    ) -> Option<impl tokio_stream::Stream<Item = StreamChunk> + use<>> {
         self.subs.chunk.store(true, Ordering::Release);
         self.rx.chunk.take().map(ReceiverStream::new)
     }

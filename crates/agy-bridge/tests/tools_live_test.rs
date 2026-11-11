@@ -7,6 +7,7 @@
 //! ```sh
 //! GEMINI_API_KEY="..." cargo test --test tools_live_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::tools::{JsonSchema, RustTool, ToolError, ToolOutput, ToolRegistry};
 use serde::Deserialize;

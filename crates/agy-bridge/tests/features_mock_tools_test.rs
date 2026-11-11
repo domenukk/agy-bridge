@@ -8,6 +8,7 @@
 //! ```sh
 //! cargo test --test features_mock_tools_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use agy_bridge::tools::ToolRegistry;
 use agy_bridge_test_support::*;

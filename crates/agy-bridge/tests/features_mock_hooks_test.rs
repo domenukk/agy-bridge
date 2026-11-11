@@ -8,6 +8,7 @@
 //! ```sh
 //! cargo test --test features_mock_hooks_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::sync::{Arc, Mutex, atomic::Ordering};
 

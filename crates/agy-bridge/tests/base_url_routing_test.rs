@@ -16,6 +16,7 @@
 //! ```sh
 //! cargo test --test base_url_routing_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::sync::{
     Arc,

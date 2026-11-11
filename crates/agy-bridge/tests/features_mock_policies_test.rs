@@ -7,6 +7,7 @@
 //! ```sh
 //! cargo test --test features_mock_policies_test -- --nocapture
 //! ```
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::sync::atomic::Ordering;
 

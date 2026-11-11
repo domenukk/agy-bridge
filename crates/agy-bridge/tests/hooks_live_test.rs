@@ -1,4 +1,5 @@
 //! Live integration tests for agy-bridge hooks against the real Gemini backend.
+#![cfg(any(feature = "native", feature = "python"))]
 
 use std::{
     sync::{Arc, Mutex},
