@@ -127,7 +127,8 @@ impl StreamLimits {
                 .unwrap_or(DEFAULT_MAX_CONSECUTIVE_EMPTY_STEPS),
             channel_buffer: config
                 .streaming_channel_buffer
-                .unwrap_or(crate::streaming::DEFAULT_CHANNEL_BUFFER),
+                .unwrap_or(crate::streaming::DEFAULT_CHANNEL_BUFFER)
+                .max(1),
         }
     }
 }
@@ -272,13 +273,7 @@ async fn forward_step_to_writer(
         // whether output arrived *after* the last error and only sends
         // to error_tx if no output followed (i.e. the error was fatal).
         // Forward the error step so timeline consumers see it.
-        crate::streaming::ChatResponseWriter::fan_out(
-            &writer.subs.step,
-            &writer.step_tx,
-            std::mem::take(&mut step),
-            "step",
-        )
-        .await;
+        writer.emit_step(std::mem::take(&mut step)).await;
         return StepContent::Error {
             message: error_msg,
             http_code,
@@ -299,16 +294,8 @@ async fn forward_step_to_writer(
     let text_len = step.content.len() + step.content_delta.len();
     let thinking_len = step.thinking.len() + step.thinking_delta.len();
     let has_tool_calls = !step.tool_calls.is_empty();
-    // A "complete response" step marks the end of a model message. The SDK may
-    // emit it *in addition to* the incremental delta steps, repeating the full
-    // text; once handled, reset the per-message dedup accumulator so the next
-    // message measures duplicates afresh.
     let is_complete_response = step.is_complete_response == Some(true);
 
-    // ── Normal content forwarding ───────────────────────────────────────
-    // Every fan-out is subscription-gated and non-fatal: a view nobody drains
-    // is skipped (so it can never fill its buffer and block the writer), and a
-    // dropped receiver never aborts the stream.
     forward_text(writer, &mut step, streamed_text).await;
     if is_complete_response {
         streamed_text.clear();
@@ -317,8 +304,7 @@ async fn forward_step_to_writer(
     forward_tool_calls(writer, &mut step, agent_id).await;
     apply_step_metadata(writer, &mut step);
 
-    crate::streaming::ChatResponseWriter::fan_out(&writer.subs.step, &writer.step_tx, step, "step")
-        .await;
+    writer.emit_step(step).await;
 
     // ── Structured step summary ─────────────────────────────────────────
     if !tool_names.is_empty() {
@@ -398,22 +384,7 @@ async fn forward_text(
         return;
     };
 
-    crate::streaming::ChatResponseWriter::fan_out(
-        &writer.subs.event,
-        &writer.event_tx,
-        crate::streaming::ResponseEvent::TextChunk(text.clone()),
-        "event",
-    )
-    .await;
-    crate::streaming::ChatResponseWriter::fan_out(
-        &writer.subs.chunk,
-        &writer.chunk_tx,
-        crate::streaming::StreamChunk::Text(text.clone()),
-        "chunk",
-    )
-    .await;
-    crate::streaming::ChatResponseWriter::fan_out(&writer.subs.text, &writer.text_tx, text, "text")
-        .await;
+    writer.emit_text(text).await;
 }
 
 /// Compute the *new* model text to stream, de-duplicating a consolidated
@@ -480,27 +451,7 @@ async fn forward_thoughts(
     if thinking.is_empty() {
         return;
     }
-    crate::streaming::ChatResponseWriter::fan_out(
-        &writer.subs.event,
-        &writer.event_tx,
-        crate::streaming::ResponseEvent::ThoughtChunk(thinking.clone()),
-        "event",
-    )
-    .await;
-    crate::streaming::ChatResponseWriter::fan_out(
-        &writer.subs.chunk,
-        &writer.chunk_tx,
-        crate::streaming::StreamChunk::Thought(thinking.clone()),
-        "chunk",
-    )
-    .await;
-    crate::streaming::ChatResponseWriter::fan_out(
-        &writer.subs.thought,
-        &writer.thought_tx,
-        thinking,
-        "thought",
-    )
-    .await;
+    writer.emit_thought(thinking).await;
 }
 
 /// Extract tool calls from the step and fan each out to the (subscribed)
@@ -524,27 +475,7 @@ async fn forward_tool_calls(
             id: tc.id,
             canonical_path: tc.canonical_path,
         };
-        crate::streaming::ChatResponseWriter::fan_out(
-            &writer.subs.event,
-            &writer.event_tx,
-            crate::streaming::ResponseEvent::ToolCall(event.clone()),
-            "event",
-        )
-        .await;
-        crate::streaming::ChatResponseWriter::fan_out(
-            &writer.subs.chunk,
-            &writer.chunk_tx,
-            crate::streaming::StreamChunk::ToolCall(event.clone()),
-            "chunk",
-        )
-        .await;
-        crate::streaming::ChatResponseWriter::fan_out(
-            &writer.subs.tool_call,
-            &writer.tool_call_tx,
-            event,
-            "tool_call",
-        )
-        .await;
+        writer.emit_tool_call(event).await;
     }
 }
 
@@ -554,10 +485,12 @@ fn apply_step_metadata(
     writer: &crate::streaming::ChatResponseWriter,
     step: &mut crate::types::Step,
 ) {
-    if let Some(usage) = step.usage_metadata.take() {
+    let is_root =
+        step.depth == 0 && step.parent_trajectory_id.is_empty() && !step.is_subagent_step();
+    if is_root && let Some(usage) = step.usage_metadata.take() {
         writer.set_usage(usage);
     }
-    if let Some(out) = step.structured_output.take() {
+    if is_root && let Some(out) = step.structured_output.take() {
         writer.set_structured_output(out);
     }
 }
@@ -714,6 +647,7 @@ fn send_stream_error(
     message: String,
     http_code: u16,
 ) {
+    writer.clear_structured_output();
     // Use try_send to avoid deadlock: the error channel has capacity 1.
     // The writer must be dropped to close the text channel (which
     // handle.text() is waiting on). If error_tx is already full, the

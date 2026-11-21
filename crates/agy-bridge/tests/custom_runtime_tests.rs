@@ -3,6 +3,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::{Future, ready},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -93,26 +94,32 @@ impl RustTool for ComputeSumTool {
     const NAME: &'static str = TOOL_COMPUTE;
     const DESCRIPTION: &'static str = "Computes a sum and records per-agent state.";
 
-    async fn call(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let Some(prev) = ctx
-            .get_state(STATE_KEY_CALLS, serde_json::json!(0))
-            .as_u64()
-        else {
-            return Err(ToolError::new("state counter was not u64"));
-        };
-        let next = prev + 1;
-        ctx.set_state(STATE_KEY_CALLS, serde_json::json!(next))?;
+    fn call(
+        &self,
+        params: Self::Params,
+        ctx: &ToolContext,
+    ) -> impl Future<Output = Result<ToolOutput, ToolError>> + Send {
+        ready((|| {
+            let Some(prev) = ctx
+                .get_state(STATE_KEY_CALLS, serde_json::json!(0))
+                .as_u64()
+            else {
+                return Err(ToolError::new("state counter was not u64"));
+            };
+            let next = prev + 1;
+            ctx.set_state(STATE_KEY_CALLS, serde_json::json!(next))?;
 
-        let payload = ComputeSumPayload {
-            sum: params.a + params.b,
-            call_number: next,
-            conversation_id: ctx.conversation_id().map(str::to_owned),
-        };
-        let encoded = serde_json::to_string(&payload)
-            .map_err(|e| ToolError::new(format!("serialize payload failed: {e}")))?;
-        ToolOutput::new(encoded).with_metadata(&ComputeMetadata {
-            source: META_VAL_CUSTOM,
-        })
+            let payload = ComputeSumPayload {
+                sum: params.a + params.b,
+                call_number: next,
+                conversation_id: ctx.conversation_id().map(str::to_owned),
+            };
+            let encoded = serde_json::to_string(&payload)
+                .map_err(|e| ToolError::new(format!("serialize payload failed: {e}")))?;
+            ToolOutput::new(encoded).with_metadata(&ComputeMetadata {
+                source: META_VAL_CUSTOM,
+            })
+        })())
     }
 }
 
@@ -128,17 +135,18 @@ impl RustTool for FailingProbeTool {
     const NAME: &'static str = TOOL_FAILING;
     const DESCRIPTION: &'static str = "Always fails with structured error metadata.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let err = ToolError::new(format!("probe failed for {}", params.target)).with_metadata(
-            &ProbeErrorMetadata {
-                error_code: ERR_META_VAL_CODE,
-            },
-        )?;
-        Err(err)
+    ) -> impl Future<Output = Result<ToolOutput, ToolError>> + Send {
+        ready(
+            ToolError::new(format!("probe failed for {}", params.target))
+                .with_metadata(&ProbeErrorMetadata {
+                    error_code: ERR_META_VAL_CODE,
+                })
+                .and_then(Err),
+        )
     }
 }
 
@@ -149,12 +157,12 @@ impl RustTool for ConfirmActionTool {
     const NAME: &'static str = TOOL_CONFIRM;
     const DESCRIPTION: &'static str = "Requires interactive confirmation.";
 
-    async fn call(
+    fn call(
         &self,
         _params: Self::Params,
         _ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput::new("confirmed-ok"))
+    ) -> impl Future<Output = Result<ToolOutput, ToolError>> + Send {
+        ready(Ok(ToolOutput::new("confirmed-ok")))
     }
 }
 
@@ -165,12 +173,12 @@ impl RustTool for BlockedActionTool {
     const NAME: &'static str = TOOL_DENIED;
     const DESCRIPTION: &'static str = "Denied by policy.";
 
-    async fn call(
+    fn call(
         &self,
         _params: Self::Params,
         _ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput::new("should-never-run"))
+    ) -> impl Future<Output = Result<ToolOutput, ToolError>> + Send {
+        ready(Ok(ToolOutput::new("should-never-run")))
     }
 }
 
@@ -293,12 +301,13 @@ async fn execute_tool_in_custom_runtime(
     let hooks = agent_hooks(agent_id);
     let mut effective_args = raw_args;
     if let Some(ref hr) = hooks {
-        let pre_ctx = PreToolCallDecideContext::new(tool_name, effective_args.clone());
-        let decision = hr.run_pre_tool_call_decide(&pre_ctx);
+        let initial_ctx = PreToolCallDecideContext::new(tool_name, effective_args.clone());
+        effective_args = hr.run_transform_tool_input(&initial_ctx);
+        let decide_ctx = PreToolCallDecideContext::new(tool_name, effective_args.clone());
+        let decision = hr.run_pre_tool_call_decide(&decide_ctx);
         if !decision.allow {
             return format!("hook denied: {}", decision.message);
         }
-        effective_args = hr.run_transform_tool_input(&pre_ctx);
     }
 
     dispatch_registered_tool(agent_id, call_id, tool_name, effective_args, hooks, writer).await
@@ -407,15 +416,15 @@ fn build_step(step_index: u32, text: &str, thought: &str) -> Step {
     step
 }
 
-impl Runtime for CustomRuntime {
-    async fn create_agent(
+impl CustomRuntime {
+    fn create_agent_sync(
         &self,
         agent_id: u64,
-        config: AgentConfig,
+        config: &AgentConfig,
     ) -> Result<(AgentId, Vec<AvailableTool>), Error> {
-        validate_create_config(&config)?;
+        validate_create_config(config)?;
         let registry = agent_registry(agent_id);
-        validate_tool_config(&config, registry.as_deref())?;
+        validate_tool_config(config, registry.as_deref())?;
 
         assert!(
             agent_policies(agent_id).is_some(),
@@ -457,11 +466,7 @@ impl Runtime for CustomRuntime {
         Ok((agent_id, available_tools))
     }
 
-    async fn chat(
-        &self,
-        agent_id: AgentId,
-        content: &Content,
-    ) -> Result<ChatResponseHandle, Error> {
+    fn chat_sync(&self, agent_id: AgentId, content: &Content) -> Result<ChatResponseHandle, Error> {
         let session = self.lookup_session(agent_id)?;
         let prompt = content.as_text().unwrap_or("").to_owned();
         let turn_num = session.turns.fetch_add(1, Ordering::SeqCst) + 1;
@@ -546,8 +551,26 @@ impl Runtime for CustomRuntime {
 
         Ok(handle)
     }
+}
 
-    async fn shutdown_agent(&self, agent_id: AgentId) -> Result<(), Error> {
+impl Runtime for CustomRuntime {
+    fn create_agent(
+        &self,
+        agent_id: u64,
+        config: AgentConfig,
+    ) -> impl Future<Output = Result<(AgentId, Vec<AvailableTool>), Error>> + Send {
+        ready(self.create_agent_sync(agent_id, &config))
+    }
+
+    fn chat(
+        &self,
+        agent_id: AgentId,
+        content: &Content,
+    ) -> impl Future<Output = Result<ChatResponseHandle, Error>> + Send {
+        ready(self.chat_sync(agent_id, content))
+    }
+
+    fn shutdown_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
         self.sessions
             .lock()
             .expect("sessions mutex")
@@ -558,7 +581,7 @@ impl Runtime for CustomRuntime {
             let session = SessionContext::new(conv_id, agent_id, SystemTime::UNIX_EPOCH);
             hooks.run_on_session_end(&OnSessionEndContext::new(session));
         }
-        Ok(())
+        ready(Ok(()))
     }
 
     fn try_shutdown_agent(&self, agent_id: AgentId) {
@@ -576,49 +599,70 @@ impl Runtime for CustomRuntime {
         remove_agent_bridge_state(agent_id);
     }
 
-    async fn cancel(&self, agent_id: AgentId) -> Result<(), Error> {
-        self.lookup_session(agent_id).map(|_s| ())
+    fn cancel(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| ()))
     }
 
-    async fn wait_for_idle(&self, agent_id: AgentId) -> Result<(), Error> {
-        self.lookup_session(agent_id).map(|_s| ())
+    fn wait_for_idle(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| ()))
     }
 
-    async fn send(&self, agent_id: AgentId, _content: &Content) -> Result<(), Error> {
-        self.lookup_session(agent_id).map(|_s| ())
+    fn send(
+        &self,
+        agent_id: AgentId,
+        _content: &Content,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| ()))
     }
 
-    async fn signal_idle(&self, agent_id: AgentId) -> Result<(), Error> {
-        self.lookup_session(agent_id).map(|_s| ())
+    fn signal_idle(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| ()))
     }
 
-    async fn wait_for_wakeup(&self, agent_id: AgentId, _timeout: Duration) -> Result<bool, Error> {
-        self.lookup_session(agent_id).map(|_s| false)
+    fn wait_for_wakeup(
+        &self,
+        agent_id: AgentId,
+        _timeout: Duration,
+    ) -> impl Future<Output = Result<bool, Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| false))
     }
 
-    async fn history(&self, agent_id: AgentId) -> Result<Vec<ConversationMessage>, Error> {
-        let session = self.lookup_session(agent_id)?;
-        Ok(session.history.lock().expect("history mutex").clone())
+    fn history(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<Vec<ConversationMessage>, Error>> + Send {
+        ready(
+            self.lookup_session(agent_id)
+                .map(|s| s.history.lock().expect("history mutex").clone()),
+        )
     }
 
-    async fn turn_count(&self, agent_id: AgentId) -> Result<u32, Error> {
-        let session = self.lookup_session(agent_id)?;
-        Ok(session.turns.load(Ordering::SeqCst))
+    fn turn_count(&self, agent_id: AgentId) -> impl Future<Output = Result<u32, Error>> + Send {
+        ready(
+            self.lookup_session(agent_id)
+                .map(|s| s.turns.load(Ordering::SeqCst)),
+        )
     }
 
-    async fn total_usage(&self, agent_id: AgentId) -> Result<UsageMetadata, Error> {
-        self.lookup_session(agent_id).map(|_s| sample_usage())
+    fn total_usage(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<UsageMetadata, Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| sample_usage()))
     }
 
-    async fn last_turn_usage(&self, agent_id: AgentId) -> Result<UsageMetadata, Error> {
-        self.lookup_session(agent_id).map(|_s| sample_usage())
+    fn last_turn_usage(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<UsageMetadata, Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|_s| sample_usage()))
     }
 
-    async fn clear_history(&self, agent_id: AgentId) -> Result<(), Error> {
-        let session = self.lookup_session(agent_id)?;
-        session.history.lock().expect("history mutex").clear();
-        session.turns.store(0, Ordering::SeqCst);
-        Ok(())
+    fn clear_history(&self, agent_id: AgentId) -> impl Future<Output = Result<(), Error>> + Send {
+        ready(self.lookup_session(agent_id).map(|session| {
+            session.history.lock().expect("history mutex").clear();
+            session.turns.store(0, Ordering::SeqCst);
+        }))
     }
 }
 

@@ -332,6 +332,7 @@ fn test_v017_lightweight_compaction_budget_retry_mock_server_turn() {
             gemini: Some(GeminiConfig {
                 api_key: Some("mock-v017-key".to_string()),
                 base_url: Some(server.base_url()),
+                http_headers: std::collections::HashMap::new(),
                 models: ModelConfig {
                     default: ModelEntry {
                         name: "gemini-3-flash-preview".to_string(),
@@ -525,6 +526,7 @@ fn v0_1_22_agent_config(base_url: String) -> AgentConfig {
         gemini: Some(GeminiConfig {
             api_key: Some("mock-v0122-key".to_string()),
             base_url: Some(base_url),
+            http_headers: std::collections::HashMap::new(),
             models: ModelConfig {
                 default: ModelEntry {
                     name: "gemini-3-flash-preview".to_string(),

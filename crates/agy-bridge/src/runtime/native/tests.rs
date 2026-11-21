@@ -68,6 +68,7 @@ fn test_build_harness_config_options_subagents_and_workspace_policy() {
     let gemini = GeminiConfig {
         api_key: Some("fallback-key".to_string()),
         base_url: Some("http://127.0.0.1:8675".to_string()),
+        http_headers: std::collections::HashMap::new(),
         models: ModelConfig {
             default: default_entry,
             image_generation: ModelEntry::default(),
@@ -145,7 +146,9 @@ fn test_remove_persisted_conversation_files() {
     std::fs::create_dir_all(&traj_dir).unwrap();
     std::fs::write(traj_dir.join("step.json"), b"{}").unwrap();
 
-    ws::remove_persisted_conversation_files(&dir, "conv-123");
+    ws::remove_persisted_conversation_files(&dir, "../traversal")
+        .expect_err("traversal cascade_id must be rejected");
+    ws::remove_persisted_conversation_files(&dir, "conv-123").expect("valid cascade_id");
     assert!(!db_file.exists());
     assert!(!traj_dir.exists());
     std::fs::remove_dir_all(&dir).unwrap();

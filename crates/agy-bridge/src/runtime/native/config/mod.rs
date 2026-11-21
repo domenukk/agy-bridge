@@ -1,5 +1,7 @@
 //! Translation from Rust `AgentConfig` to localharness protobuf messages.
 
+mod models;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -8,6 +10,7 @@ use std::{
 
 use llm_tool::ToolDefinition;
 
+use self::models::build_models_proto;
 use crate::{
     config::{
         AgentConfig, BuiltinTools, CapabilitiesConfig, McpServer, McpStdioServer,
@@ -280,26 +283,26 @@ fn to_proto_subagent_skills_config(
 }
 
 fn to_proto_subagent_harness_side_tools(
-    cap: &crate::config::SubagentCapabilities,
+    cap: Option<&crate::config::SubagentCapabilities>,
 ) -> proto::localharness::HarnessSideTools {
+    let default_sub_caps = crate::config::SubagentCapabilities {
+        enabled_tools: Some(BuiltinTools::read_only().to_vec()),
+        ..crate::config::SubagentCapabilities::default()
+    };
+    let effective = cap.unwrap_or(&default_sub_caps);
     let caps = CapabilitiesConfig {
-        enable_subagents: cap
-            .allowed_subagents
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
-            || cap
-                .enabled_tools
-                .as_ref()
-                .is_none_or(|v| v.contains(&BuiltinTools::InvokeSubagent)),
-        allowed_subagents: cap.allowed_subagents.clone(),
+        enable_subagents: true,
+        allowed_subagents: effective.allowed_subagents.clone(),
         max_subagent_depth: None,
-        enabled_tools: cap.enabled_tools.clone(),
-        disabled_tools: cap.disabled_tools.clone(),
+        enabled_tools: effective.enabled_tools.clone(),
+        disabled_tools: effective.disabled_tools.clone(),
         compaction_threshold: None,
         command_timeout_ms: None,
-        agent_behavior: cap.agent_behavior,
-        run_command_config: cap.run_command_config.clone(),
-        tool_output_truncation_config: cap.tool_output_truncation_config,
+        agent_behavior: effective.agent_behavior,
+        run_command_config: effective.run_command_config.clone(),
+        tool_output_truncation_config: effective.tool_output_truncation_config,
+        disable_define_subagent_tool: effective.disable_define_subagent_tool,
+        disable_manage_subagents_tool: effective.disable_manage_subagents_tool,
         ..CapabilitiesConfig::default()
     };
     to_proto_harness_side_tools(Some(&caps), false)
@@ -322,10 +325,9 @@ fn to_proto_custom_agents(
                 .map_or(proto::localharness::AgentBehavior::Autonomous as i32, |c| {
                     to_proto_agent_behavior(c.agent_behavior)
                 });
-            let harness_side_tools = sub
-                .capabilities
-                .as_ref()
-                .map(to_proto_subagent_harness_side_tools);
+            let harness_side_tools = Some(to_proto_subagent_harness_side_tools(
+                sub.capabilities.as_ref(),
+            ));
             let tools = sub
                 .tools
                 .iter()
@@ -631,6 +633,7 @@ fn to_proto_harness_side_tools(
             max_nesting_depth,
             allowed_subagents,
             disable_define_subagent_tool: caps.is_some_and(|c| c.disable_define_subagent_tool),
+            disable_manage_subagents_tool: caps.is_some_and(|c| c.disable_manage_subagents_tool),
         }),
         find: Some(proto::localharness::FindToolConfig {
             enabled: enabled_tools.contains(&BuiltinTools::FindFile),
@@ -691,122 +694,6 @@ fn to_proto_harness_side_tools(
             execution_mode: 0,
         }),
     }
-}
-
-fn to_proto_gemini_options(
-    gen_cfg: Option<&crate::config::GenerationConfig>,
-) -> Option<proto::localharness::GeminiModelOptions> {
-    let g = gen_cfg?;
-    if g.thinking_level.is_none() && g.service_tier.is_none() && g.max_output_tokens.is_none() {
-        return None;
-    }
-    let mut opts = proto::localharness::GeminiModelOptions::default();
-    if let Some(t) = g.thinking_level {
-        opts.thinking_level = t.as_str().to_string();
-    }
-    if let Some(s) = g.service_tier {
-        opts.service_tier = s.as_str().to_string();
-    }
-    if let Some(max_tokens) = g.max_output_tokens {
-        opts.max_output_tokens = max_tokens;
-    }
-    Some(opts)
-}
-
-fn build_gemini_endpoint(
-    base_url: String,
-    api_key: String,
-    options: Option<proto::localharness::GeminiModelOptions>,
-) -> proto::localharness::GeminiApiEndpoint {
-    proto::localharness::GeminiApiEndpoint {
-        base_url,
-        http_headers: HashMap::new(),
-        api_key,
-        options,
-    }
-}
-
-fn build_model_config(
-    name: String,
-    model_type: proto::localharness::ModelType,
-    base_url: String,
-    api_key: String,
-    options: Option<proto::localharness::GeminiModelOptions>,
-) -> proto::localharness::ModelConfig {
-    let endpoint = build_gemini_endpoint(base_url, api_key, options);
-    proto::localharness::ModelConfig {
-        name,
-        types: vec![model_type as i32],
-        endpoint: Some(proto::localharness::model_config::Endpoint::GeminiApi(
-            endpoint,
-        )),
-    }
-}
-
-fn build_models_proto(config: &AgentConfig) -> Vec<proto::localharness::ModelConfig> {
-    let model_name = if !config.model.is_empty() {
-        config.model.clone()
-    } else if let Some(ref g) = config.gemini {
-        g.models.default.name.clone()
-    } else {
-        crate::config::DEFAULT_MODEL.to_string()
-    };
-
-    let mut base_url = String::new();
-    if let Some(url) = config.effective_base_url() {
-        base_url = url;
-    }
-    let mut fallback_api_key = String::new();
-    if let Some(key) = config
-        .effective_api_key()
-        .or_else(|| (!base_url.is_empty()).then(|| crate::config::PROXY_AUTH_SENTINEL.to_string()))
-    {
-        fallback_api_key = key;
-    }
-
-    let text_api_key = config
-        .gemini
-        .as_ref()
-        .and_then(|g| g.models.default.api_key.clone())
-        .filter(|k| !k.is_empty())
-        .unwrap_or_else(|| fallback_api_key.clone());
-    let text_options =
-        to_proto_gemini_options(config.gemini.as_ref().map(|g| &g.models.default.generation));
-
-    let text_model = build_model_config(
-        model_name,
-        proto::localharness::ModelType::Text,
-        base_url.clone(),
-        text_api_key,
-        text_options,
-    );
-
-    let image_model_name = config.gemini.as_ref().map_or_else(
-        || crate::config::DEFAULT_IMAGE_GENERATION_MODEL.to_string(),
-        |g| g.models.image_generation.name.clone(),
-    );
-    let image_api_key = config
-        .gemini
-        .as_ref()
-        .and_then(|g| g.models.image_generation.api_key.clone())
-        .filter(|k| !k.is_empty())
-        .unwrap_or(fallback_api_key);
-    let image_options = to_proto_gemini_options(
-        config
-            .gemini
-            .as_ref()
-            .map(|g| &g.models.image_generation.generation),
-    );
-
-    let image_model = build_model_config(
-        image_model_name,
-        proto::localharness::ModelType::Image,
-        base_url,
-        image_api_key,
-        image_options,
-    );
-
-    vec![text_model, image_model]
 }
 
 fn stdio_mcp_server(name: String, stdio: &McpStdioServer) -> proto::localharness::McpServerConfig {
@@ -939,26 +826,49 @@ fn get_enabled_hooks(hook_runner: Option<&Arc<Hooks>>) -> Vec<i32> {
     hooks
 }
 
+fn split_policy_tool_target(target: &str) -> (String, String) {
+    if target == "*" {
+        return ("*".to_string(), String::new());
+    }
+    if let Some((server, tool_name)) = target.split_once('/') {
+        return (tool_name.to_string(), server.to_string());
+    }
+    (target.to_string(), String::new())
+}
+
+fn sanitize_rule_label(prefix: &str, raw: &str) -> String {
+    let clean = raw.replace('/', "_").replace('*', "all");
+    format!("{prefix}_{clean}")
+}
+
 fn rule_to_proto(rule: &PolicyRule) -> Option<proto::localharness::PolicyRule> {
     match rule {
-        PolicyRule::Allow(tool) => Some(proto::localharness::PolicyRule {
-            tool: tool.clone(),
-            server_name: String::new(),
-            name: format!("allow_{tool}"),
-            decision: proto::localharness::PolicyDecision::Allow as i32,
-            deny_reason: String::new(),
-            is_dynamic: false,
-            rule_id: format!("allow_{tool}"),
-        }),
-        PolicyRule::Deny(tool) => Some(proto::localharness::PolicyRule {
-            tool: tool.clone(),
-            server_name: String::new(),
-            name: format!("deny_{tool}"),
-            decision: proto::localharness::PolicyDecision::Deny as i32,
-            deny_reason: String::new(),
-            is_dynamic: false,
-            rule_id: format!("deny_{tool}"),
-        }),
+        PolicyRule::Allow(target) => {
+            let (tool, server_name) = split_policy_tool_target(target);
+            let label = sanitize_rule_label("allow", target);
+            Some(proto::localharness::PolicyRule {
+                tool,
+                server_name,
+                name: label.clone(),
+                decision: proto::localharness::PolicyDecision::Allow as i32,
+                deny_reason: String::new(),
+                is_dynamic: false,
+                rule_id: label,
+            })
+        }
+        PolicyRule::Deny(target) => {
+            let (tool, server_name) = split_policy_tool_target(target);
+            let label = sanitize_rule_label("deny", target);
+            Some(proto::localharness::PolicyRule {
+                tool,
+                server_name,
+                name: label.clone(),
+                decision: proto::localharness::PolicyDecision::Deny as i32,
+                deny_reason: String::new(),
+                is_dynamic: false,
+                rule_id: label,
+            })
+        }
         PolicyRule::AllowAll => Some(proto::localharness::PolicyRule {
             tool: "*".to_string(),
             server_name: String::new(),
@@ -977,15 +887,21 @@ fn rule_to_proto(rule: &PolicyRule) -> Option<proto::localharness::PolicyRule> {
             is_dynamic: false,
             rule_id: "deny_all".to_string(),
         }),
-        PolicyRule::AskUser { tool, handler_id } => Some(proto::localharness::PolicyRule {
-            tool: tool.clone(),
-            server_name: String::new(),
-            name: format!("ask_user_{tool}"),
-            decision: proto::localharness::PolicyDecision::AskUser as i32,
-            deny_reason: String::new(),
-            is_dynamic: true,
-            rule_id: handler_id.clone(),
-        }),
+        PolicyRule::AskUser {
+            tool: target,
+            handler_id,
+        } => {
+            let (tool, server_name) = split_policy_tool_target(target);
+            Some(proto::localharness::PolicyRule {
+                tool,
+                server_name,
+                name: sanitize_rule_label("ask_user", target),
+                decision: proto::localharness::PolicyDecision::AskUser as i32,
+                deny_reason: String::new(),
+                is_dynamic: true,
+                rule_id: handler_id.clone(),
+            })
+        }
         PolicyRule::WorkspaceOnly(_) => None,
     }
 }
@@ -995,8 +911,11 @@ fn build_policy_config(policy_set: &PolicySet) -> proto::localharness::PolicyCon
     let has_workspace_only = policy_set
         .iter()
         .any(|r| matches!(r, PolicyRule::WorkspaceOnly(_)));
+    let has_allow_all = policy_set.iter().any(|r| matches!(r, PolicyRule::AllowAll));
     let workspace_containment = if has_workspace_only {
         proto::localharness::policy_config::WorkspaceContainment::Enabled as i32
+    } else if has_allow_all {
+        proto::localharness::policy_config::WorkspaceContainment::Disabled as i32
     } else {
         proto::localharness::policy_config::WorkspaceContainment::Unspecified as i32
     };

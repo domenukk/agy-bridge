@@ -33,23 +33,25 @@ impl RustTool for GetDeviceSerial {
     const NAME: &'static str = "get_device_serial";
     const DESCRIPTION: &'static str = "Returns the serial number for a device.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
         let normalized = params.device_name.to_lowercase().replace(' ', "_");
         let serial = match normalized.as_str() {
             "pixel_9" => "SERIAL-PX9-001",
             "cuttlefish" => "SERIAL-CF-002",
             _ => "SERIAL-UNKNOWN",
         };
-        serde_json::to_string(&serde_json::json!({
-            "device": params.device_name,
-            "serial": serial,
-        }))
-        .map(ToolOutput::from)
-        .map_err(|e| ToolError::new(format!("Serialization error: {e}")))
+        std::future::ready(
+            serde_json::to_string(&serde_json::json!({
+                "device": params.device_name,
+                "serial": serial,
+            }))
+            .map(ToolOutput::from)
+            .map_err(|e| ToolError::new(format!("Serialization error: {e}"))),
+        )
     }
 }
 
@@ -68,11 +70,11 @@ impl RustTool for CheckBuildStatus {
     const NAME: &'static str = "check_build_status";
     const DESCRIPTION: &'static str = "Checks the status of a build job.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
         let result = match params.build_id.as_str() {
             "build-42" => serde_json::json!({
                 "build_id": "build-42",
@@ -89,9 +91,11 @@ impl RustTool for CheckBuildStatus {
                 "status": "unknown",
             }),
         };
-        serde_json::to_string(&result)
-            .map(ToolOutput::from)
-            .map_err(|e| ToolError::new(format!("Serialization error: {e}")))
+        std::future::ready(
+            serde_json::to_string(&result)
+                .map(ToolOutput::from)
+                .map_err(|e| ToolError::new(format!("Serialization error: {e}"))),
+        )
     }
 }
 
@@ -112,12 +116,12 @@ impl RustTool for AddNumbers {
     const NAME: &'static str = "add_numbers";
     const DESCRIPTION: &'static str = "Adds two numbers together.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        Ok(format!("{}", params.x + params.y).into())
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
+        std::future::ready(Ok(format!("{}", params.x + params.y).into()))
     }
 }
 
@@ -417,11 +421,11 @@ impl RustTool for WhoAmI {
     const NAME: &'static str = "who_am_i";
     const DESCRIPTION: &'static str = "Returns the caller's conversation identifier.";
 
-    async fn call(
+    fn call(
         &self,
         _params: Self::Params,
         ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
         let observed = ctx.conversation_id().map(str::to_owned);
         match self.captured.lock() {
             Ok(mut slot) => slot.clone_from(&observed),
@@ -429,7 +433,7 @@ impl RustTool for WhoAmI {
             // but a poisoned mutex should never be silently ignored.
             Err(e) => eprintln!("who_am_i: captured mutex poisoned: {e}"),
         }
-        Ok(observed.unwrap_or_else(|| "unknown".to_owned()).into())
+        std::future::ready(Ok(observed.unwrap_or_else(|| "unknown".to_owned()).into()))
     }
 }
 

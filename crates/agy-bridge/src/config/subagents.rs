@@ -90,6 +90,12 @@ pub struct SubagentCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(setter(into, strip_option))]
     pub tool_output_truncation_config: Option<super::truncation::ToolOutputTruncationConfig>,
+    /// When true, disables the `define_subagent` tool for this subagent.
+    #[serde(default)]
+    pub disable_define_subagent_tool: bool,
+    /// When true, disables the `manage_subagents` tool for this subagent (`0.1.24`+).
+    #[serde(default)]
+    pub disable_manage_subagents_tool: bool,
 }
 
 /// Configuration for defining a custom subagent available to the primary agent.

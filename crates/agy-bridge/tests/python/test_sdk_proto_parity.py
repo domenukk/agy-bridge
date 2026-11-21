@@ -52,7 +52,7 @@ def test_harness_side_tools_patch_keeps_real_sdk_signature_and_call_path():
     assert sub_proto.HasField("subagents")
 
 
-def test_harness_side_tools_patch_sets_flag_for_root_agent_only():
+def test_harness_side_tools_patch_sets_flags_for_root_and_flagged_subagent():
     real_params = inspect.signature(
         _patched_strategy_cls().__mro__[1]._to_harness_side_tools_proto
     ).parameters
@@ -74,7 +74,11 @@ def test_harness_side_tools_patch_sets_flag_for_root_agent_only():
     root = strategy._to_harness_side_tools_proto(flagged)
     assert root.subagents.disable_define_subagent_tool is True
     sub = strategy._to_harness_side_tools_proto(flagged, is_subagent=True)
-    assert sub.subagents.disable_define_subagent_tool is False
+    assert sub.subagents.disable_define_subagent_tool is True
+    plain_sub = strategy._to_harness_side_tools_proto(
+        types.SimpleNamespace(), is_subagent=True
+    )
+    assert plain_sub.subagents.disable_define_subagent_tool is False
     plain = strategy._to_harness_side_tools_proto(types.SimpleNamespace())
     assert plain.subagents.disable_define_subagent_tool is False
 

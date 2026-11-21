@@ -14,7 +14,7 @@ use super::{
     events::to_proto_user_input,
     session::NativeAgentSession,
     tools::build_available_tools,
-    ws::{remove_persisted_conversation_files, spawn_session_io_tasks},
+    ws::{remove_persisted_conversation_files, spawn_session_io_tasks, validate_conversation_id},
 };
 use crate::{
     agent::{AgentId, Runtime, validate_create_config},
@@ -89,35 +89,36 @@ async fn acquire_session_turn(
                         "Failed to send HaltRequest for abandoned turn"
                     );
                 }
-                while let Err(still_idle_state) = session.is_idle.compare_exchange(
-                    true,
-                    false,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    tracing::trace!(
-                        agent_id = %agent_id,
-                        still_idle_state,
-                        "Waiting for abandoned turn to transition to idle"
-                    );
+                loop {
+                    let notified = session.idle_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    match session.is_idle.compare_exchange(
+                        true,
+                        false,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(_still_busy) => {}
+                    }
                     if !session.connected.load(Ordering::SeqCst) {
                         return Err(Error::BackendError {
                             message: "Agent session disconnected while waiting for abandoned turn"
                                 .to_string(),
                         });
                     }
-                    session.idle_notify.notified().await;
+                    notified.await;
                 }
-                Ok(())
-            } else {
-                tracing::debug!(
-                    agent_id = %agent_id,
-                    "Agent is busy with an active turn, cannot acquire turn"
-                );
-                Err(Error::BackendError {
-                    message: "Agent is already executing a turn; wait for completion before starting a new turn".to_string(),
-                })
             }
+            tracing::debug!(
+                agent_id = %agent_id,
+                "Agent is busy with an active turn, cannot acquire turn"
+            );
+            Err(Error::BackendError {
+                message: "Agent is already executing a turn; wait for completion before starting a new turn".to_string(),
+            })
         }
     }
 }
@@ -151,6 +152,21 @@ fn extract_hook_runner_and_conv_id(agent_id: AgentId) -> (Option<Arc<Hooks>>, Op
     }
 }
 
+fn extract_prompt_text(content: &Content) -> String {
+    match content {
+        Content::Text { text } => text.clone(),
+        Content::Multi { parts } => parts
+            .iter()
+            .filter_map(|p| match p {
+                crate::content::ContentPrimitive::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 impl Runtime for NativeRuntime {
     fn create_agent(
         &self,
@@ -162,23 +178,22 @@ impl Runtime for NativeRuntime {
         let runtime = self.runtime_handle.clone();
 
         async move {
+            if config.litert.is_some() {
+                return Err(Error::UnsupportedFeature {
+                    message:
+                        "LiteRTConfig requires the Python runtime (`litert-lm`); NativeRuntime does not embed the Python LiteRT server"
+                            .to_owned(),
+                });
+            }
             validate_create_config(&config)?;
             let hook_runner = agent_hooks(agent_id);
             let policies = PolicySet::validated_from(config.policies.clone())?;
 
-            let save_dir = config.save_dir.clone().unwrap_or_else(std::env::temp_dir);
-            if config.save_dir.is_some()
-                && let Err(e) = std::fs::create_dir_all(&save_dir)
-            {
-                tracing::warn!(
-                    path = %save_dir.display(),
-                    error = %e,
-                    "Failed to pre-create save_dir for localharness"
-                );
-            }
-            let (ws, init_state) = match self
+            let save_dir = self.prepare_save_dir(config.save_dir.as_deref())?;
+            let harness_key = Self::harness_cache_key(&save_dir, &config.env);
+            let (ws, mut init_state) = match self
                 .connect_and_init_harness(
-                    &save_dir,
+                    &harness_key,
                     custom_binary_path.as_deref(),
                     agent_id,
                     &config,
@@ -189,8 +204,12 @@ impl Runtime for NativeRuntime {
             {
                 Ok(val) => val,
                 Err(e) => {
-                    Self::deregister_agent_from_harnesses_map(&self.harnesses, &save_dir, agent_id)
-                        .await;
+                    Self::deregister_agent_from_harnesses_map(
+                        &self.harnesses,
+                        &harness_key,
+                        agent_id,
+                    )
+                    .await;
                     return Err(e);
                 }
             };
@@ -202,6 +221,12 @@ impl Runtime for NativeRuntime {
             {
                 tracing::warn!(error = %e, "Failed to set agent conversation id on bridge_state");
             }
+            if let Some(restored_out) = init_state.restored_structured_output.take() {
+                crate::runtime::bridge_state::set_restored_structured_output(
+                    agent_id,
+                    Some(restored_out),
+                );
+            }
 
             let available_tools = build_available_tools(&config);
             let finish_on_tools: HashSet<String> = config.finish_on_tools.iter().cloned().collect();
@@ -212,6 +237,7 @@ impl Runtime for NativeRuntime {
                 event_tx,
                 init_state,
                 save_dir,
+                harness_key,
                 finish_on_tools,
             ));
 
@@ -224,7 +250,9 @@ impl Runtime for NativeRuntime {
                 sessions.insert(agent_id, session);
             }
 
-            if let Some(ref hooks) = hook_runner {
+            if let Some(ref hooks) = hook_runner
+                && crate::runtime::bridge_state::claim_session_start_once(agent_id)
+            {
                 let hooks = Arc::clone(hooks);
                 let session_id = initial_cascade_id
                     .clone()
@@ -253,16 +281,51 @@ impl Runtime for NativeRuntime {
         content: &Content,
     ) -> impl Future<Output = Result<ChatResponseHandle, Error>> + Send {
         let sessions_map = Arc::clone(&self.sessions);
-        let content = content.clone();
+        let prompt_text = extract_prompt_text(content);
+        let user_input = to_proto_user_input(content);
 
         async move {
             let session = lookup_session(&sessions_map, agent_id)?;
 
             acquire_session_turn(agent_id, &session).await?;
 
+            session.turn_epoch.fetch_add(1, Ordering::SeqCst);
             session.produced_output.store(false, Ordering::SeqCst);
             session.turn_activity.store(false, Ordering::SeqCst);
             session.finished_by_tool.store(false, Ordering::SeqCst);
+            crate::runtime::bridge_state::set_restored_structured_output(agent_id, None);
+            match session.emitted_builtin_tool_steps.lock() {
+                Ok(mut seen) => seen.clear(),
+                Err(poisoned) => poisoned.into_inner().clear(),
+            }
+            match session.answered_question_steps.lock() {
+                Ok(mut seen) => seen.clear(),
+                Err(poisoned) => poisoned.into_inner().clear(),
+            }
+
+            let current_cumulative = match session.total_usage.lock() {
+                Ok(guard) => guard.clone(),
+                Err(e) => {
+                    tracing::error!(error = %e, "Poisoned total_usage lock in chat");
+                    UsageMetadata::default()
+                }
+            };
+            match session.turn_start_usage.lock() {
+                Ok(mut start_lock) => {
+                    *start_lock = current_cumulative;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Poisoned turn_start_usage lock in chat");
+                }
+            }
+            match session.last_turn_usage.lock() {
+                Ok(mut turn_lock) => {
+                    *turn_lock = UsageMetadata::default();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Poisoned last_turn_usage lock in chat");
+                }
+            }
             match session.last_response_text.lock() {
                 Ok(mut resp_lock) => {
                     *resp_lock = None;
@@ -280,19 +343,6 @@ impl Runtime for NativeRuntime {
                 }
             }
 
-            let prompt_text = match &content {
-                Content::Text { text } => text.clone(),
-                Content::Multi { parts } => parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        crate::content::ContentPrimitive::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            };
-
             match session.history.lock() {
                 Ok(mut hist) => hist.push(ConversationMessage {
                     role: MessageRole::User,
@@ -309,7 +359,6 @@ impl Runtime for NativeRuntime {
                 *active = Some(writer);
             }
 
-            let user_input = to_proto_user_input(&content);
             let input_event = proto::localharness::InputEvent {
                 event: Some(proto::localharness::input_event::Event::UserInput(
                     user_input,
@@ -353,11 +402,13 @@ impl Runtime for NativeRuntime {
                 }
                 s.connected.store(false, Ordering::Release);
 
-                Self::deregister_agent_from_harnesses_map(&harnesses_map, &s.save_dir, agent_id)
+                Self::deregister_agent_from_harnesses_map(&harnesses_map, &s.harness_key, agent_id)
                     .await;
 
+                let end_not_yet_fired =
+                    crate::runtime::bridge_state::claim_session_end_once(agent_id);
                 let (hr_opt, conv_id) = extract_hook_runner_and_conv_id(agent_id);
-                if let Some(hr) = hr_opt {
+                if end_not_yet_fired && let Some(hr) = hr_opt {
                     let session_id = conv_id.unwrap_or_else(|| format!("agent-{agent_id}"));
                     let ctx = OnSessionEndContext {
                         session: SessionContext {
@@ -391,9 +442,8 @@ impl Runtime for NativeRuntime {
                     }
                     s.connected.store(false, Ordering::Release);
 
-                    let key = Self::canonical_save_dir(&s.save_dir);
                     let slot_opt = match self.harnesses.lock() {
-                        Ok(harnesses) => harnesses.get(&key).cloned(),
+                        Ok(harnesses) => harnesses.get(&s.harness_key).cloned(),
                         Err(e) => {
                             tracing::debug!(
                                 error = %e,
@@ -443,8 +493,10 @@ impl Runtime for NativeRuntime {
                         }
                     }
 
+                    let end_not_yet_fired =
+                        crate::runtime::bridge_state::claim_session_end_once(agent_id);
                     let (hr_opt, conv_id) = extract_hook_runner_and_conv_id(agent_id);
-                    if let Some(hr) = hr_opt {
+                    if end_not_yet_fired && let Some(hr) = hr_opt {
                         let session_id = conv_id.unwrap_or_else(|| format!("agent-{agent_id}"));
                         let ctx = OnSessionEndContext {
                             session: SessionContext {
@@ -487,11 +539,16 @@ impl Runtime for NativeRuntime {
         async move {
             let session = lookup_session(&sessions_map, agent_id)?;
 
-            while !session.is_idle.load(Ordering::SeqCst) {
-                session.idle_notify.notified().await;
-            }
+            loop {
+                let notified = session.idle_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
 
-            Ok(())
+                if session.is_idle.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                notified.await;
+            }
         }
     }
 
@@ -618,7 +675,27 @@ impl Runtime for NativeRuntime {
                         message: format!("Poisoned last_response_text lock: {e}"),
                     })?;
             *last_resp = None;
+            let current_total = session
+                .total_usage
+                .lock()
+                .map_err(|e| Error::BackendError {
+                    message: format!("Poisoned total_usage lock: {e}"),
+                })?
+                .clone();
+            *session
+                .turn_start_usage
+                .lock()
+                .map_err(|e| Error::BackendError {
+                    message: format!("Poisoned turn_start_usage lock: {e}"),
+                })? = current_total;
+            *session
+                .last_turn_usage
+                .lock()
+                .map_err(|e| Error::BackendError {
+                    message: format!("Poisoned last_turn_usage lock: {e}"),
+                })? = UsageMetadata::default();
             session.turn_count.store(0, Ordering::SeqCst);
+            crate::runtime::bridge_state::set_restored_structured_output(agent_id, None);
             Ok(())
         }
     }
@@ -671,11 +748,16 @@ impl Runtime for NativeRuntime {
                 }
             };
             let conv_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id);
-            let res = shutdown_fut.await;
+            let validation_res = match conv_id.as_deref() {
+                Some(cid) => validate_conversation_id(cid),
+                None => Ok(()),
+            };
+            let shutdown_res = shutdown_fut.await;
+            validation_res?;
             if let (Some(save_dir), Some(cid)) = (save_dir_opt, conv_id) {
-                remove_persisted_conversation_files(&save_dir, &cid);
+                remove_persisted_conversation_files(&save_dir, &cid)?;
             }
-            res
+            shutdown_res
         }
     }
 

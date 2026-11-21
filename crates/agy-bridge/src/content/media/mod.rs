@@ -174,11 +174,49 @@ pub mod mime {
     pub const TEXT_RTF: &str = "text/rtf";
     /// MIME type for XML documents.
     pub const TEXT_XML: &str = "text/xml";
+    /// MIME type for `PowerPoint` `.pptx` presentations (`0.1.24`+).
+    pub const APPLICATION_PPTX: &str =
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    /// MIME type for legacy `PowerPoint` `.ppt` presentations (`0.1.24`+).
+    pub const APPLICATION_PPT: &str = "application/vnd.ms-powerpoint";
+    /// MIME type for `OpenDocument` `.odp` presentations (`0.1.24`+).
+    pub const APPLICATION_ODP: &str = "application/vnd.oasis.opendocument.presentation";
+    /// MIME type for Word `.docx` documents (`0.1.24`+).
+    pub const APPLICATION_DOCX: &str =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    /// MIME type for legacy Word `.doc` documents (`0.1.24`+).
+    pub const APPLICATION_DOC: &str = "application/msword";
+    /// MIME type for Word `.dotx` templates (`0.1.24`+).
+    pub const APPLICATION_DOTX: &str =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.template";
+    /// MIME type for `OpenDocument` `.odt` text documents (`0.1.24`+).
+    pub const APPLICATION_ODT: &str = "application/vnd.oasis.opendocument.text";
+    /// MIME type for Excel `.xlsx` spreadsheets (`0.1.24`+).
+    pub const APPLICATION_XLSX: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    /// MIME type for legacy Excel `.xls` spreadsheets (`0.1.24`+).
+    pub const APPLICATION_XLS: &str = "application/vnd.ms-excel";
+    /// MIME type for `OpenDocument` `.ods` spreadsheets (`0.1.24`+).
+    pub const APPLICATION_ODS: &str = "application/vnd.oasis.opendocument.spreadsheet";
 
-    /// MIME type for MP3 audio.
+    /// MIME type for MP3 audio (`audio/mpeg`).
     pub const AUDIO_MPEG: &str = "audio/mpeg";
-    /// MIME type for WAV audio.
+    /// Alias MIME type for MP3 audio (`audio/mp3`, `0.1.24`+).
+    pub const AUDIO_MP3: &str = "audio/mp3";
+    /// MIME type for MP4 audio (`audio/mp4`, `0.1.24`+).
+    pub const AUDIO_MP4: &str = "audio/mp4";
+    /// MIME type for WAV audio (`audio/wav`).
     pub const AUDIO_WAV: &str = "audio/wav";
+    /// Alias MIME type for WAV audio (`audio/x-wav`, `0.1.24`+).
+    pub const AUDIO_X_WAV: &str = "audio/x-wav";
+    /// Alias MIME type for WAV audio (`audio/wave`, `0.1.24`+).
+    pub const AUDIO_WAVE: &str = "audio/wave";
+    /// Alias MIME type for WAV audio (`audio/vnd.wave`, `0.1.24`+).
+    pub const AUDIO_VND_WAVE: &str = "audio/vnd.wave";
+    /// MIME type for raw 16-bit PCM audio (`audio/l16`, `0.1.24`+).
+    pub const AUDIO_L16: &str = "audio/l16";
+    /// MIME type for `WebM` audio (`audio/webm`, `0.1.24`+).
+    pub const AUDIO_WEBM: &str = "audio/webm";
     /// MIME type for OGG audio.
     pub const AUDIO_OGG: &str = "audio/ogg";
     /// MIME type for FLAC audio.
@@ -232,9 +270,21 @@ pub mod mime {
             "js" | "mjs" => Some(TEXT_JAVASCRIPT),
             "rtf" => Some(TEXT_RTF),
             "xml" => Some(TEXT_XML),
+            "pptx" => Some(APPLICATION_PPTX),
+            "ppt" => Some(APPLICATION_PPT),
+            "odp" => Some(APPLICATION_ODP),
+            "docx" => Some(APPLICATION_DOCX),
+            "doc" => Some(APPLICATION_DOC),
+            "dotx" => Some(APPLICATION_DOTX),
+            "odt" => Some(APPLICATION_ODT),
+            "xlsx" => Some(APPLICATION_XLSX),
+            "xls" => Some(APPLICATION_XLS),
+            "ods" => Some(APPLICATION_ODS),
             // Audio
             "mp3" => Some(AUDIO_MPEG),
             "wav" => Some(AUDIO_WAV),
+            "l16" | "pcm" => Some(AUDIO_L16),
+            "weba" => Some(AUDIO_WEBM),
             "ogg" | "oga" => Some(AUDIO_OGG),
             "flac" => Some(AUDIO_FLAC),
             "aac" => Some(AUDIO_AAC),
@@ -596,6 +646,62 @@ impl Video {
         let (data, mime_type) = from_file_inner(path.as_ref(), "a video", &["video/"])?;
         Ok(Self::new(data, mime_type))
     }
+}
+
+/// Construct a typed [`super::ContentPrimitive`] from raw bytes and a MIME string.
+///
+/// Routes `image/*` → [`Image`], `audio/*` → [`Audio`], `video/*` → [`Video`],
+/// and `application/*` / `text/*` → [`Document`].
+///
+/// # Errors
+///
+/// Returns `std::io::Error` (`ErrorKind::InvalidInput`) if `mime_type` is empty
+/// or has an unsupported top-level media category.
+pub fn from_bytes(
+    data: Vec<u8>,
+    mime_type: impl Into<String>,
+) -> std::io::Result<super::ContentPrimitive> {
+    let normalized = normalize_mime_type(mime_type);
+    if normalized.starts_with("image/") {
+        Ok(super::ContentPrimitive::Image(Image::new(data, normalized)))
+    } else if normalized.starts_with("audio/") {
+        Ok(super::ContentPrimitive::Audio(Audio::new(data, normalized)))
+    } else if normalized.starts_with("video/") {
+        Ok(super::ContentPrimitive::Video(Video::new(data, normalized)))
+    } else if normalized.starts_with("application/") || normalized.starts_with("text/") {
+        Ok(super::ContentPrimitive::Document(Document::new(
+            data, normalized,
+        )))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported media MIME type: '{normalized}'"),
+        ))
+    }
+}
+
+/// Load a file from disk into a typed [`super::ContentPrimitive`], inferring the
+/// media category and MIME type from its extension (expanding leading `~`).
+///
+/// # Errors
+///
+/// Returns `std::io::Error` if the path lacks a recognized extension or reading fails.
+pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<super::ContentPrimitive> {
+    let expanded = expand_tilde(path.as_ref());
+    let ext = expanded
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file extension")
+        })?;
+    let mime_type = mime::from_extension(ext).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unrecognized media file extension: {ext}"),
+        )
+    })?;
+    let data = std::fs::read(&expanded)?;
+    from_bytes(data, mime_type)
 }
 
 #[cfg(test)]

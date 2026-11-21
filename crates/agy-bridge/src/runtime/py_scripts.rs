@@ -94,6 +94,37 @@ pub(crate) fn warm_up_lazy_imports(py: Python<'_>) {
     }
 }
 
+/// Strongly-typed prompt transport payload preserving plain text (`Content::Text`)
+/// verbatim so numeric/boolean/JSON-shaped text prompts (`"42"`, `"true"`, `'{"a":1}'`)
+/// are never misparsed as non-string Python objects or spoofed media dicts.
+#[derive(Debug, Clone)]
+pub(crate) enum PyPromptPayload {
+    PlainText(String),
+    RichJson(String),
+}
+
+impl PyPromptPayload {
+    pub(crate) fn from_content(
+        content: &crate::content::Content,
+    ) -> Result<Self, crate::error::Error> {
+        match content {
+            crate::content::Content::Text { text } => Ok(Self::PlainText(text.clone())),
+            other => crate::content::content_to_json(other).map(Self::RichJson),
+        }
+    }
+}
+
+/// Convert a [`PyPromptPayload`] into a Python SDK prompt argument (`str`, media object, or `list`).
+pub(crate) fn decode_prompt_payload_py<'py>(
+    py: Python<'py>,
+    payload: &PyPromptPayload,
+) -> PyResult<Bound<'py, PyAny>> {
+    match payload {
+        PyPromptPayload::PlainText(text) => Ok(pyo3::types::PyString::new(py, text).into_any()),
+        PyPromptPayload::RichJson(json) => decode_prompt_py(py, json),
+    }
+}
+
 /// Decode multimodal prompt content from JSON and map it to Python SDK objects.
 pub fn decode_prompt_py<'py>(py: Python<'py>, prompt_str: &str) -> PyResult<Bound<'py, PyAny>> {
     match serde_json::from_str::<serde_json::Value>(prompt_str) {
@@ -198,6 +229,21 @@ fn decode_content_value<'py>(
                     })?;
 
                 let types_mod = import_serialized(py, MEDIA_TYPES_MODULE)?;
+                if typ == "Document"
+                    && types_mod.hasattr("SUPPORTED_DOCUMENT_MIMES")?
+                    && let Ok(supported) = types_mod.getattr("SUPPORTED_DOCUMENT_MIMES")
+                    && !supported.contains(mime_type.as_str())?
+                {
+                    let err_cls = types_mod
+                        .getattr("AntigravityValidationError")
+                        .unwrap_or_else(|_e| {
+                            py.get_type::<pyo3::exceptions::PyValueError>().into_any()
+                        });
+                    return Err(PyErr::from_value(err_cls.call1((format!(
+                        "Document mime_type '{mime_type}' is not in google.antigravity.types.SUPPORTED_DOCUMENT_MIMES; \
+                         use NativeRuntime for Office/ODF document attachments until the Python SDK allowlist adds it"
+                    ),))?));
+                }
                 let kwargs = pyo3::types::PyDict::new(py);
                 kwargs.set_item("data", pyo3::types::PyBytes::new(py, &raw_bytes))?;
                 kwargs.set_item("mime_type", mime_type)?;

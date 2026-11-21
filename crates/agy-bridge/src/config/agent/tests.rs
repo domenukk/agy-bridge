@@ -42,6 +42,7 @@ fn agent_config_builder_with_gemini() {
         api_key: Some("test-key".to_string()),
         base_url: None,
         models: ModelConfig::default(),
+        ..Default::default()
     };
     let config = AgentConfig::builder().gemini(gemini).build();
     let gemini_cfg = config.gemini.expect("gemini should be Some");
@@ -54,6 +55,7 @@ fn agent_config_builder_gemini_with_thinking_level() {
     let gemini = GeminiConfig {
         api_key: None,
         base_url: None,
+        http_headers: std::collections::HashMap::new(),
         models: ModelConfig {
             default: ModelEntry {
                 name: "gemini-3.5-flash".to_string(),
@@ -88,6 +90,7 @@ fn agent_config_gemini_serde_roundtrip() {
         gemini: Some(GeminiConfig {
             api_key: Some("roundtrip-key".to_string()),
             base_url: None,
+            http_headers: std::collections::HashMap::new(),
             models: ModelConfig {
                 default: ModelEntry {
                     name: "gemini-3.5-flash".to_string(),
@@ -175,12 +178,14 @@ fn agent_config_fully_populated_serde() {
         const NAME: &'static str = "custom_tool";
         const DESCRIPTION: &'static str = "A custom tool";
 
-        async fn call(
+        fn call(
             &self,
             _params: Self::Params,
             _ctx: &crate::tools::ToolContext,
-        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
-            Ok("ok".into())
+        ) -> impl std::future::Future<
+            Output = Result<crate::tools::ToolOutput, crate::tools::ToolError>,
+        > + Send {
+            std::future::ready(Ok("ok".into()))
         }
     }
 
@@ -524,6 +529,7 @@ fn effective_api_key_prefers_per_model_key() {
         .gemini(super::super::GeminiConfig {
             api_key: Some("shared-key".into()),
             base_url: None,
+            http_headers: std::collections::HashMap::new(),
             models: super::super::ModelConfig {
                 default: super::super::ModelEntry {
                     name: "gemini-3.5-flash".into(),

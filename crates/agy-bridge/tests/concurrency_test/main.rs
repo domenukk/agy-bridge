@@ -290,6 +290,7 @@ fn agent_config(base_url: &str, system: &str) -> agy_bridge::config::AgentConfig
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url.to_string()),
             models: agy_bridge::config::ModelConfig::default(),
+            ..Default::default()
         })
         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
         .retry_config(agy_bridge::config::RetryConfig::no_retries())

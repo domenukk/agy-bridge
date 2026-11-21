@@ -22,6 +22,7 @@ PROTO_CUSTOM_SI_PART = "CustomSystemInstructions.Part"
 PROTO_COMPACTION_CONFIG = "CompactionConfig"
 PROTO_MCP_SERVER_CONFIG = "McpServerConfig"
 FIELD_DISABLE_DEFINE_SUBAGENT_TOOL = "disable_define_subagent_tool"
+FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL = "disable_manage_subagents_tool"
 FIELD_TITLE = "title"
 FIELD_INCLUDE_LAST_USER_MESSAGE = "include_last_user_message"
 FIELD_MCP_ENABLED_TOOLS = "enabled_tools"
@@ -29,6 +30,7 @@ FIELD_MCP_DISABLED_TOOLS = "disabled_tools"
 FIELD_MCP_TIMEOUT_SECONDS = "timeout_seconds"
 FIELD_MCP_FORCE_ALL_TOOLS_EAGER = "force_all_tools_eager"
 ATTR_DISABLE_DEFINE_SUBAGENT_TOOL = "_agy_disable_define_subagent_tool"
+ATTR_DISABLE_MANAGE_SUBAGENTS_TOOL = "_agy_disable_manage_subagents_tool"
 ATTR_CUSTOM_TITLE = "_agy_custom_title"
 
 
@@ -67,10 +69,16 @@ def _patch_harness_side_tools_proto(strategy_cls: Any, logger: logging.Logger) -
 
         def _patched(self: Any, cfg: Any, is_subagent: bool = False) -> Any:
             proto = original(self, cfg, is_subagent=is_subagent)
-            if not is_subagent and getattr(
-                cfg, ATTR_DISABLE_DEFINE_SUBAGENT_TOOL, False
-            ):
+            has_ws_only = any(
+                getattr(p, "name", "") == "workspace_only"
+                for p in (getattr(self, "_policies", None) or ())
+            )
+            if has_ws_only and not is_subagent:
+                proto.permissions.enforce_workspace_validation = True
+            if getattr(cfg, ATTR_DISABLE_DEFINE_SUBAGENT_TOOL, False):
                 setattr(proto.subagents, FIELD_DISABLE_DEFINE_SUBAGENT_TOOL, True)
+            if getattr(cfg, ATTR_DISABLE_MANAGE_SUBAGENTS_TOOL, False):
+                setattr(proto.subagents, FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL, True)
             return proto
 
         strategy_cls._to_harness_side_tools_proto = _patched
@@ -271,6 +279,63 @@ def _coerce_system_instructions(si: Any) -> Any:
     return si
 
 
+def _schema_expects_integer(schema: Any, root_schema: dict[str, Any]) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        node: Any = root_schema
+        for seg in ref[2:].split("/"):
+            node = node.get(seg) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            return _schema_expects_integer(node, root_schema)
+    ty = schema.get("type")
+    if ty == "integer":
+        return True
+    if isinstance(ty, list) and "integer" in ty and "number" not in ty:
+        return True
+    for union_key in ("anyOf", "oneOf"):
+        variants = schema.get(union_key)
+        if isinstance(variants, list) and any(
+            _schema_expects_integer(v, root_schema) for v in variants
+        ):
+            return True
+    return False
+
+
+def _coerce_schema_integers(
+    value: Any, schema: Any, root_schema: dict[str, Any]
+) -> Any:
+    """Coerce whole-valued `float` (`45.0`) unpacked from `protobuf.Struct` back to `int` for integer schema fields."""
+    if not isinstance(schema, dict):
+        return value
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        node: Any = root_schema
+        for seg in ref[2:].split("/"):
+            node = node.get(seg) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            return _coerce_schema_integers(value, node, root_schema)
+    if (
+        isinstance(value, float)
+        and not isinstance(value, bool)
+        and value.is_integer()
+        and _schema_expects_integer(schema, root_schema)
+    ):
+        return int(value)
+    if isinstance(value, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            return {
+                k: _coerce_schema_integers(v, props.get(k), root_schema)
+                for k, v in value.items()
+            }
+    if isinstance(value, list) and "items" in schema:
+        item_schema = schema.get("items")
+        return [_coerce_schema_integers(v, item_schema, root_schema) for v in value]
+    return value
+
+
 def _wire_tool_proxies(local_config: dict[str, Any], agent_id_u64: int) -> None:
     """Replace tool/capability dict specs with AsyncRustProxy instances."""
     from google.antigravity.tools import tool_runner
@@ -299,28 +364,52 @@ def _wire_tool_proxies(local_config: dict[str, Any], agent_id_u64: int) -> None:
                 raise RuntimeError(
                     "dispatch_rust_tool not found in _agy_bridge_globals"
                 )
-            if not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
-                globals_mod.CURRENT_TOOL_CALLS = {}
 
             class DummyToolCall:
                 def __init__(self, name: str, args: dict[str, Any]) -> None:
                     self.name = name
                     self.args = args
 
-            globals_mod.CURRENT_TOOL_CALLS[int(self.agent_id)] = DummyToolCall(
-                self.__name__, kwargs
+            active_call_id = (
+                globals_mod.get_current_client_tool_call_id()
+                if hasattr(globals_mod, "get_current_client_tool_call_id")
+                else None
             )
-            args_json = json.dumps(kwargs)
+            coerced_kwargs = _coerce_schema_integers(
+                kwargs, self.input_schema, self.input_schema
+            )
+            if hasattr(globals_mod, "_store_tracked_tool_call"):
+                globals_mod._store_tracked_tool_call(
+                    globals_mod,
+                    int(self.agent_id),
+                    active_call_id,
+                    DummyToolCall(self.__name__, coerced_kwargs),
+                )
+            else:
+                if not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
+                    globals_mod.CURRENT_TOOL_CALLS = {}
+                globals_mod.CURRENT_TOOL_CALLS[int(self.agent_id)] = {
+                    str(active_call_id) if active_call_id else "_latest": DummyToolCall(
+                        self.__name__, coerced_kwargs
+                    )
+                }
+            args_json = json.dumps(coerced_kwargs)
 
             res = globals_mod.dispatch_rust_tool(
                 int(self.agent_id), self.__name__, args_json
             )
             if inspect.isawaitable(res):
                 res = await res
-            if isinstance(res, dict) and "metadata" in res:
-                if not hasattr(globals_mod, "LAST_TOOL_METADATA"):
-                    globals_mod.LAST_TOOL_METADATA = {}
-                globals_mod.LAST_TOOL_METADATA[int(self.agent_id)] = res.get("metadata")
+            if isinstance(res, dict) and "content" in res:
+                if hasattr(globals_mod, "_store_tool_metadata"):
+                    globals_mod._store_tool_metadata(
+                        globals_mod,
+                        int(self.agent_id),
+                        active_call_id,
+                        self.__name__,
+                        res.get("metadata"),
+                    )
+                return res["content"]
             return res
 
     def create_proxy(
@@ -469,6 +558,24 @@ def _wire_subagents(local_config: dict[str, Any]) -> None:
                         disabled_tools=disabled,
                         run_command_config=rc_cfg,
                     )
+                    if c_dict.get(FIELD_DISABLE_DEFINE_SUBAGENT_TOOL):
+                        _require_sdk_proto_field(
+                            PROTO_SUBAGENTS_CONFIG,
+                            FIELD_DISABLE_DEFINE_SUBAGENT_TOOL,
+                            "SubagentCapabilities.disable_define_subagent_tool",
+                        )
+                        object.__setattr__(
+                            caps, ATTR_DISABLE_DEFINE_SUBAGENT_TOOL, True
+                        )
+                    if c_dict.get(FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL):
+                        _require_sdk_proto_field(
+                            PROTO_SUBAGENTS_CONFIG,
+                            FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL,
+                            "SubagentCapabilities.disable_manage_subagents_tool",
+                        )
+                        object.__setattr__(
+                            caps, ATTR_DISABLE_MANAGE_SUBAGENTS_TOOL, True
+                        )
                 sub_si = s.get("system_instructions")
                 if sub_si is not None:
                     sub_si = _coerce_system_instructions(sub_si)
@@ -602,3 +709,263 @@ def _wire_retry_config(local_config: dict[str, Any]) -> None:
             local_config["retry_config"] = RetryConfig(**kwargs)
         except ImportError:
             return
+
+
+def _decode_question_hook_result(result_json: str, hook_logger: logging.Logger) -> Any:
+    """Decode a serialized Rust `QuestionHookResult` into an SDK `QuestionHookResult`."""
+    import json
+
+    from google.antigravity import types as sdk_types
+
+    if not result_json:
+        return sdk_types.QuestionHookResult(responses=[], cancelled=False)
+    try:
+        res_dict = json.loads(result_json)
+        if not isinstance(res_dict, dict):
+            return sdk_types.QuestionHookResult(responses=[], cancelled=False)
+        raw_responses = res_dict.get("responses") or []
+        parsed_responses = []
+        for item in raw_responses:
+            if isinstance(item, dict):
+                sel = item.get("selected_option_ids")
+                parsed_responses.append(
+                    sdk_types.QuestionResponse(
+                        selected_option_ids=(
+                            [str(x) for x in sel] if isinstance(sel, list) else None
+                        ),
+                        freeform_response=str(item.get("freeform_response") or ""),
+                        skipped=bool(item.get("skipped", False)),
+                    )
+                )
+        return sdk_types.QuestionHookResult(
+            responses=parsed_responses,
+            cancelled=bool(res_dict.get("cancelled", False)),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        hook_logger.error("Failed to decode on_interaction result JSON: %s", exc)
+        return sdk_types.QuestionHookResult(responses=[], cancelled=True)
+
+
+def _build_vertex_model_target(
+    entry: Any,
+    vertex_cfg: dict[str, Any],
+    env_map: dict[str, str],
+    fallback_model_name: str,
+    image_shorthand: str | None,
+    is_image: bool,
+) -> Any:
+    """Build an SDK `ModelTarget` backed by `VertexEndpoint`."""
+    import os
+
+    from google.antigravity import models as sdk_models
+    from google.antigravity.types import (
+        GeminiModelOptions,
+        ModelTarget,
+        ModelType,
+        ServiceTier,
+        ThinkingLevel,
+        VertexEndpoint,
+    )
+
+    entry_dict = entry if isinstance(entry, dict) else {"name": str(entry or "")}
+    raw_name = entry_dict.get("name") or ""
+    if is_image:
+        if (
+            image_shorthand
+            and image_shorthand != sdk_models.DEFAULT_IMAGE_GENERATION_MODEL
+            and (not raw_name or raw_name == sdk_models.DEFAULT_IMAGE_GENERATION_MODEL)
+        ):
+            name = image_shorthand
+        else:
+            name = raw_name or sdk_models.DEFAULT_IMAGE_GENERATION_MODEL
+    else:
+        if not raw_name or raw_name == sdk_models.DEFAULT_MODEL:
+            name = fallback_model_name or raw_name or sdk_models.DEFAULT_MODEL
+        else:
+            name = raw_name
+
+    gen = entry_dict.get("generation") or {}
+    options = None
+    if isinstance(gen, dict) and (
+        gen.get("thinking_level")
+        or gen.get("service_tier")
+        or gen.get("max_output_tokens") is not None
+    ):
+        tl_raw = gen.get("thinking_level")
+        tl_norm = str(tl_raw).lower() if tl_raw else None
+        if tl_norm == "extra_high":
+            tl_norm = "xhigh"
+        st_raw = gen.get("service_tier")
+        mot_raw = gen.get("max_output_tokens")
+        opt_kwargs: dict[str, Any] = {
+            "thinking_level": ThinkingLevel(tl_norm) if tl_norm else None,
+            "service_tier": ServiceTier(str(st_raw).lower()) if st_raw else None,
+        }
+        if mot_raw is not None and int(mot_raw) > 0:
+            opt_kwargs["max_output_tokens"] = int(mot_raw)
+        options = GeminiModelOptions(**opt_kwargs)
+
+    base_url = vertex_cfg.get("base_url") or None
+    api_key = entry_dict.get("api_key") or vertex_cfg.get("api_key") or None
+    use_ambient = not base_url and not api_key
+    project = vertex_cfg.get("project") or (
+        (env_map.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT"))
+        if use_ambient
+        else None
+    )
+    location = vertex_cfg.get("location") or (
+        (
+            env_map.get("GOOGLE_CLOUD_LOCATION")
+            or os.environ.get("GOOGLE_CLOUD_LOCATION")
+        )
+        if use_ambient
+        else None
+    )
+    headers = vertex_cfg.get("http_headers") or None
+    endpoint = VertexEndpoint(
+        project=project,
+        location=location,
+        base_url=base_url,
+        http_headers=headers,
+        api_key=api_key,
+        options=options,
+    )
+    return ModelTarget(
+        name=name,
+        types=[ModelType.IMAGE] if is_image else [ModelType.TEXT],
+        endpoint=endpoint,
+    )
+
+
+_DANGEROUS_ENV_KEYS_UPPER: frozenset[str] = frozenset(
+    {
+        "ANTIGRAVITY_HARNESS_PATH",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_CONFIG_FILE",
+        "GLIBC_TUNABLES",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "BASH_ENV",
+        "ENV",
+        "PROMPT_COMMAND",
+    }
+)
+
+
+def _validate_agent_env(raw_env: Any) -> None:
+    """Defense-in-depth validation of `AgentConfig.env` matching Rust `validate_env_map`."""
+    if raw_env is None:
+        return
+    if not isinstance(raw_env, dict):
+        raise TypeError("AgentConfig.env must be a dictionary of string pairs")
+    for raw_k, raw_v in raw_env.items():
+        key = str(raw_k)
+        val = str(raw_v)
+        if not key:
+            raise ValueError("AgentConfig.env cannot contain an empty variable name")
+        if any(ch in key for ch in ("=", "\0", "\r", "\n")):
+            raise ValueError(
+                f"AgentConfig.env key {key!r} contains illegal delimiter or control character"
+            )
+        if "\0" in val:
+            raise ValueError(
+                f"AgentConfig.env value for key {key!r} contains illegal NUL byte"
+            )
+        upper_key = key.upper()
+        if upper_key in _DANGEROUS_ENV_KEYS_UPPER or upper_key.startswith("DYLD_"):
+            raise ValueError(
+                f"AgentConfig.env key {key!r} is forbidden because it can hijack binary/linker/interpreter execution"
+            )
+
+
+def _build_python_agent_config(
+    local_config: dict[str, Any], sdk_triggers: list[Any]
+) -> Any:
+    """Instantiate `LocalAgentConfig`, `LocalOpenAIAgentConfig`, or `LiteRTAgentConfig`."""
+    image_shorthand = local_config.pop("_agy_image_model_shorthand", None)
+    litert_cfg = local_config.pop("litert_config", None)
+    if isinstance(litert_cfg, dict):
+        from google.antigravity.connections.local.litert_connection_config import (
+            LiteRTAgentConfig,
+        )
+
+        local_config.pop("model", None)
+        local_config.pop("models", None)
+        local_config.pop("api_key", None)
+        local_config.pop("gemini_config", None)
+        local_config.pop("vertex_config", None)
+        local_config.pop("local_openai_config", None)
+        lrt_kwargs = dict(litert_cfg)
+        lrt_kwargs["model_path"] = str(lrt_kwargs["model_path"])
+        if lrt_kwargs.get("cache_dir") is not None:
+            lrt_kwargs["cache_dir"] = str(lrt_kwargs["cache_dir"])
+        return LiteRTAgentConfig(triggers=sdk_triggers, **lrt_kwargs, **local_config)
+
+    oai_cfg = local_config.pop("local_openai_config", None)
+    if isinstance(oai_cfg, dict):
+        from google.antigravity.connections.local.local_openai_connection_config import (
+            LocalOpenAIAgentConfig,
+        )
+
+        fallback_model = local_config.pop("model", None)
+        local_config.pop("models", None)
+        local_config.pop("api_key", None)
+        local_config.pop("gemini_config", None)
+        local_config.pop("vertex_config", None)
+        resolved_model = oai_cfg.get("model") or fallback_model
+        return LocalOpenAIAgentConfig(
+            model=resolved_model,
+            base_url=oai_cfg.get("base_url"),
+            triggers=sdk_triggers,
+            **local_config,
+        )
+
+    vertex_cfg = local_config.pop("vertex_config", None)
+    if isinstance(vertex_cfg, dict):
+        from google.antigravity.connections.local.local_connection_config import (
+            LocalAgentConfig,
+        )
+
+        fallback_model = str(local_config.pop("model", "") or "")
+        top_key = local_config.pop("api_key", None)
+        has_explicit_regional = bool(
+            vertex_cfg.get("project") or vertex_cfg.get("location")
+        )
+        if top_key and not vertex_cfg.get("api_key") and not has_explicit_regional:
+            vertex_cfg = {**vertex_cfg, "api_key": top_key}
+        local_config.pop("gemini_config", None)
+        raw_env = local_config.get("env")
+        env_map: dict[str, str] = (
+            {str(k): str(v) for k, v in raw_env.items()}
+            if isinstance(raw_env, dict)
+            else {}
+        )
+        models_dict = vertex_cfg.get("models") or {}
+        t_default = _build_vertex_model_target(
+            models_dict.get("default") or {},
+            vertex_cfg,
+            env_map,
+            fallback_model,
+            image_shorthand,
+            is_image=False,
+        )
+        t_image = _build_vertex_model_target(
+            models_dict.get("image_generation") or {},
+            vertex_cfg,
+            env_map,
+            fallback_model,
+            image_shorthand,
+            is_image=True,
+        )
+        local_config["models"] = [t_default, t_image]
+        return LocalAgentConfig(triggers=sdk_triggers, **local_config)
+
+    from google.antigravity.connections.local.local_connection_config import (
+        LocalAgentConfig,
+    )
+
+    return LocalAgentConfig(triggers=sdk_triggers, **local_config)

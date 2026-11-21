@@ -1,10 +1,8 @@
 //! Core types for the agent SDK bridge.
 //!
 //! This module defines the data structures that model an agent's execution
-//! trajectory: individual [`Step`](crate::types::Step)s,
-//! [`ToolCallInfo`](crate::types::ToolCallInfo) requests,
-//! [`ToolResult`](crate::types::ToolResult) responses, and
-//! [`UsageMetadata`](crate::types::UsageMetadata) for token accounting. All types derive
+//! trajectory: individual [`Step`]s, [`ToolCallInfo`] requests,
+//! [`ToolResult`] responses, and [`UsageMetadata`] for token accounting. All types derive
 //! `Serialize`/`Deserialize` for JSON interchange with the Python SDK.
 
 use std::{fmt, str::FromStr};
@@ -200,26 +198,102 @@ define_sdk_enum_custom_serde! {
     }
 }
 
-define_sdk_enum! {
-    /// Reason why an agent trajectory stopped or halted.
-    StopReason {
-        /// Reason unspecified.
-        Unspecified => "UNSPECIFIED",
-        /// Maximum number of model calls exceeded.
-        MaxModelCallsExceeded => "MAX_MODEL_CALLS_EXCEEDED",
-        /// Maximum number of tool calls exceeded.
-        MaxToolCallsExceeded => "MAX_TOOL_CALLS_EXCEEDED",
-        /// Maximum prompt/input tokens exceeded.
-        MaxInputTokensExceeded => "MAX_INPUT_TOKENS_EXCEEDED",
-        /// Maximum output tokens exceeded.
-        MaxOutputTokensExceeded => "MAX_OUTPUT_TOKENS_EXCEEDED",
-        /// Maximum total tokens exceeded.
-        MaxTotalTokensExceeded => "MAX_TOTAL_TOKENS_EXCEEDED",
-        /// Remote API quota exhausted.
-        QuotaExhausted => "QUOTA_EXHAUSTED",
-        /// Unrecognized stop reason (fallback).
-        #[default]
-        Unknown => "UNKNOWN",
+/// Reason why an agent trajectory stopped or halted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StopReason {
+    /// Reason unspecified.
+    #[serde(alias = "STOP_REASON_UNSPECIFIED")]
+    Unspecified,
+    /// Maximum number of model calls exceeded.
+    #[serde(alias = "STOP_REASON_MAX_MODEL_CALLS_EXCEEDED")]
+    MaxModelCallsExceeded,
+    /// Maximum number of tool calls exceeded.
+    #[serde(alias = "STOP_REASON_MAX_TOOL_CALLS_EXCEEDED")]
+    MaxToolCallsExceeded,
+    /// Maximum prompt/input tokens exceeded.
+    #[serde(alias = "STOP_REASON_MAX_INPUT_TOKENS_EXCEEDED")]
+    MaxInputTokensExceeded,
+    /// Maximum output tokens exceeded.
+    #[serde(alias = "STOP_REASON_MAX_OUTPUT_TOKENS_EXCEEDED")]
+    MaxOutputTokensExceeded,
+    /// Maximum total tokens exceeded.
+    #[serde(alias = "STOP_REASON_MAX_TOTAL_TOKENS_EXCEEDED")]
+    MaxTotalTokensExceeded,
+    /// Remote API quota exhausted.
+    #[serde(alias = "STOP_REASON_QUOTA_EXHAUSTED")]
+    QuotaExhausted,
+    /// Unrecognized stop reason (fallback).
+    #[default]
+    Unknown,
+}
+
+impl StopReason {
+    /// Convert a `localharness` protobuf `StopReason` discriminant into [`StopReason`].
+    #[must_use]
+    pub const fn from_proto_i32(value: i32) -> Self {
+        match value {
+            0 => Self::Unspecified,
+            1 => Self::MaxModelCallsExceeded,
+            2 => Self::MaxToolCallsExceeded,
+            3 => Self::MaxInputTokensExceeded,
+            4 => Self::MaxOutputTokensExceeded,
+            5 => Self::MaxTotalTokensExceeded,
+            6 => Self::QuotaExhausted,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert [`StopReason`] into its `localharness` protobuf discriminant (`0` when `Unknown`).
+    #[must_use]
+    pub const fn to_proto_i32(self) -> i32 {
+        match self {
+            Self::Unspecified | Self::Unknown => 0,
+            Self::MaxModelCallsExceeded => 1,
+            Self::MaxToolCallsExceeded => 2,
+            Self::MaxInputTokensExceeded => 3,
+            Self::MaxOutputTokensExceeded => 4,
+            Self::MaxTotalTokensExceeded => 5,
+            Self::QuotaExhausted => 6,
+        }
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Unspecified => "UNSPECIFIED",
+            Self::MaxModelCallsExceeded => "MAX_MODEL_CALLS_EXCEEDED",
+            Self::MaxToolCallsExceeded => "MAX_TOOL_CALLS_EXCEEDED",
+            Self::MaxInputTokensExceeded => "MAX_INPUT_TOKENS_EXCEEDED",
+            Self::MaxOutputTokensExceeded => "MAX_OUTPUT_TOKENS_EXCEEDED",
+            Self::MaxTotalTokensExceeded => "MAX_TOTAL_TOKENS_EXCEEDED",
+            Self::QuotaExhausted => "QUOTA_EXHAUSTED",
+            Self::Unknown => "UNKNOWN",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for StopReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = match s {
+            "STOP_REASON_UNKNOWN" => return Err(format!("Unrecognized StopReason: {s:?}")),
+            other => other.strip_prefix("STOP_REASON_").unwrap_or(other),
+        };
+        match normalized {
+            "UNSPECIFIED" => Ok(Self::Unspecified),
+            "MAX_MODEL_CALLS_EXCEEDED" => Ok(Self::MaxModelCallsExceeded),
+            "MAX_TOOL_CALLS_EXCEEDED" => Ok(Self::MaxToolCallsExceeded),
+            "MAX_INPUT_TOKENS_EXCEEDED" => Ok(Self::MaxInputTokensExceeded),
+            "MAX_OUTPUT_TOKENS_EXCEEDED" => Ok(Self::MaxOutputTokensExceeded),
+            "MAX_TOTAL_TOKENS_EXCEEDED" => Ok(Self::MaxTotalTokensExceeded),
+            "QUOTA_EXHAUSTED" => Ok(Self::QuotaExhausted),
+            "UNKNOWN" => Ok(Self::Unknown),
+            _ => Err(format!("Unrecognized StopReason: {s:?}")),
+        }
     }
 }
 
@@ -366,6 +440,72 @@ pub struct UsageMetadata {
     /// Service tier that processed the model request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+}
+
+impl UsageMetadata {
+    /// Compute the per-turn delta between cumulative `self` and an earlier cumulative `baseline`.
+    #[must_use]
+    pub fn saturating_delta_since(&self, baseline: &Self) -> Self {
+        fn diff_opt(curr: Option<u64>, base: Option<u64>) -> Option<u64> {
+            curr.map(|c| match base {
+                Some(b) => c.saturating_sub(b),
+                None => c,
+            })
+        }
+
+        fn diff_modalities(
+            curr: &[ModalityTokenCount],
+            base: &[ModalityTokenCount],
+        ) -> Vec<ModalityTokenCount> {
+            curr.iter()
+                .map(|entry| {
+                    let prev = base
+                        .iter()
+                        .find(|b| b.modality == entry.modality)
+                        .map_or(0, |b| b.token_count);
+                    ModalityTokenCount {
+                        modality: entry.modality,
+                        token_count: entry.token_count.saturating_sub(prev),
+                    }
+                })
+                .filter(|entry| entry.token_count > 0)
+                .collect()
+        }
+
+        Self {
+            prompt_token_count: diff_opt(self.prompt_token_count, baseline.prompt_token_count),
+            cached_content_token_count: diff_opt(
+                self.cached_content_token_count,
+                baseline.cached_content_token_count,
+            ),
+            candidates_token_count: diff_opt(
+                self.candidates_token_count,
+                baseline.candidates_token_count,
+            ),
+            thoughts_token_count: diff_opt(
+                self.thoughts_token_count,
+                baseline.thoughts_token_count,
+            ),
+            total_token_count: diff_opt(self.total_token_count, baseline.total_token_count),
+            prompt_tokens_details: diff_modalities(
+                &self.prompt_tokens_details,
+                &baseline.prompt_tokens_details,
+            ),
+            cache_tokens_details: diff_modalities(
+                &self.cache_tokens_details,
+                &baseline.cache_tokens_details,
+            ),
+            candidates_tokens_details: diff_modalities(
+                &self.candidates_tokens_details,
+                &baseline.candidates_tokens_details,
+            ),
+            tool_use_prompt_tokens_details: diff_modalities(
+                &self.tool_use_prompt_tokens_details,
+                &baseline.tool_use_prompt_tokens_details,
+            ),
+            service_tier: self.service_tier,
+        }
+    }
 }
 
 /// The role of a message author in the conversation.

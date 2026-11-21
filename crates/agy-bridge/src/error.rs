@@ -112,6 +112,13 @@ pub enum Error {
         message: String,
     },
 
+    /// A requested SDK feature is not supported by the active runtime backend.
+    #[error("Unsupported feature: {message}")]
+    UnsupportedFeature {
+        /// Human-readable explanation of why the feature is unavailable.
+        message: String,
+    },
+
     /// An I/O error occurred during a file or socket operation.
     #[error("I/O error: {message}")]
     Io {
@@ -138,6 +145,17 @@ impl Error {
             Self::Stream(se) if se.http_code != HTTP_CODE_UNKNOWN => {
                 http_code_is_retryable(se.http_code)
             }
+            Self::Stream(se) if se.error_code.as_deref().is_some_and(|c| !c.is_empty()) => {
+                if let Some(ref code) = se.error_code {
+                    if rpc_code_is_retryable(code) {
+                        return true;
+                    }
+                    if rpc_code_is_known_non_retryable(code) {
+                        return false;
+                    }
+                }
+                message_indicates_quota(&se.message)
+            }
             Self::BackendError { message } | Self::Stream(StreamError { message, .. }) => {
                 message_indicates_quota(message)
             }
@@ -148,8 +166,9 @@ impl Error {
     /// Returns `true` if this error indicates a quota / rate-limit condition.
     ///
     /// Matches the structured [`Error::QuotaExceeded`] variant, stream errors
-    /// carrying a quota HTTP status (429 or 503), and backend/stream messages
-    /// reporting `RESOURCE_EXHAUSTED`, HTTP 429, or HTTP 503.
+    /// carrying a quota HTTP status (429 or 503) or canonical `RESOURCE_EXHAUSTED`
+    /// `error_code`, and backend/stream messages reporting `RESOURCE_EXHAUSTED`,
+    /// HTTP 429, or HTTP 503.
     #[must_use]
     pub fn is_quota_error(&self) -> bool {
         match self {
@@ -157,12 +176,56 @@ impl Error {
             Self::Stream(se) if se.http_code != HTTP_CODE_UNKNOWN => {
                 http_code_is_quota(se.http_code)
             }
+            Self::Stream(se) if se.error_code.as_deref().is_some_and(|c| !c.is_empty()) => {
+                if let Some(ref code) = se.error_code {
+                    if rpc_code_is_quota(code) {
+                        return true;
+                    }
+                    if rpc_code_is_retryable(code) || rpc_code_is_known_non_retryable(code) {
+                        return false;
+                    }
+                }
+                message_indicates_quota(&se.message)
+            }
             Self::BackendError { message } | Self::Stream(StreamError { message, .. }) => {
                 message_indicates_quota(message)
             }
             _ => false,
         }
     }
+}
+
+fn rpc_code_is_quota(code: &str) -> bool {
+    code.eq_ignore_ascii_case("RESOURCE_EXHAUSTED")
+}
+
+fn rpc_code_is_retryable(code: &str) -> bool {
+    [
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "INTERNAL",
+        "ABORTED",
+    ]
+    .iter()
+    .any(|retryable| code.eq_ignore_ascii_case(retryable))
+}
+
+fn rpc_code_is_known_non_retryable(code: &str) -> bool {
+    [
+        "INVALID_ARGUMENT",
+        "PERMISSION_DENIED",
+        "UNAUTHENTICATED",
+        "NOT_FOUND",
+        "CANCELLED",
+        "ALREADY_EXISTS",
+        "FAILED_PRECONDITION",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "DATA_LOSS",
+    ]
+    .iter()
+    .any(|non_retryable| code.eq_ignore_ascii_case(non_retryable))
 }
 
 /// Whether an untyped backend/stream message reports a quota condition.

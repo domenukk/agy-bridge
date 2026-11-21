@@ -37,6 +37,10 @@ pub struct McpStdioServer {
 }
 
 /// Configuration for an MCP server connected via SSE.
+///
+/// On `google-antigravity 0.1.24`+, SSE servers are lowered to
+/// [`McpStreamableHttpServer`] (`McpHttpTransport`) on both `NativeRuntime`
+/// and `PythonRuntime`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpSseServer {
     /// Server name used by the harness (e.g. `ServerName` in `call_mcp_tool`).
@@ -281,6 +285,24 @@ impl McpServer {
                 "MCP server '{}' timeout_seconds must be non-negative, got {secs}",
                 self.server_name()
             ));
+        }
+        match self {
+            Self::Stdio(_) => {}
+            Self::Sse(s) => {
+                super::validation::validate_http_url(&s.url, "McpSseServer.url", false)?;
+                if let Some(ref headers) = s.headers {
+                    super::validation::validate_http_headers(headers, "McpSseServer.headers")?;
+                }
+            }
+            Self::Http(s) => {
+                super::validation::validate_http_url(&s.url, "McpStreamableHttpServer.url", false)?;
+                if let Some(ref headers) = s.headers {
+                    super::validation::validate_http_headers(
+                        headers,
+                        "McpStreamableHttpServer.headers",
+                    )?;
+                }
+            }
         }
         Ok(())
     }

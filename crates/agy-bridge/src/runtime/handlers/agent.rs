@@ -58,8 +58,6 @@ fn prepare_agent_globals(py: Python<'_>) -> PyResult<()> {
     )?;
     agy_bridge_globals.setattr(SET_AGENT_CONVERSATION_ID_ATTR, set_conv_id_func)?;
 
-    globals_module.add_class::<crate::policies::PreToolCallDecideHook>()?;
-
     let c_helpers = CString::new(PYTHON_AGENT_INIT_HELPERS_SCRIPT).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "Python init helpers script contains null byte: {e}"
@@ -114,6 +112,7 @@ fn init_agent_instance(
         .get_item(AGY_BRIDGE_GLOBALS_MODULE)?;
     let init_agent_fn = globals_mod.getattr("init_agent")?;
 
+    let _root_pkg = crate::runtime::py_scripts::import_serialized(py, "google.antigravity")?;
     let agent_mod = crate::runtime::py_scripts::import_serialized(py, "google.antigravity.agent")?;
     let agent_cls = agent_mod.getattr("Agent")?;
 
@@ -173,6 +172,12 @@ pub(in crate::runtime) async fn handle_create_agent(
         Ok(agent_instance_py) => {
             let aid = AgentId(next_id);
             let tool_defs = extract_tool_definitions(&agent_instance_py);
+            if let Some(restored_out) = extract_restored_structured_output(&agent_instance_py) {
+                crate::runtime::bridge_state::set_restored_structured_output(
+                    next_id,
+                    Some(restored_out),
+                );
+            }
             match registry.lock() {
                 Ok(mut guard) => {
                     guard.insert(
@@ -362,6 +367,33 @@ fn extract_tool_names_fallback(agent_py: &Py<PyAny>) -> Vec<RawToolInfo> {
     })
 }
 
+/// Run `ctx_py.__aexit__(None, None, None)` and purge per-agent Python globals.
+pub(in crate::runtime) async fn run_agent_aexit_and_purge(
+    ctx_py: &Py<PyAny>,
+    agent_id: AgentId,
+) -> Result<(), Error> {
+    let aexit_coro_py = Python::attach(|py| {
+        let ctx_bound = ctx_py.bind(py);
+        let none = py.None();
+        let coro = ctx_bound.call_method1("__aexit__", (&none, &none, &none))?;
+        Ok::<_, PyErr>(coro.clone().unbind())
+    })?;
+
+    let aexit_fut = Python::attach(|py| {
+        let coro = aexit_coro_py.into_bound(py);
+        pyo3_async_runtimes::tokio::into_future(coro)
+    })?;
+
+    let exit_res = aexit_fut.await;
+    Python::attach(|py| {
+        purge_python_agent_globals(py, agent_id);
+    });
+    match exit_res {
+        Ok(_py_obj) => Ok(()),
+        Err(err) => Err(Error::from(err)),
+    }
+}
+
 /// Remove the agent from the registry and run its `__aexit__` cleanup.
 pub(in crate::runtime) async fn handle_shutdown_agent(
     registry: AgentRegistry,
@@ -388,76 +420,64 @@ pub(in crate::runtime) async fn handle_shutdown_agent(
         return;
     };
 
-    // Bridge state cleanup is handled by AgentHandle::shutdown() after this
-    // handler returns, ensuring hooks dispatched during __aexit__ (e.g.
-    // on_session_end) can still find the hook runner.
-
-    let aexit_coro_res = Python::attach(|py| {
-        let ctx_bound = ctx_py.bind(py);
-        let none = py.None();
-        let coro = ctx_bound.call_method1("__aexit__", (&none, &none, &none))?;
-        Ok::<_, PyErr>(coro.clone().unbind())
-    });
-
-    let aexit_coro_py = match aexit_coro_res {
-        Ok(c) => c,
-        Err(e) => {
-            let err: Error = e.into();
-            if let Err(e) = reply.send(Err(err)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?e, "ShutdownAgent reply receiver dropped (aexit coro error)");
-            }
-            return;
-        }
-    };
-
-    let aexit_fut = match Python::attach(|py| {
-        let coro = aexit_coro_py.into_bound(py);
-        pyo3_async_runtimes::tokio::into_future(coro)
-    }) {
-        Ok(fut) => fut,
-        Err(e) => {
-            let err: Error = e.into();
-            if let Err(e) = reply.send(Err(err)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?e, "ShutdownAgent reply receiver dropped (aexit conversion error)");
-            }
-            return;
-        }
-    };
-
-    let exit_res = aexit_fut.await;
-
-    // Clean up any per-agent cache entries in Python globals.
-    Python::attach(|py| {
-        purge_python_agent_globals(py, agent_id);
-    });
-
-    // Bridge state cleanup handled by AgentHandle::shutdown().
-
-    match exit_res {
-        Ok(_) => {
-            if let Err(e) = reply.send(Ok(())) {
-                tracing::warn!(agent_id = ?agent_id, error = ?e, "ShutdownAgent reply receiver dropped");
-            }
-        }
-        Err(e) => {
-            let err: Error = e.into();
-            if let Err(e) = reply.send(Err(err)) {
-                tracing::warn!(agent_id = ?agent_id, error = ?e, "ShutdownAgent reply receiver dropped (aexit error)");
-            }
-        }
+    let exit_res = run_agent_aexit_and_purge(&ctx_py, agent_id).await;
+    if let Err(e) = reply.send(exit_res) {
+        tracing::warn!(agent_id = ?agent_id, error = ?e, "ShutdownAgent reply receiver dropped");
     }
 }
 
+/// Read `agent.conversation.get_last_structured_output()` on session creation/resume
+/// so `AgentHandle::get_last_structured_output()` matches `NativeRuntime` resume parity.
+fn extract_restored_structured_output(agent_py: &Py<PyAny>) -> Option<serde_json::Value> {
+    Python::attach(|py| {
+        crate::runtime::py_scripts::warm_up_lazy_imports(py);
+        let agent = agent_py.bind(py);
+        let conv = match agent.getattr("conversation") {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "Could not read agent.conversation for restored structured_output");
+                return None;
+            }
+        };
+        if conv.is_none() {
+            return None;
+        }
+        let raw_out = match conv.call_method0("get_last_structured_output") {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "get_last_structured_output() failed during create_agent");
+                return None;
+            }
+        };
+        if raw_out.is_none() {
+            return None;
+        }
+        match pythonize::depythonize::<serde_json::Value>(&raw_out) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to depythonize restored structured_output");
+                None
+            }
+        }
+    })
+}
+
 /// Clean up any per-agent cache entries in Python globals.
-fn purge_python_agent_globals(py: Python<'_>, agent_id: AgentId) {
+pub(in crate::runtime) fn purge_python_agent_globals(py: Python<'_>, agent_id: AgentId) {
     let result = (|| -> PyResult<()> {
         let sys = py.import("sys")?;
         let modules = sys.getattr("modules")?;
         if modules.contains("_agy_bridge_globals")? {
             let globals_mod = modules.get_item("_agy_bridge_globals")?;
-            if globals_mod.hasattr("LAST_TOOL_METADATA")? {
-                let last_meta = globals_mod.getattr("LAST_TOOL_METADATA")?;
-                last_meta.call_method1("pop", (agent_id.0, py.None()))?;
+            for attr in [
+                "LAST_TOOL_METADATA",
+                "TOOL_CALL_METADATA",
+                "CURRENT_TOOL_CALLS",
+            ] {
+                if globals_mod.hasattr(attr)? {
+                    let map_obj = globals_mod.getattr(attr)?;
+                    map_obj.call_method1("pop", (agent_id.0, py.None()))?;
+                }
             }
         }
         Ok(())

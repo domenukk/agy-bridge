@@ -52,6 +52,7 @@ fn policy_allow_all_permits_tool() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server2.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::AllowAll])
@@ -97,6 +98,7 @@ fn policy_deny_specific_blocks_tool() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::deny("counting_tool"), PolicyRule::AllowAll])
@@ -140,6 +142,7 @@ fn policy_allow_specific_plus_deny_all() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::allow("add_numbers"), PolicyRule::DenyAll])
@@ -182,6 +185,7 @@ fn policy_deny_all_blocks_tool() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::DenyAll])
@@ -238,6 +242,7 @@ fn policy_ask_user_handler_allows() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([
@@ -301,6 +306,7 @@ fn policy_ask_user_handler_denies() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([

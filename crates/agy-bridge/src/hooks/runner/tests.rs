@@ -542,15 +542,11 @@ fn convenience_on_interaction() {
         }
     });
 
-    let allowed = runner.run_on_interaction(&OnInteractionContext {
-        message: "hello".into(),
-    });
-    assert!(allowed.allow);
+    let allowed = runner.run_on_interaction(&OnInteractionContext::new("hello"));
+    assert!(!allowed.cancelled);
 
-    let denied = runner.run_on_interaction(&OnInteractionContext {
-        message: "this is spam".into(),
-    });
-    assert!(!denied.allow);
+    let denied = runner.run_on_interaction(&OnInteractionContext::new("this is spam"));
+    assert!(denied.cancelled);
 }
 
 #[test]

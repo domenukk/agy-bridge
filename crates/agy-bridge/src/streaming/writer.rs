@@ -93,6 +93,9 @@ pub struct ChatResponseWriter {
     pub(crate) subs: Arc<StreamSubscriptions>,
     /// Shared state to send metadata updates back to the handle.
     pub(crate) shared_state: Arc<Mutex<ChatResponseSharedState>>,
+    /// Strong liveness token dropped when the writer completes; paired with
+    /// `Weak<()>` on `ChatResponseHandle` without implementing `Drop` on `Self`.
+    pub(crate) _alive_token: Arc<()>,
 }
 
 impl ChatResponseWriter {
@@ -308,12 +311,20 @@ impl ChatResponseWriter {
         .await;
     }
 
+    /// Returns `true` when a subscriber or buffered slot is available on the step stream.
+    ///
+    /// Callers can check this before constructing a heavy [`Step`] object on every delta.
+    #[must_use]
+    pub fn wants_step(&self) -> bool {
+        Self::can_deliver(&self.subs.step, &self.step_tx, CHANNEL_STEP)
+    }
+
     /// Fan out a step update to the step stream.
     ///
     /// Unsubscribed views use non-blocking `try_send` so an undrained stream
     /// never stalls the turn.
     pub async fn emit_step(&self, step: Step) {
-        if Self::can_deliver(&self.subs.step, &self.step_tx, CHANNEL_STEP) {
+        if self.wants_step() {
             Self::fan_out(&self.subs.step, &self.step_tx, step, CHANNEL_STEP).await;
         }
     }
@@ -359,13 +370,30 @@ impl ChatResponseWriter {
             .map_err(WriterError::from)
     }
 
-    /// Send an error.
+    /// Send an error without blocking when the capacity-1 error slot is already occupied.
+    ///
+    /// If an earlier error is already queued, the first error wins so `send_error`
+    /// can never deadlock while holding the writer alive.
     ///
     /// # Errors
     ///
-    /// Returns [`WriterError`] if the receiver has been dropped.
+    /// Returns [`WriterError`] if the error receiver has been dropped.
     pub async fn send_error(&self, error: StreamError) -> Result<(), WriterError> {
-        self.error_tx.send(error).await.map_err(WriterError::from)
+        self.record_turn_failure(&error);
+        std::future::ready(match self.error_tx.try_send(error) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(discarded)) => {
+                tracing::debug!(
+                    discarded = %discarded,
+                    "error_tx already holds an earlier error; preserving first error"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(closed_err)) => Err(WriterError::new(format!(
+                "channel send failed: {closed_err}"
+            ))),
+        })
+        .await
     }
 
     /// Send a response event.
@@ -412,16 +440,68 @@ impl ChatResponseWriter {
     }
 
     /// Store structured output in the shared state so the handle can read it
-    /// after the stream completes.
+    /// after the stream completes (unless the turn has already failed).
     pub fn set_structured_output(&self, value: serde_json::Value) {
         match self.shared_state.lock() {
             Ok(mut state) => {
-                state.structured_output = Some(value);
+                if !state.turn_failed {
+                    state.structured_output = Some(value);
+                }
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "ChatResponseWriter shared_state mutex poisoned in set_structured_output"
+                );
+            }
+        }
+    }
+
+    /// Clear any provisional structured output and mark the turn failed so
+    /// partial `FINISH` payloads are never exposed from an errored turn.
+    pub fn clear_structured_output(&self) {
+        match self.shared_state.lock() {
+            Ok(mut state) => {
+                state.structured_output = None;
+                state.turn_failed = true;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "ChatResponseWriter shared_state mutex poisoned in clear_structured_output"
+                );
+            }
+        }
+    }
+
+    fn record_turn_failure(&self, error: &StreamError) {
+        match self.shared_state.lock() {
+            Ok(mut state) => {
+                state.structured_output = None;
+                state.turn_failed = true;
+                if state.last_stream_error.is_none() {
+                    state.last_stream_error = Some(error.clone());
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "ChatResponseWriter shared_state mutex poisoned in record_turn_failure"
+                );
+            }
+        }
+    }
+
+    /// Record the trajectory stop reason for this turn.
+    pub fn set_stop_reason(&self, stop_reason: crate::types::StopReason) {
+        match self.shared_state.lock() {
+            Ok(mut state) => {
+                state.stop_reason = stop_reason;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "ChatResponseWriter shared_state mutex poisoned in set_stop_reason"
                 );
             }
         }

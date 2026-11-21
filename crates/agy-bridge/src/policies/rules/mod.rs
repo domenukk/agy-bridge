@@ -131,20 +131,31 @@ impl PolicyRule {
     ///
     /// Returns [`Error::InvalidConfig`] if validation fails.
     pub fn validate(&self) -> Result<(), Error> {
+        let validate_tool_target = |tool: &str, ctx: &str| -> Result<(), Error> {
+            let trimmed = tool.trim();
+            if trimmed.is_empty() {
+                return Err(Error::InvalidConfig {
+                    message: format!("{ctx} tool name must not be empty"),
+                });
+            }
+            if trimmed != "*"
+                && let Some((server, subtool)) = trimmed.split_once('/')
+                && (server.trim().is_empty() || subtool.trim().is_empty())
+            {
+                return Err(Error::InvalidConfig {
+                    message: format!(
+                        "{ctx} MCP target '{tool}' must have non-empty server and tool segments"
+                    ),
+                });
+            }
+            Ok(())
+        };
         match self {
             Self::Allow(tool) | Self::Deny(tool) => {
-                if tool.trim().is_empty() {
-                    return Err(Error::InvalidConfig {
-                        message: "PolicyRule tool name must not be empty".to_owned(),
-                    });
-                }
+                validate_tool_target(tool, "PolicyRule")?;
             }
             Self::AskUser { tool, handler_id } => {
-                if tool.trim().is_empty() {
-                    return Err(Error::InvalidConfig {
-                        message: "PolicyRule::AskUser tool name must not be empty".to_owned(),
-                    });
-                }
+                validate_tool_target(tool, "PolicyRule::AskUser")?;
                 if handler_id.trim().is_empty() {
                     return Err(Error::InvalidConfig {
                         message: format!("PolicyRule::AskUser '{tool}' has an empty handler_id"),
@@ -197,12 +208,12 @@ pub fn confirm_run_command() -> PolicyRule {
     ask_user("run_command", "confirm_run_command")
 }
 
-/// Returns a safe default policy set: `AllowAll` for read operations,
+/// Returns a safe default policy set: `Allow` for read-only builtin operations,
 /// `AskUser` for write/execute operations, and `DenyAll` as a fallback.
 ///
 /// Specifically:
-/// - **Allow**: `view_file`, `read_file`, `list_dir`, `search`
-/// - **`AskUser`**: `run_command`, `write_file`, `edit_file`
+/// - **Allow**: `view_file`, `list_directory`, `search_directory`, `find_file`, `finish`
+/// - **`AskUser`**: `run_command`, `create_file`, `edit_file`, `delete_file`
 /// - **`DenyAll`**: everything else
 ///
 /// # Panics
@@ -220,19 +231,22 @@ pub fn confirm_run_command() -> PolicyRule {
 /// ```
 #[must_use]
 pub fn safe_defaults() -> PolicySet {
-    // These tool names match the SDK's built-in tool registry as of the
-    // version this bridge was written against. If the SDK renames or adds
-    // tools, these lists should be updated to match.
-    const READ_TOOLS: &[&str] = &["view_file", "read_file", "list_dir", "search"];
+    const READ_TOOLS: &[&str] = &[
+        "view_file",
+        "list_directory",
+        "search_directory",
+        "find_file",
+        "finish",
+    ];
     const WRITE_TOOLS: &[(&str, &str)] = &[
         ("run_command", "confirm_run_command"),
-        ("write_file", "confirm_write_file"),
+        ("create_file", "confirm_create_file"),
         ("edit_file", "confirm_edit_file"),
+        ("delete_file", "confirm_delete_file"),
     ];
 
     let mut set = PolicySet::new();
     for tool in READ_TOOLS {
-        // Safety: these are known-good tool names, unwrap is fine.
         set.push(PolicyRule::Allow((*tool).to_owned()))
             .expect("safe_defaults: valid Allow rule");
     }
@@ -319,9 +333,11 @@ impl PolicyDecision<'_> {
     }
 }
 
-/// An ordered list of policy rules applied to an agent.
+/// A set of policy rules applied to an agent.
 ///
-/// Policies are evaluated in order — the first matching rule wins.
+/// Evaluated using `localharness` and the Python SDK's 9-bucket specificity
+/// and safety precedence (`Specific > ServerPrefix > Wildcard`, and
+/// `Deny > AskUser > Allow` within each tier).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PolicySet {
     rules: Vec<PolicyRule>,
@@ -386,30 +402,87 @@ impl PolicySet {
 
     /// Evaluate whether a tool call is allowed by this policy set.
     ///
-    /// Uses first-match semantics: the first rule that matches the tool name
-    /// determines the result.  Returns [`PolicyDecision::Deny`] if no rule
-    /// matches (default-deny).
+    /// Matches `localharness` and the Python SDK's 9-bucket specificity and safety
+    /// precedence:
+    ///
+    /// `Specific (Deny > AskUser > Allow) > ServerPrefix "server/*" (Deny > AskUser > Allow) > Wildcard "*" (Deny > AskUser > Allow)`
+    ///
+    /// Within the highest-priority matching bucket, the first matching rule wins.
+    /// Returns [`PolicyDecision::Deny`] if no rule matches (default-deny).
     ///
     /// [`WorkspaceOnly`](PolicyRule::WorkspaceOnly) rules are skipped during
-    /// tool-name evaluation — they apply to path checks, not tool dispatch.
+    /// tool-name evaluation when combined with tool-name rules — they apply to
+    /// path checks, not tool dispatch. When the set is non-empty and contains
+    /// *exclusively* [`WorkspaceOnly`](PolicyRule::WorkspaceOnly) rules, returns
+    /// [`PolicyDecision::Allow`] so in-workspace tools remain permitted.
     #[must_use]
     pub fn evaluate(&self, tool_name: &str) -> PolicyDecision<'_> {
+        if !self.rules.is_empty()
+            && self
+                .rules
+                .iter()
+                .all(|r| matches!(r, PolicyRule::WorkspaceOnly(_)))
+        {
+            return PolicyDecision::Allow;
+        }
+
+        let mut best: Option<((u8, u8), PolicyDecision<'_>)> = None;
+
         for rule in &self.rules {
-            match rule {
-                PolicyRule::Allow(name) if name == tool_name => return PolicyDecision::Allow,
-                PolicyRule::Deny(name) if name == tool_name => return PolicyDecision::Deny,
-                PolicyRule::AllowAll => return PolicyDecision::Allow,
-                PolicyRule::DenyAll => return PolicyDecision::Deny,
-                PolicyRule::AskUser { tool, handler_id } if tool == tool_name => {
-                    return PolicyDecision::NeedsConfirmation { handler_id };
-                }
-                PolicyRule::AskUser { .. }
-                | PolicyRule::Allow(_)
-                | PolicyRule::Deny(_)
-                | PolicyRule::WorkspaceOnly(_) => {}
+            let Some((priority, decision)) = match_rule_priority(rule, tool_name) else {
+                continue;
+            };
+            if priority == (0, 0) {
+                return decision;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(best_prio, _)| priority < *best_prio)
+            {
+                best = Some((priority, decision));
             }
         }
-        PolicyDecision::Deny
+
+        best.map_or(PolicyDecision::Deny, |(_, decision)| decision)
+    }
+}
+
+fn classify_target_and_match(pattern: &str, tool_name: &str) -> Option<u8> {
+    if pattern == "*" {
+        return Some(2);
+    }
+    if let Some(server_prefix) = pattern.strip_suffix("/*") {
+        if let Some((call_server, call_tool)) = tool_name.split_once('/')
+            && !call_tool.is_empty()
+            && call_server == server_prefix
+        {
+            return Some(1);
+        }
+        return None;
+    }
+    (pattern == tool_name).then_some(0)
+}
+
+fn match_rule_priority<'a>(
+    rule: &'a PolicyRule,
+    tool_name: &str,
+) -> Option<((u8, u8), PolicyDecision<'a>)> {
+    match rule {
+        PolicyRule::DenyAll => Some(((2, 0), PolicyDecision::Deny)),
+        PolicyRule::AllowAll => Some(((2, 2), PolicyDecision::Allow)),
+        PolicyRule::Deny(pattern) => {
+            let scope = classify_target_and_match(pattern, tool_name)?;
+            Some(((scope, 0), PolicyDecision::Deny))
+        }
+        PolicyRule::AskUser { tool, handler_id } => {
+            let scope = classify_target_and_match(tool, tool_name)?;
+            Some(((scope, 1), PolicyDecision::NeedsConfirmation { handler_id }))
+        }
+        PolicyRule::Allow(pattern) => {
+            let scope = classify_target_and_match(pattern, tool_name)?;
+            Some(((scope, 2), PolicyDecision::Allow))
+        }
+        PolicyRule::WorkspaceOnly(_) => None,
     }
 }
 

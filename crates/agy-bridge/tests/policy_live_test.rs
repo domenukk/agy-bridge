@@ -22,12 +22,12 @@ impl RustTool for SafeTool {
     const NAME: &'static str = "safe_tool";
     const DESCRIPTION: &'static str = "A safe no-op tool that returns a confirmation.";
 
-    async fn call(
+    fn call(
         &self,
         _params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        Ok("safe_tool was called".into())
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
+        std::future::ready(Ok("safe_tool was called".into()))
     }
 }
 

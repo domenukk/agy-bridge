@@ -35,12 +35,12 @@ impl RustTool for Multiply {
     const NAME: &'static str = "multiply";
     const DESCRIPTION: &'static str = "Multiplies two numbers.";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        Ok(format!("{}", params.a * params.b).into())
+    ) -> impl std::future::Future<Output = Result<ToolOutput, ToolError>> + Send {
+        std::future::ready(Ok(format!("{}", params.a * params.b).into()))
     }
 }
 

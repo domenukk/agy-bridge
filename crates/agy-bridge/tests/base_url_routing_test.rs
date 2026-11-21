@@ -340,6 +340,7 @@ fn base_url_routes_requests_to_custom_endpoint() {
             api_key: Some("test-key-for-mock".to_string()),
             base_url: Some(base_url.clone()),
             models: agy_bridge::config::ModelConfig::default(),
+            ..Default::default()
         };
 
         let config = agy_bridge::config::AgentConfig::builder()
@@ -416,6 +417,7 @@ fn multiple_agents_use_independent_base_urls() {
                 api_key: Some("key-a".to_string()),
                 base_url: Some(url_a.clone()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .retry_config(agy_bridge::config::RetryConfig::no_retries())
@@ -427,6 +429,7 @@ fn multiple_agents_use_independent_base_urls() {
                 api_key: Some("key-b".to_string()),
                 base_url: Some(url_b.clone()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .retry_config(agy_bridge::config::RetryConfig::no_retries())

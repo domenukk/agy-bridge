@@ -383,13 +383,15 @@ async fn spawn_subagent_with_registry_populates_tools() {
         type Params = Params;
         const NAME: &'static str = "test_tool";
         const DESCRIPTION: &'static str = "A test tool";
-        async fn call(
+        fn call(
             &self,
             params: Params,
             _ctx: &crate::tools::ToolContext,
-        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+        ) -> impl std::future::Future<
+            Output = Result<crate::tools::ToolOutput, crate::tools::ToolError>,
+        > + Send {
             assert!(params.x > 0, "expected positive x, got {}", params.x);
-            Ok("ok".into())
+            std::future::ready(Ok("ok".into()))
         }
     }
 

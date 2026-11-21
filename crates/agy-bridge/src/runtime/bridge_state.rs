@@ -1,12 +1,15 @@
 //! Per-agent bridge state registry.
 //!
-//! Stores per-agent sidecar data (tool registries, hook runners, policy sets)
-//! in a global `RwLock<HashMap>` keyed by agent ID. See the module-level docs
-//! in `runtime/mod.rs` for the rationale behind global state.
+//! Stores per-agent sidecar data (tool registries, hook runners, policy sets,
+//! surrogate vaults, and `call_id`-keyed tool execution metadata) in a global
+//! `RwLock<HashMap>` keyed by agent ID.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(feature = "python")]
@@ -21,11 +24,63 @@ impl std::fmt::Display for AgentId {
     }
 }
 
-/// Process-global monotonic source of unique agent IDs.
+const MAX_TRACKED_TOOL_CALL_SLOTS: usize = 256;
+#[cfg(any(feature = "native", feature = "python"))]
+const MAX_CONVERSATION_ID_LEN: usize = 128;
+
+/// Validate that a conversation/cascade ID cannot traverse directories (`[A-H6]`).
 ///
-/// A single counter shared by *all* bridges/runtimes guarantees that agent IDs
-/// never collide across bridges, so per-agent entries in [`bridge_state()`]
-/// (and the initializing-hook-runner registry) are always unambiguous.
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`](crate::error::Error::InvalidConfig) if `id` is empty,
+/// exceeds 128 bytes, or contains characters outside `[A-Za-z0-9_-]`.
+#[cfg(any(feature = "native", feature = "python"))]
+pub(crate) fn validate_conversation_id(id: &str) -> Result<(), crate::error::Error> {
+    let is_safe = !id.is_empty()
+        && id.len() <= MAX_CONVERSATION_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !is_safe {
+        return Err(crate::error::Error::InvalidConfig {
+            message: format!(
+                "Invalid conversation_id {id:?}: must be 1..={MAX_CONVERSATION_ID_LEN} ASCII alphanumeric, '-', or '_' characters"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Remove persisted conversation artifacts inside `save_dir` after validating `cascade_id`
+/// against path traversal and refusing to follow directory symlinks.
+#[cfg(any(feature = "native", feature = "python"))]
+pub(crate) fn remove_persisted_conversation_files(
+    save_dir: &std::path::Path,
+    cascade_id: &str,
+) -> Result<(), crate::error::Error> {
+    validate_conversation_id(cascade_id)?;
+    for candidate in [
+        save_dir.join(format!("{cascade_id}.db")),
+        save_dir.join(format!("{cascade_id}.db-wal")),
+        save_dir.join(format!("{cascade_id}.db-shm")),
+        save_dir.join(format!("traj-{cascade_id}")),
+        save_dir.join(cascade_id),
+    ] {
+        let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+            if let Err(e) = std::fs::remove_dir_all(&candidate) {
+                tracing::debug!(path = %candidate.display(), error = %e, "Failed removing persisted conversation dir");
+            }
+        } else if let Err(e) = std::fs::remove_file(&candidate) {
+            tracing::debug!(path = %candidate.display(), error = %e, "Failed removing persisted conversation file");
+        }
+    }
+    Ok(())
+}
+
+/// Process-global monotonic source of unique agent IDs.
 static AGENT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Allocate a new, process-globally-unique agent ID.
@@ -34,11 +89,56 @@ pub fn next_agent_id() -> u64 {
     AGENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Bounded `call_id`-keyed metadata store with an unnamed fallback slot for
+/// callers or runtimes that do not supply a tool call ID.
+pub(crate) struct TrackedToolMap<T> {
+    by_call_id: HashMap<String, T>,
+    latest_fallback: Option<T>,
+}
+
+impl<T> Default for TrackedToolMap<T> {
+    fn default() -> Self {
+        Self {
+            by_call_id: HashMap::new(),
+            latest_fallback: None,
+        }
+    }
+}
+
+impl<T> TrackedToolMap<T> {
+    fn insert(&mut self, call_id: &str, value: T) {
+        if call_id.is_empty() {
+            self.latest_fallback = Some(value);
+            return;
+        }
+        if self.by_call_id.len() >= MAX_TRACKED_TOOL_CALL_SLOTS
+            && !self.by_call_id.contains_key(call_id)
+            && let Some(stale_key) = self.by_call_id.keys().next().cloned()
+        {
+            self.by_call_id.remove(&stale_key);
+        }
+        self.by_call_id.insert(call_id.to_owned(), value);
+    }
+
+    fn take(&mut self, call_id: &str) -> Option<T> {
+        if call_id.is_empty() {
+            return self.latest_fallback.take();
+        }
+        self.by_call_id
+            .remove(call_id)
+            .or_else(|| self.latest_fallback.take())
+    }
+
+    fn clear(&mut self, call_id: &str) {
+        if call_id.is_empty() {
+            self.latest_fallback = None;
+        } else {
+            self.by_call_id.remove(call_id);
+        }
+    }
+}
+
 /// Per-agent state stored in the global [`BRIDGE_STATE`] registry.
-///
-/// Bundles all sidecar data that FFI callbacks need to look up by agent ID.
-/// Consolidating into one struct means a single lock acquisition covers all
-/// lookups/insertions/removals, preventing inconsistent partial state.
 pub(crate) struct AgentBridgeState {
     /// Custom Rust tools registered for this agent.
     pub(crate) registry: Option<Arc<crate::tools::ToolRegistry>>,
@@ -50,41 +150,149 @@ pub(crate) struct AgentBridgeState {
     pub(crate) policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     /// Shared key-value state persisted across tool calls for this agent.
     pub(crate) tool_state: llm_tool::SharedState,
-    /// The agent's conversation ID, sharing the same `Arc` as its
-    /// [`AgentHandle`](crate::agent::AgentHandle) so updates are visible here
-    /// immediately. Threaded into the [`ToolContext`](llm_tool::ToolContext)
-    /// built for every custom-tool dispatch, so tools can identify which
-    /// conversation they serve.
-    ///
-    /// It faithfully mirrors the SDK session: seeded from
-    /// `AgentConfig::conversation_id` when resuming, then overwritten with the
-    /// harness-assigned id during the first turn (synced from Python via
-    /// `set_agent_conversation_id`). `None` until the harness assigns one for a
-    /// fresh conversation.
-    pub(crate) conversation_id: Arc<std::sync::Mutex<Option<String>>>,
-    /// Structured payload of the most recent failed tool dispatch, if any.
-    ///
-    /// When a Rust tool returns `Err(ToolError)`, the error is serialized here
-    /// (message + metadata) *before* being converted to a `PyErr`. The
-    /// `on_tool_error` hook dispatch then takes this value to enrich
-    /// [`OnToolErrorContext`](crate::hooks::OnToolErrorContext) with the same
-    /// structured metadata that successful calls already receive — the SDK's
-    /// Python callback only sees the model-facing message string, so the
-    /// metadata cannot round-trip through Python.
-    ///
-    /// Cleared on the next successful dispatch to avoid surfacing a stale error.
-    pub(crate) last_tool_error: std::sync::Mutex<Option<CapturedToolError>>,
-    /// Cached structured output from the most recent successful custom tool
-    /// call on this agent.
-    ///
-    /// When a Rust tool returns `Ok(ToolOutput)`, its arguments and structured
-    /// metadata are stored here so that the subsequent post-tool hook dispatch
-    /// can enrich [`PostToolCallContext`](crate::hooks::PostToolCallContext)
-    /// with the full structured metadata and arguments.
-    pub(crate) last_tool_output: std::sync::Mutex<Option<CapturedToolOutput>>,
+    /// Per-agent host-pinned surrogate vault (`<surrogate:kind:id>`).
+    pub(crate) surrogate_vault: llm_tool::SurrogateVault,
+    /// Minimum prompt-injection sanitization floor configured for this agent.
+    pub(crate) tool_output_floor: crate::tools::OutputSanitization,
+    /// The agent's conversation ID, sharing the same `Arc` as its [`AgentHandle`](crate::agent::AgentHandle).
+    pub(crate) conversation_id: Arc<Mutex<Option<String>>>,
+    /// Structured payloads of failed custom tool dispatches, keyed by `call_id`.
+    pub(crate) tool_errors: Mutex<TrackedToolMap<CapturedToolError>>,
+    /// Cached structured outputs of successful custom tool dispatches, keyed by `call_id`.
+    pub(crate) tool_outputs: Mutex<TrackedToolMap<CapturedToolOutput>>,
+    /// Custom tool invocations already approved via `PolicyDecisionRequest` / `_rust_confirm_handler`,
+    /// consumed once by `check_tool_execution_allowed` if `TransformToolInput` did not mutate `args`.
+    pub(crate) confirmed_tool_calls: Mutex<Vec<ConfirmedToolCall>>,
+    /// Structured output restored from persisted `InitializeConversationResponse.history` on session resume.
+    pub(crate) restored_structured_output: Mutex<Option<serde_json::Value>>,
+    /// Tool `call_id`s already evaluated via `CallHookRequest(PreTool)` so `run_tool_pre_check`
+    /// never executes `TransformToolInput` / `PreToolCallDecide` twice on the same call.
+    #[cfg(feature = "native")]
+    pub(crate) pre_tool_evaluated_calls: Mutex<std::collections::HashSet<String>>,
+    /// Ensures `OnSessionStart` fires at most once per agent on `NativeRuntime`.
+    #[cfg(feature = "native")]
+    pub(crate) session_start_fired: std::sync::atomic::AtomicBool,
+    /// Ensures `OnSessionEnd` fires at most once per agent on `NativeRuntime`.
+    #[cfg(feature = "native")]
+    pub(crate) session_end_fired: std::sync::atomic::AtomicBool,
 }
 
-/// Structured snapshot of the most recent successful custom tool dispatch.
+/// Snapshot of an interactive `AskUser` approval granted by `PolicyDecisionRequest` or Python policy confirm.
+pub(crate) struct ConfirmedToolCall {
+    pub(crate) tool_name: String,
+    pub(crate) args: serde_json::Value,
+}
+
+fn json_values_semantically_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Null, serde_json::Value::Null) => true,
+        (serde_json::Value::Bool(x), serde_json::Value::Bool(y)) => x == y,
+        (serde_json::Value::String(x), serde_json::Value::String(y)) => x == y,
+        (serde_json::Value::Number(x), serde_json::Value::Number(y)) => {
+            x == y || (x.as_f64().is_some() && x.as_f64() == y.as_f64())
+        }
+        (serde_json::Value::Array(xs), serde_json::Value::Array(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|(x, y)| json_values_semantically_equal(x, y))
+        }
+        (serde_json::Value::Object(xm), serde_json::Value::Object(ym)) => {
+            xm.len() == ym.len()
+                && xm.iter().all(|(k, xv)| {
+                    ym.get(k)
+                        .is_some_and(|yv| json_values_semantically_equal(xv, yv))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Record that `PolicyDecisionRequest` / `_rust_confirm_handler` approved `(tool_name, args)` for `agent_id`.
+#[cfg(any(feature = "native", feature = "python"))]
+pub(crate) fn record_confirmed_tool_call(agent_id: u64, tool_name: &str, args: serde_json::Value) {
+    let map = match bridge_state().read() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "BRIDGE_STATE read lock poisoned in record_confirmed_tool_call");
+            return;
+        }
+    };
+    let Some(entry) = map.get(&agent_id) else {
+        return;
+    };
+    match entry.confirmed_tool_calls.lock() {
+        Ok(mut list) => {
+            if list.len() >= MAX_TRACKED_TOOL_CALL_SLOTS {
+                list.remove(0);
+            }
+            list.push(ConfirmedToolCall {
+                tool_name: tool_name.to_owned(),
+                args,
+            });
+        }
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "confirmed_tool_calls mutex poisoned");
+        }
+    }
+}
+
+/// Invalidate one cached `AskUser` approval for `(tool_name, orig_args)` when `TransformToolInput` mutates `args`.
+#[cfg(any(feature = "native", feature = "python"))]
+pub(crate) fn invalidate_confirmed_tool_call(
+    agent_id: u64,
+    tool_name: &str,
+    orig_args: &serde_json::Value,
+) {
+    let map = match bridge_state().read() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "BRIDGE_STATE read lock poisoned in invalidate_confirmed_tool_call");
+            return;
+        }
+    };
+    let Some(entry) = map.get(&agent_id) else {
+        return;
+    };
+    match entry.confirmed_tool_calls.lock() {
+        Ok(mut list) => {
+            if let Some(pos) = list.iter().position(|c| {
+                c.tool_name == tool_name && json_values_semantically_equal(&c.args, orig_args)
+            }) {
+                list.remove(pos);
+            }
+        }
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "confirmed_tool_calls mutex poisoned");
+        }
+    }
+}
+
+fn take_confirmed_tool_call(
+    confirmed_slot: &Mutex<Vec<ConfirmedToolCall>>,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> bool {
+    match confirmed_slot.lock() {
+        Ok(mut list) => {
+            if let Some(pos) = list.iter().position(|c| {
+                c.tool_name == tool_name && json_values_semantically_equal(&c.args, args)
+            }) {
+                list.remove(pos);
+                true
+            } else {
+                false
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "confirmed_tool_calls mutex poisoned in take_confirmed_tool_call");
+            false
+        }
+    }
+}
+
+/// Structured snapshot of a successful custom tool dispatch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedToolOutput {
     /// Arguments the tool was invoked with.
@@ -93,33 +301,51 @@ pub struct CapturedToolOutput {
     pub metadata: serde_json::Value,
 }
 
-/// Cache `(tool_args, metadata)` from a successful custom tool call in the
-/// agent's last-tool-output slot.
+/// Cache `(tool_args, metadata)` from a successful custom tool call under `call_id`.
+pub fn record_tool_output_for_call(
+    agent_id: u64,
+    call_id: &str,
+    tool_args: serde_json::Value,
+    metadata: serde_json::Value,
+) {
+    with_tool_outputs_slot(agent_id, "record", |map| {
+        map.insert(
+            call_id,
+            CapturedToolOutput {
+                tool_args,
+                metadata,
+            },
+        );
+    });
+}
+
+/// Remove and return the cached [`CapturedToolOutput`] for `call_id`, if present.
+#[must_use]
+pub fn take_tool_output_for_call(agent_id: u64, call_id: &str) -> Option<CapturedToolOutput> {
+    let mut taken = None;
+    with_tool_outputs_slot(agent_id, "take", |map| taken = map.take(call_id));
+    taken
+}
+
+/// Cache `(tool_args, metadata)` from a successful custom tool call in the fallback slot.
 pub fn record_last_tool_output(
     agent_id: u64,
     tool_args: serde_json::Value,
     metadata: serde_json::Value,
 ) {
-    with_last_tool_output_slot(agent_id, "record", |slot| {
-        *slot = Some(CapturedToolOutput {
-            tool_args,
-            metadata,
-        });
-    });
+    record_tool_output_for_call(agent_id, "", tool_args, metadata);
 }
 
-/// Remove and return the agent's cached [`CapturedToolOutput`], if present.
+/// Remove and return the agent's fallback cached [`CapturedToolOutput`], if present.
 #[must_use]
 pub fn take_last_tool_output(agent_id: u64) -> Option<CapturedToolOutput> {
-    let mut taken = None;
-    with_last_tool_output_slot(agent_id, "take", |slot| taken = slot.take());
-    taken
+    take_tool_output_for_call(agent_id, "")
 }
 
-fn with_last_tool_output_slot(
+fn with_tool_outputs_slot(
     agent_id: u64,
     op: &str,
-    f: impl FnOnce(&mut Option<CapturedToolOutput>),
+    f: impl FnOnce(&mut TrackedToolMap<CapturedToolOutput>),
 ) {
     let map = match bridge_state().read() {
         Ok(map) => map,
@@ -128,7 +354,7 @@ fn with_last_tool_output_slot(
                 agent_id,
                 op,
                 error = %e,
-                "BRIDGE_STATE read lock poisoned — cannot access last_tool_output slot"
+                "BRIDGE_STATE read lock poisoned — cannot access tool_outputs"
             );
             return;
         }
@@ -137,33 +363,29 @@ fn with_last_tool_output_slot(
         tracing::debug!(
             agent_id,
             op,
-            "No bridge state entry for last_tool_output access"
+            "No bridge state entry for tool_outputs access"
         );
         return;
     };
-    match entry.last_tool_output.lock() {
+    match entry.tool_outputs.lock() {
         Ok(mut slot) => f(&mut slot),
         Err(e) => {
             tracing::error!(
                 agent_id,
                 op,
                 error = %e,
-                "last_tool_output mutex poisoned — structured output metadata unavailable"
+                "tool_outputs mutex poisoned — structured output metadata unavailable"
             );
         }
     }
 }
 
-/// Structured snapshot of the most recent failed custom tool dispatch.
-///
-/// Captured on the dispatch error path so the `on_tool_error` hook can
-/// receive the same arguments and structured metadata as `post_tool_call`.
+/// Structured snapshot of a failed custom tool dispatch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedToolError {
     /// Arguments the failing tool was invoked with (`Null` when unknown).
     pub tool_args: serde_json::Value,
-    /// Structured [`ToolError`](llm_tool::ToolError) metadata, or `None` when
-    /// the error carried no metadata.
+    /// Structured [`ToolError`](llm_tool::ToolError) metadata, or `None` when empty.
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -185,42 +407,54 @@ impl CapturedToolError {
     }
 }
 
-/// Snapshot a [`ToolError`](llm_tool::ToolError) and cache it in the agent's
-/// last-tool-error slot.
-///
-/// Called from the tool dispatch error path. Failures to look up the agent are
-/// logged (never silently swallowed) rather than propagated, since losing
-/// metadata must not mask the original tool failure.
+/// Snapshot a [`ToolError`](llm_tool::ToolError) under `call_id`.
+pub fn record_tool_error_for_call(
+    agent_id: u64,
+    call_id: &str,
+    tool_args: serde_json::Value,
+    error: &llm_tool::ToolError,
+) {
+    let captured = CapturedToolError::from_tool_error(tool_args, error);
+    with_tool_errors_slot(agent_id, "record", |map| map.insert(call_id, captured));
+}
+
+/// Clear any cached [`CapturedToolError`] for `call_id`.
+pub fn clear_tool_error_for_call(agent_id: u64, call_id: &str) {
+    with_tool_errors_slot(agent_id, "clear", |map| map.clear(call_id));
+}
+
+/// Remove and return the cached [`CapturedToolError`] for `call_id`, if present.
+#[must_use]
+pub fn take_tool_error_for_call(agent_id: u64, call_id: &str) -> Option<CapturedToolError> {
+    let mut taken = None;
+    with_tool_errors_slot(agent_id, "take", |map| taken = map.take(call_id));
+    taken
+}
+
+/// Snapshot a [`ToolError`](llm_tool::ToolError) in the agent's fallback slot.
 pub fn record_last_tool_error(
     agent_id: u64,
     tool_args: serde_json::Value,
     error: &llm_tool::ToolError,
 ) {
-    let captured = CapturedToolError::from_tool_error(tool_args, error);
-    with_last_tool_error_slot(agent_id, "record", |slot| *slot = Some(captured));
+    record_tool_error_for_call(agent_id, "", tool_args, error);
 }
 
-/// Clear the agent's cached [`CapturedToolError`], preventing a previous
-/// failure from leaking into a later hook invocation.
+/// Clear the agent's fallback cached [`CapturedToolError`].
 pub fn clear_last_tool_error(agent_id: u64) {
-    with_last_tool_error_slot(agent_id, "clear", |slot| *slot = None);
+    clear_tool_error_for_call(agent_id, "");
 }
 
-/// Remove and return the agent's cached [`CapturedToolError`], if present.
+/// Remove and return the agent's fallback cached [`CapturedToolError`], if present.
 #[must_use]
 pub fn take_last_tool_error(agent_id: u64) -> Option<CapturedToolError> {
-    let mut taken = None;
-    with_last_tool_error_slot(agent_id, "take", |slot| taken = slot.take());
-    taken
+    take_tool_error_for_call(agent_id, "")
 }
 
-/// Run `f` against an agent's `last_tool_error` mutex, logging (rather than
-/// panicking or silently dropping) if the registry lock or the slot mutex is
-/// unavailable. `op` names the operation for diagnostics.
-fn with_last_tool_error_slot(
+fn with_tool_errors_slot(
     agent_id: u64,
     op: &str,
-    f: impl FnOnce(&mut Option<CapturedToolError>),
+    f: impl FnOnce(&mut TrackedToolMap<CapturedToolError>),
 ) {
     let map = match bridge_state().read() {
         Ok(map) => map,
@@ -229,70 +463,100 @@ fn with_last_tool_error_slot(
                 agent_id,
                 op,
                 error = %e,
-                "BRIDGE_STATE read lock poisoned — cannot access last_tool_error slot"
+                "BRIDGE_STATE read lock poisoned — cannot access tool_errors"
             );
             return;
         }
     };
     let Some(entry) = map.get(&agent_id) else {
-        // No entry is normal during teardown races; debug-level only.
-        tracing::debug!(
-            agent_id,
-            op,
-            "No bridge state entry for last_tool_error access"
-        );
+        tracing::debug!(agent_id, op, "No bridge state entry for tool_errors access");
         return;
     };
-    match entry.last_tool_error.lock() {
+    match entry.tool_errors.lock() {
         Ok(mut slot) => f(&mut slot),
         Err(e) => {
             tracing::error!(
                 agent_id,
                 op,
                 error = %e,
-                "last_tool_error mutex poisoned — structured error metadata unavailable"
+                "tool_errors mutex poisoned — structured error metadata unavailable"
             );
         }
     }
 }
 
-/// Single global registry of per-agent bridge state, keyed by agent ID.
-///
-/// # Lock choice
-///
-/// Uses `std::sync::RwLock` (not `tokio::sync::RwLock`) because the lock is
-/// held only for brief `HashMap` insert/remove/lookup operations and is never
-/// held across an `.await` point. This avoids the overhead of an async lock
-/// and is safe from deadlocks.
-///
-/// # Scalability
-///
-/// For typical agent counts (< ~100), `RwLock<HashMap>` provides sufficient
-/// throughput.  Read-side contention is bounded by the microsecond-scale lock
-/// duration.  If the bridge ever needs to support thousands of concurrent
-/// agents, replacing this with a `DashMap` would eliminate read-lock overhead
-/// entirely — but is unnecessary for current workloads.
-static BRIDGE_STATE: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>>,
-> = std::sync::OnceLock::new();
-
-/// Access the global per-agent bridge state registry.
-pub(crate) fn bridge_state()
--> &'static std::sync::RwLock<std::collections::HashMap<u64, AgentBridgeState>> {
-    BRIDGE_STATE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+/// Record that `CallHookRequest(PreTool)` has already evaluated `call_id` for `agent_id`.
+#[cfg(feature = "native")]
+pub(crate) fn mark_pre_tool_evaluated(agent_id: u64, call_id: &str) {
+    if call_id.is_empty() {
+        return;
+    }
+    let map = match bridge_state().read() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "BRIDGE_STATE read lock poisoned in mark_pre_tool_evaluated");
+            return;
+        }
+    };
+    let Some(entry) = map.get(&agent_id) else {
+        return;
+    };
+    match entry.pre_tool_evaluated_calls.lock() {
+        Ok(mut set) => {
+            if set.len() >= MAX_TRACKED_TOOL_CALL_SLOTS
+                && !set.contains(call_id)
+                && let Some(stale) = set.iter().next().cloned()
+            {
+                set.remove(&stale);
+            }
+            set.insert(call_id.to_owned());
+        }
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "pre_tool_evaluated_calls mutex poisoned");
+        }
+    }
 }
 
-/// Per-agent hook runners registered *before* the agent handle is fully
-/// constructed, so that `on_session_start` hooks can fire during initialization.
-static INITIALIZING_HOOK_RUNNERS: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>>,
-> = std::sync::OnceLock::new();
+/// Consume whether `call_id` was already evaluated by `CallHookRequest(PreTool)`.
+#[cfg(feature = "native")]
+#[must_use]
+pub(crate) fn take_pre_tool_evaluated(agent_id: u64, call_id: &str) -> bool {
+    if call_id.is_empty() {
+        return false;
+    }
+    let map = match bridge_state().read() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "BRIDGE_STATE read lock poisoned in take_pre_tool_evaluated");
+            return false;
+        }
+    };
+    let Some(entry) = map.get(&agent_id) else {
+        return false;
+    };
+    match entry.pre_tool_evaluated_calls.lock() {
+        Ok(mut set) => set.remove(call_id),
+        Err(e) => {
+            tracing::error!(agent_id, error = %e, "pre_tool_evaluated_calls mutex poisoned");
+            false
+        }
+    }
+}
+
+static BRIDGE_STATE: OnceLock<RwLock<HashMap<u64, AgentBridgeState>>> = OnceLock::new();
+
+/// Access the global per-agent bridge state registry.
+pub(crate) fn bridge_state() -> &'static RwLock<HashMap<u64, AgentBridgeState>> {
+    BRIDGE_STATE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+static INITIALIZING_HOOK_RUNNERS: OnceLock<RwLock<HashMap<u64, Arc<crate::hooks::Hooks>>>> =
+    OnceLock::new();
 
 /// Access the per-agent initializing hook-runner registry.
-pub(crate) fn initializing_hook_runners()
--> &'static std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::hooks::Hooks>>> {
-    INITIALIZING_HOOK_RUNNERS
-        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+pub(crate) fn initializing_hook_runners() -> &'static RwLock<HashMap<u64, Arc<crate::hooks::Hooks>>>
+{
+    INITIALIZING_HOOK_RUNNERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Store a conversation ID assigned to an agent.
@@ -376,12 +640,41 @@ pub fn agent_registry(agent_id: u64) -> Option<Arc<crate::tools::ToolRegistry>> 
     }
 }
 
+/// Return the effective [`OutputSanitization`](crate::tools::OutputSanitization) floor
+/// for `agent_id` (defaults to `SanitizeTokens` if the agent entry is absent or poisoned).
+#[must_use]
+pub fn agent_output_floor(agent_id: u64) -> crate::tools::OutputSanitization {
+    match bridge_state().read() {
+        Ok(map) => {
+            map.get(&agent_id)
+                .map_or(crate::tools::OutputSanitization::SanitizeTokens, |entry| {
+                    entry
+                        .registry
+                        .as_ref()
+                        .map_or(entry.tool_output_floor, |reg| reg.output_floor())
+                })
+        }
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_output_floor; defaulting to SanitizeTokens"
+            );
+            crate::tools::OutputSanitization::SanitizeTokens
+        }
+    }
+}
+
+/// Apply `agent_id`'s [`OutputSanitization`](crate::tools::OutputSanitization) floor to a
+/// model-facing error or `OnToolError` replacement string.
+#[cfg(any(feature = "native", feature = "python"))]
+#[must_use]
+pub(crate) fn sanitize_with_agent_floor(agent_id: u64, raw: &str) -> String {
+    agent_output_floor(agent_id).apply_str(raw).into_owned()
+}
+
 /// Look up the [`Hooks`](crate::hooks::Hooks) runner registered for `agent_id`,
 /// if any.
-///
-/// Checks the active bridge-state map first and falls back to the per-agent
-/// initializing hook registry so `on_session_start` callbacks resolve during
-/// [`Runtime::create_agent`](crate::agent::Runtime::create_agent).
 #[must_use]
 pub fn agent_hooks(agent_id: u64) -> Option<Arc<crate::hooks::Hooks>> {
     match bridge_state().read() {
@@ -467,12 +760,84 @@ pub fn agent_tool_state(agent_id: u64) -> Option<llm_tool::SharedState> {
     }
 }
 
+/// Store or clear the structured output restored from a resumed session's initial history.
+pub(crate) fn set_restored_structured_output(agent_id: u64, value: Option<serde_json::Value>) {
+    let Ok(map) = bridge_state().read() else {
+        tracing::error!(
+            agent_id,
+            "BRIDGE_STATE read lock poisoned in set_restored_structured_output"
+        );
+        return;
+    };
+    let Some(entry) = map.get(&agent_id) else {
+        return;
+    };
+    match entry.restored_structured_output.lock() {
+        Ok(mut guard) => *guard = value,
+        Err(poisoned) => *poisoned.into_inner() = value,
+    }
+}
+
+/// Read the structured output restored from a resumed session's initial history, if any.
+#[must_use]
+pub(crate) fn agent_restored_structured_output(agent_id: u64) -> Option<serde_json::Value> {
+    let Ok(map) = bridge_state().read() else {
+        tracing::error!(
+            agent_id,
+            "BRIDGE_STATE read lock poisoned in agent_restored_structured_output"
+        );
+        return None;
+    };
+    let entry = map.get(&agent_id)?;
+    match entry.restored_structured_output.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Atomically claim the one-shot `OnSessionStart` execution slot for `agent_id`.
+#[cfg(feature = "native")]
+#[must_use]
+pub(crate) fn claim_session_start_once(agent_id: u64) -> bool {
+    let Ok(map) = bridge_state().read() else {
+        return true;
+    };
+    map.get(&agent_id)
+        .is_none_or(|e| !e.session_start_fired.swap(true, Ordering::SeqCst))
+}
+
+/// Atomically claim the one-shot `OnSessionEnd` execution slot for `agent_id`.
+#[cfg(feature = "native")]
+#[must_use]
+pub(crate) fn claim_session_end_once(agent_id: u64) -> bool {
+    let Ok(map) = bridge_state().read() else {
+        return true;
+    };
+    map.get(&agent_id)
+        .is_none_or(|e| !e.session_end_fired.swap(true, Ordering::SeqCst))
+}
+
+/// Look up the shared per-agent [`SurrogateVault`](llm_tool::SurrogateVault) used
+/// across custom tool dispatches for `agent_id`, if registered.
+#[must_use]
+pub fn agent_surrogate_vault(agent_id: u64) -> Option<llm_tool::SurrogateVault> {
+    match bridge_state().read() {
+        Ok(map) => map
+            .get(&agent_id)
+            .map(|entry| entry.surrogate_vault.clone()),
+        Err(e) => {
+            tracing::error!(
+                agent_id,
+                error = %e,
+                "BRIDGE_STATE read lock poisoned in agent_surrogate_vault"
+            );
+            None
+        }
+    }
+}
+
 /// Remove `agent_id` from both the active bridge-state registry and the
 /// initializing hook-runner registry.
-///
-/// External [`Runtime`](crate::agent::Runtime) implementations should call this
-/// from [`Runtime::try_shutdown_agent`](crate::agent::Runtime::try_shutdown_agent)
-/// after firing any `on_session_end` hooks when cleaning up an un-awaited drop.
 pub fn remove_agent_bridge_state(agent_id: u64) {
     match bridge_state().write() {
         Ok(mut map) => {
@@ -537,15 +902,19 @@ pub fn check_tool_execution_allowed(
         return Ok(true);
     }
 
-    if needs_confirm && let Some(ref handler) = state.policy_handler {
-        let handler = std::sync::Arc::clone(handler);
-        // Drop the lock before calling the handler (it may block).
-        drop(map);
+    if needs_confirm {
         let args_val: serde_json::Value =
             serde_json::from_str(args_json).map_err(|e| crate::error::Error::BackendError {
                 message: format!("Failed to parse policy args JSON: {e}"),
             })?;
-        return Ok(handler.confirm(name, &args_val));
+        if take_confirmed_tool_call(&state.confirmed_tool_calls, name, &args_val) {
+            return Ok(true);
+        }
+        if let Some(ref handler) = state.policy_handler {
+            let handler = Arc::clone(handler);
+            drop(map);
+            return Ok(handler.confirm(name, &args_val));
+        }
     }
 
     Ok(false)
@@ -557,7 +926,6 @@ mod tests {
 
     use super::*;
 
-    /// Sequential allocations must never repeat an ID.
     #[test]
     fn next_agent_id_is_unique_sequentially() {
         const N: usize = 1000;
@@ -566,9 +934,6 @@ mod tests {
         assert_eq!(unique.len(), N, "sequential IDs must all be unique");
     }
 
-    /// Concurrent allocations across many threads must never hand out the same
-    /// ID twice — the invariant that guarantees per-agent state entries (and
-    /// initializing hook runners) never collide across bridges.
     #[test]
     fn next_agent_id_is_unique_under_concurrency() {
         const THREADS: usize = 16;
@@ -595,6 +960,20 @@ mod tests {
             all_ids.len(),
             "concurrent allocations must be collision-free"
         );
+    }
+
+    #[test]
+    fn tracked_tool_map_isolates_parallel_call_ids_and_fallback() {
+        let mut map = TrackedToolMap::default();
+        map.insert("call_a", 10);
+        map.insert("call_b", 20);
+        assert_eq!(map.take("call_a"), Some(10));
+        assert_eq!(map.take("call_b"), Some(20));
+        assert_eq!(map.take("call_a"), None);
+
+        map.insert("", 99);
+        assert_eq!(map.take("call_unmatched"), Some(99));
+        assert_eq!(map.take(""), None);
     }
 
     #[test]

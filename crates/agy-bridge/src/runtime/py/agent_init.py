@@ -27,6 +27,7 @@ try:
         _build_model_target,
         _extract_initial_history,
         _get_monkeypatch_lock,
+        _lookup_tracked_tool_call,
         _munge_config_model,
         _normalize_tool_name,
         _patch_subagent_inline_skills,
@@ -41,6 +42,7 @@ try:
         _serialize_pre_turn_ctx,
         _serialize_session_ctx,
         _serialize_stop_args,
+        _store_tracked_tool_call,
         _subagent_skills_proto_with_inline,
         _to_dict,
     )
@@ -50,15 +52,20 @@ except ImportError as _imp_err:
 try:
     from sdk_proto_parity import (
         ATTR_DISABLE_DEFINE_SUBAGENT_TOOL,
+        ATTR_DISABLE_MANAGE_SUBAGENTS_TOOL,
         FIELD_DISABLE_DEFINE_SUBAGENT_TOOL,
+        FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL,
         PROTO_SUBAGENTS_CONFIG,
+        _build_python_agent_config,
         _coerce_builtin_tool,
         _coerce_system_instructions,
+        _decode_question_hook_result,
         _parse_inline_skill,
         _patch_compaction_config_proto,
         _patch_harness_side_tools_proto,
         _require_sdk_proto_field,
         _unwrap_stdio_env_wrapper,
+        _validate_agent_env,
         _validate_mcp_server_parity,
         _wire_budget_config,
         _wire_compaction_config,
@@ -163,11 +170,20 @@ def _wire_capabilities(local_config: dict[str, Any]) -> None:
     disable_define_subagent = isinstance(caps_raw, dict) and bool(
         caps_raw.get(FIELD_DISABLE_DEFINE_SUBAGENT_TOOL, False)
     )
+    disable_manage_subagents = isinstance(caps_raw, dict) and bool(
+        caps_raw.get(FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL, False)
+    )
     if disable_define_subagent:
         _require_sdk_proto_field(
             PROTO_SUBAGENTS_CONFIG,
             FIELD_DISABLE_DEFINE_SUBAGENT_TOOL,
             "CapabilitiesConfig.disable_define_subagent_tool",
+        )
+    if disable_manage_subagents:
+        _require_sdk_proto_field(
+            PROTO_SUBAGENTS_CONFIG,
+            FIELD_DISABLE_MANAGE_SUBAGENTS_TOOL,
+            "CapabilitiesConfig.disable_manage_subagents_tool",
         )
     if "capabilities" in local_config and isinstance(
         local_config["capabilities"], dict
@@ -186,13 +202,17 @@ def _wire_capabilities(local_config: dict[str, Any]) -> None:
                 caps_dict["run_command_config"] = RunCommandConfig(
                     timeout_seconds=float(cmd_timeout_ms) / 1000.0
                 )
-            caps_dict.pop("image_model", None)
+            image_model_shorthand = caps_dict.pop("image_model", None)
+            if image_model_shorthand:
+                local_config["_agy_image_model_shorthand"] = image_model_shorthand
             if hasattr(CapabilitiesConfig, "model_fields"):
                 allowed_keys = set(CapabilitiesConfig.model_fields.keys())
                 caps_dict = {k: v for k, v in caps_dict.items() if k in allowed_keys}
             sdk_caps = CapabilitiesConfig(**caps_dict)
             if disable_define_subagent:
                 object.__setattr__(sdk_caps, ATTR_DISABLE_DEFINE_SUBAGENT_TOOL, True)
+            if disable_manage_subagents:
+                object.__setattr__(sdk_caps, ATTR_DISABLE_MANAGE_SUBAGENTS_TOOL, True)
             local_config["capabilities"] = sdk_caps
         except _RECOVERABLE_ERRORS as exc:
             _INIT_LOGGER.debug("CapabilitiesConfig coercion skipped: %s", exc)
@@ -231,9 +251,10 @@ def _wire_policies(local_config, agent_id_u64):
     from google.antigravity.hooks import policy
 
     if "policies" in local_config:
+        raw_policies = local_config["policies"]
         parsed_policies = []
         policy_logger = logging.getLogger("agy_bridge.policies")
-        for p in local_config["policies"]:
+        for p in raw_policies:
             if isinstance(p, str):
                 if p == "AllowAll":
                     parsed_policies.append(policy.allow_all())
@@ -248,7 +269,6 @@ def _wire_policies(local_config, agent_id_u64):
             elif isinstance(p, dict) and "AskUser" in p:
 
                 async def _rust_confirm_handler(tc):
-                    import asyncio
                     import inspect
                     import json
                     import sys
@@ -258,32 +278,48 @@ def _wire_policies(local_config, agent_id_u64):
                         globals_mod, "dispatch_rust_policy_confirm"
                     ):
                         policy_logger.warning(
-                            "dispatch_rust_policy_confirm not found in globals module, falling back to console input"
+                            "dispatch_rust_policy_confirm not found in globals module; failing closed"
                         )
-                        print(
-                            f"\nAgent requested to run tool '{tc.name}' with args {dict(tc.args)}"
-                        )
-                        try:
-                            ans = await asyncio.to_thread(input, "Allow? [Y/n]: ")
-                            return ans.strip().lower() in ("", "y", "yes")
-                        except (EOFError, OSError):
-                            return False
+                        return False
 
-                    tc_args_json = json.dumps(dict(tc.args))
-                    res = globals_mod.dispatch_rust_policy_confirm(
-                        int(agent_id_u64), tc.name, tc_args_json
-                    )
-                    if inspect.isawaitable(res):
-                        return await res
-                    return res
+                    try:
+                        tc_args_json = json.dumps(dict(tc.args))
+                        res = globals_mod.dispatch_rust_policy_confirm(
+                            int(agent_id_u64), tc.name, tc_args_json
+                        )
+                        if inspect.isawaitable(res):
+                            return bool(await res)
+                        return bool(res)
+                    except _RECOVERABLE_ERRORS as exc:
+                        policy_logger.warning(
+                            "Interactive policy confirmation failed for tool %r; failing closed: %s",
+                            tc.name,
+                            exc,
+                        )
+                        return False
 
                 parsed_policies.append(
                     policy.ask_user(p["AskUser"]["tool"], handler=_rust_confirm_handler)
                 )
             elif isinstance(p, dict) and "WorkspaceOnly" in p:
-                pass  # Handled by SDK via LocalAgentConfig.workspaces field
+                ws_paths = [str(x) for x in (p["WorkspaceOnly"] or [])]
+                if ws_paths:
+                    existing_ws = local_config.get("workspaces")
+                    if not isinstance(existing_ws, list):
+                        existing_ws = []
+                    for wp in ws_paths:
+                        if wp not in existing_ws:
+                            existing_ws.append(wp)
+                    local_config["workspaces"] = existing_ws
+                    parsed_policies.extend(policy.workspace_only(ws_paths))
             else:
                 policy_logger.warning("Unknown policy type %r, skipping", p)
+        if (
+            raw_policies
+            and parsed_policies
+            and all(isinstance(p, dict) and "WorkspaceOnly" in p for p in raw_policies)
+        ):
+            parsed_policies.append(policy.allow_all())
         local_config["policies"] = parsed_policies
 
 
@@ -302,11 +338,14 @@ def _wire_hooks(local_config, agent_id_u64):
             import re
 
             registered_hooks = []
+            seen_points: set[str] = set()
             for entry in hooks_entries:
                 try:
                     hook_name = entry.get("name", "unnamed")
                     hook_point = entry.get("point", "")
                     sdk_point = re.sub(r"(?<!^)(?=[A-Z])", "_", hook_point).lower()
+                    if sdk_point in seen_points:
+                        continue
 
                     decorator = getattr(hooks_module, sdk_point, None)
                     if decorator is None:
@@ -317,6 +356,7 @@ def _wire_hooks(local_config, agent_id_u64):
                             hook_name,
                         )
                         continue
+                    seen_points.add(sdk_point)
 
                     def _make_hook_cb(name, point_label):
                         """Factory to capture name/point_label per hook."""
@@ -342,10 +382,13 @@ def _wire_hooks(local_config, agent_id_u64):
                                     )
                                 return
 
+                            call_id = getattr(ctx, "id", None) or getattr(
+                                ctx, "call_id", None
+                            )
                             if point_label == "pre_tool_call_decide" and globals_mod:
-                                if not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
-                                    globals_mod.CURRENT_TOOL_CALLS = {}
-                                globals_mod.CURRENT_TOOL_CALLS[agent_id_u64] = ctx
+                                _store_tracked_tool_call(
+                                    globals_mod, int(agent_id_u64), call_id, ctx
+                                )
 
                             try:
                                 if point_label in (
@@ -356,21 +399,15 @@ def _wire_hooks(local_config, agent_id_u64):
                                         local_config, agent_id_u64
                                     )
                                 elif point_label == "post_tool_call":
-                                    current_tool_call = (
-                                        globals_mod.CURRENT_TOOL_CALLS.get(agent_id_u64)
-                                        if globals_mod
-                                        and hasattr(globals_mod, "CURRENT_TOOL_CALLS")
-                                        else None
+                                    current_tool_call = _lookup_tracked_tool_call(
+                                        globals_mod, int(agent_id_u64), call_id
                                     )
                                     ctx_json = _serialize_post_tool_call_ctx(
                                         ctx, current_tool_call, agent_id_u64
                                     )
                                 elif point_label == "on_tool_error":
-                                    current_tool_call = (
-                                        globals_mod.CURRENT_TOOL_CALLS.get(agent_id_u64)
-                                        if globals_mod
-                                        and hasattr(globals_mod, "CURRENT_TOOL_CALLS")
-                                        else None
+                                    current_tool_call = _lookup_tracked_tool_call(
+                                        globals_mod, int(agent_id_u64), call_id
                                     )
                                     ctx_json = _serialize_on_tool_error_ctx(
                                         ctx, current_tool_call, hook_logger
@@ -395,6 +432,12 @@ def _wire_hooks(local_config, agent_id_u64):
                                     from google.antigravity import types as sdk_types
 
                                     return sdk_types.StopHookResult()
+                                if point_label == "on_interaction":
+                                    from google.antigravity import types as sdk_types
+
+                                    return sdk_types.QuestionHookResult(
+                                        responses=[], cancelled=True
+                                    )
                                 if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False,
@@ -418,6 +461,12 @@ def _wire_hooks(local_config, agent_id_u64):
                                     from google.antigravity import types as sdk_types
 
                                     return sdk_types.StopHookResult()
+                                if point_label == "on_interaction":
+                                    from google.antigravity import types as sdk_types
+
+                                    return sdk_types.QuestionHookResult(
+                                        responses=[], cancelled=True
+                                    )
                                 if point_label in RESULT_HOOK_POINTS:
                                     return hooks_module.HookResult(
                                         allow=False, message=str(e)
@@ -461,13 +510,35 @@ def _wire_hooks(local_config, agent_id_u64):
                                     )
                                     return None
 
+                            if point_label == "on_interaction":
+                                return _decode_question_hook_result(
+                                    result_json, hook_logger
+                                )
+
                             if result_json:
                                 try:
                                     res_dict = json.loads(result_json)
                                     if "allow" in res_dict:
+                                        allow_flag = bool(res_dict.get("allow", True))
+                                        modified_args = res_dict.get("transformed_args")
+                                        valid_modified = (
+                                            modified_args
+                                            if allow_flag
+                                            and isinstance(modified_args, dict)
+                                            else None
+                                        )
+                                        if (
+                                            valid_modified is not None
+                                            and point_label == "pre_tool_call_decide"
+                                            and hasattr(ctx, "args")
+                                            and isinstance(ctx.args, dict)
+                                        ):
+                                            ctx.args.clear()
+                                            ctx.args.update(valid_modified)
                                         return hooks_module.HookResult(
-                                            allow=res_dict.get("allow", True),
+                                            allow=allow_flag,
                                             message=res_dict.get("message", ""),
+                                            modified_args=valid_modified,
                                         )
                                 except json.JSONDecodeError as e:
                                     hook_logger.error(
@@ -627,12 +698,28 @@ def _setup_base_url_routing(local_config):
     import logging
 
     logger = logging.getLogger("agy_bridge.init")
+    uses_alt_backend = bool(
+        local_config.get("vertex_config")
+        or local_config.get("local_openai_config")
+        or local_config.get("litert_config")
+    )
 
     custom_base_url = None
-    if local_config.get("gemini_config"):
-        custom_base_url = local_config["gemini_config"].pop("base_url", None)
-    if not custom_base_url:
-        custom_base_url = os.environ.get("GEMINI_API_BASE_URL")
+    if not uses_alt_backend:
+        if local_config.get("gemini_config"):
+            custom_base_url = local_config["gemini_config"].pop("base_url", None)
+        if not custom_base_url:
+            cfg_env = (
+                local_config.get("env")
+                if isinstance(local_config.get("env"), dict)
+                else {}
+            )
+            custom_base_url = (
+                cfg_env.get("GOOGLE_GEMINI_BASE_URL")
+                or cfg_env.get("GEMINI_API_BASE_URL")
+                or os.environ.get("GOOGLE_GEMINI_BASE_URL")
+                or os.environ.get("GEMINI_API_BASE_URL")
+            )
 
     try:
         from google.antigravity.connections.local import local_connection as _lc_mod
@@ -646,7 +733,7 @@ def _setup_base_url_routing(local_config):
     except ImportError:
         LocalConnectionStrategy = None  # type: ignore[assignment,misc]
 
-    if custom_base_url:
+    if custom_base_url and not uses_alt_backend:
         if "gemini_config" not in local_config or not local_config["gemini_config"]:
             local_config["gemini_config"] = {}
         if not local_config["gemini_config"].get("api_key"):
@@ -670,14 +757,23 @@ def _setup_base_url_routing(local_config):
 
             def _patched_build(self):
                 config = _original_build(self)
-                url = (
+                self_env = getattr(self, "_env", None) or {}
+                explicit_url = (
                     getattr(self, "_agy_base_url", None)
                     or LocalConnectionStrategy._agy_base_url_var.get()
+                )
+                fallback_url = (
+                    self_env.get("GOOGLE_GEMINI_BASE_URL")
+                    or self_env.get("GEMINI_API_BASE_URL")
+                    or os.environ.get("GOOGLE_GEMINI_BASE_URL")
                     or os.environ.get("GEMINI_API_BASE_URL")
                 )
+                url = explicit_url or fallback_url
                 if url:
                     try:
-                        if config.HasField("gemini_config"):
+                        if config.HasField("gemini_config") and (
+                            explicit_url or not config.gemini_config.base_url
+                        ):
                             config.gemini_config.base_url = url
                             logger.info("Injected base_url=%s into harness config", url)
                     except (AttributeError, ValueError):
@@ -685,7 +781,8 @@ def _setup_base_url_routing(local_config):
                     if hasattr(config, "models"):
                         for m in config.models:
                             if m.HasField("gemini_api_endpoint"):
-                                m.gemini_api_endpoint.base_url = url
+                                if explicit_url or not m.gemini_api_endpoint.base_url:
+                                    m.gemini_api_endpoint.base_url = url
                                 if (
                                     not m.gemini_api_endpoint.api_key
                                     or m.gemini_api_endpoint.api_key
@@ -694,7 +791,7 @@ def _setup_base_url_routing(local_config):
                                     m.gemini_api_endpoint.api_key = _PROXY_AUTH_SENTINEL
                                 logger.info(
                                     "Injected base_url=%s into model %s",
-                                    url,
+                                    m.gemini_api_endpoint.base_url,
                                     m.name,
                                 )
                 return config
@@ -879,6 +976,7 @@ def init_agent(
         sys.modules["_agy_bridge_globals"] = types.ModuleType("_agy_bridge_globals")
 
     local_config: dict[str, Any] = json.loads(config_json)
+    _validate_agent_env(local_config.get("env"))
 
     _wire_tool_proxies(local_config, agent_id_u64)
     _wire_capabilities(local_config)
@@ -915,12 +1013,7 @@ def init_agent(
     _munge_config_model(local_config, custom_base_url=custom_base_url)
 
     initial_history = _extract_initial_history(local_config)
-
-    from google.antigravity.connections.local.local_connection_config import (
-        LocalAgentConfig,
-    )
-
-    config = LocalAgentConfig(triggers=sdk_triggers, **local_config)
+    config = _build_python_agent_config(local_config, sdk_triggers)
     agent = agent_cls(config)
 
     return _build_agent_lifecycle(

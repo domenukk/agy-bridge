@@ -361,6 +361,7 @@ fn sequential_bridges_with_different_proxy_configs() {
                         api_key: None, // falls back to env var
                         base_url: Some(test_base_url()),
                         models: agy_bridge::config::ModelConfig::default(),
+                        ..Default::default()
                     })
                     .build();
 
@@ -424,6 +425,7 @@ fn same_bridge_proxy_and_direct_agents_isolation() {
                     api_key: None,
                     base_url: Some(test_base_url()),
                     models: agy_bridge::config::ModelConfig::default(),
+                    ..Default::default()
                 })
                 .build();
 
@@ -495,6 +497,7 @@ fn same_bridge_concurrent_proxy_and_direct_agents() {
                     api_key: None,
                     base_url: Some(test_base_url()),
                     models: agy_bridge::config::ModelConfig::default(),
+                    ..Default::default()
                 })
                 .build();
 
@@ -572,6 +575,7 @@ fn two_bridges_concurrent_proxy_and_direct_agents() {
                     api_key: None,
                     base_url: Some(test_base_url()),
                     models: agy_bridge::config::ModelConfig::default(),
+                    ..Default::default()
                 })
                 .build();
 

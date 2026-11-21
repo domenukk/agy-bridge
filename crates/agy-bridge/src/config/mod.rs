@@ -4,6 +4,7 @@
 //! model selection, tool capabilities, MCP server setup, and agent parameters.
 
 pub mod agent;
+pub mod backends;
 pub mod budget;
 pub mod capabilities;
 pub mod compaction;
@@ -12,8 +13,10 @@ pub mod mcp_json;
 pub mod models;
 pub mod subagents;
 pub mod truncation;
+pub(crate) mod validation;
 
 pub use agent::*;
+pub use backends::*;
 pub use budget::*;
 pub use capabilities::*;
 pub use compaction::*;
@@ -24,7 +27,7 @@ pub use subagents::*;
 pub use truncation::*;
 
 /// Default primary model name.
-pub const DEFAULT_MODEL: &str = "gemini-3.8-flash";
+pub const DEFAULT_MODEL: &str = "gemini-4-hydrogen";
 /// Default image generation model name.
 pub const DEFAULT_IMAGE_GENERATION_MODEL: &str = "gemini-3.1-flash-lite-image";
 
@@ -32,6 +35,8 @@ pub const DEFAULT_IMAGE_GENERATION_MODEL: &str = "gemini-3.1-flash-lite-image";
 pub const ENV_GEMINI_API_KEY: &str = "GEMINI_API_KEY";
 /// Environment variable name for the Gemini API base URL (e.g. proxy endpoint).
 pub const ENV_GEMINI_API_BASE_URL: &str = "GEMINI_API_BASE_URL";
+/// Secondary SDK environment variable name for the Gemini API base URL (`0.1.24`+).
+pub const ENV_GOOGLE_GEMINI_BASE_URL: &str = "GOOGLE_GEMINI_BASE_URL";
 /// Sentinel API key value used when routing through a proxy or gateway
 /// that handles authentication externally (e.g. via LOAS/gcert or mTLS).
 pub const PROXY_AUTH_SENTINEL: &str = "__agy_proxy_auth__";

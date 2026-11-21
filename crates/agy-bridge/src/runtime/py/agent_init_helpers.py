@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from typing import Any
@@ -17,6 +18,93 @@ RESULT_HOOK_POINTS: tuple[str, ...] = (
     "on_interaction",
 )
 _PROXY_AUTH_SENTINEL: str = "__agy_proxy_auth__"
+
+
+_FALLBACK_CALL_KEY: str = "_latest"
+_CURRENT_CLIENT_TOOL_CALL_ID: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("agy_current_client_tool_call_id", default=None)
+)
+
+
+def get_current_client_tool_call_id() -> str | None:
+    """Return the active client tool `call_id` bound to the current `asyncio.Task`."""
+    return _CURRENT_CLIENT_TOOL_CALL_ID.get()
+
+
+def _store_tracked_tool_call(
+    globals_mod: Any, agent_id_u64: int, call_id: str | None, tool_call: Any
+) -> None:
+    """Record an in-flight tool call keyed by `call_id` (with `_latest` fallback only when `call_id` is absent)."""
+    if not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
+        globals_mod.CURRENT_TOOL_CALLS = {}
+    agent_map = globals_mod.CURRENT_TOOL_CALLS.get(int(agent_id_u64))
+    if not isinstance(agent_map, dict):
+        agent_map = {}
+        globals_mod.CURRENT_TOOL_CALLS[int(agent_id_u64)] = agent_map
+    if len(agent_map) >= 256:
+        oldest_key = next(iter(agent_map))
+        agent_map.pop(oldest_key, None)
+    if call_id:
+        agent_map[str(call_id)] = tool_call
+    else:
+        agent_map[_FALLBACK_CALL_KEY] = tool_call
+
+
+def _lookup_tracked_tool_call(
+    globals_mod: Any, agent_id_u64: int, call_id: str | None
+) -> Any:
+    """Look up (and pop when `call_id` is known) a tracked tool call for `agent_id_u64`."""
+    if not globals_mod or not hasattr(globals_mod, "CURRENT_TOOL_CALLS"):
+        return None
+    entry = globals_mod.CURRENT_TOOL_CALLS.get(int(agent_id_u64))
+    if isinstance(entry, dict):
+        if call_id:
+            return entry.pop(str(call_id), None)
+        return entry.pop(_FALLBACK_CALL_KEY, None)
+    return entry
+
+
+def _store_tool_metadata(
+    globals_mod: Any,
+    agent_id_u64: int,
+    call_id: str | None,
+    tool_name: str,
+    metadata: Any,
+) -> None:
+    """Store host-only `ToolOutput::metadata()` scoped strictly to `(agent_id, call_id)`."""
+    if not hasattr(globals_mod, "TOOL_CALL_METADATA"):
+        globals_mod.TOOL_CALL_METADATA = {}
+    agent_meta = globals_mod.TOOL_CALL_METADATA.get(int(agent_id_u64))
+    if not isinstance(agent_meta, dict):
+        agent_meta = {}
+        globals_mod.TOOL_CALL_METADATA[int(agent_id_u64)] = agent_meta
+    if len(agent_meta) >= 256:
+        oldest_key = next(iter(agent_meta))
+        agent_meta.pop(oldest_key, None)
+    key = f"id:{call_id}" if call_id else f"name:{tool_name}"
+    if isinstance(metadata, dict) and metadata:
+        agent_meta[key] = dict(metadata)
+    else:
+        agent_meta.pop(key, None)
+
+
+def _pop_tool_metadata(
+    globals_mod: Any,
+    agent_id_u64: int,
+    call_id: str | None,
+    tool_name: str,
+) -> dict[str, Any]:
+    """Pop host-only tool metadata for `(agent_id, call_id)` without cross-tool leakage."""
+    if not globals_mod or not hasattr(globals_mod, "TOOL_CALL_METADATA"):
+        return {}
+    agent_meta = globals_mod.TOOL_CALL_METADATA.get(int(agent_id_u64))
+    if not isinstance(agent_meta, dict):
+        return {}
+    key = f"id:{call_id}" if call_id else f"name:{tool_name}"
+    val = agent_meta.pop(key, None)
+    if isinstance(val, dict):
+        return _to_dict(val)
+    return {}
 
 
 def _to_dict(obj: Any) -> Any:
@@ -111,21 +199,24 @@ def _serialize_post_tool_call_ctx(
     if not metadata and hasattr(ctx, "metadata") and ctx.metadata is not None:
         metadata = _to_dict(ctx.metadata)
 
-    if not metadata and agent_id_u64 is not None:
-        import sys
-
-        globals_mod = sys.modules.get("_agy_bridge_globals")
-        if globals_mod and hasattr(globals_mod, "LAST_TOOL_METADATA"):
-            cached_meta = globals_mod.LAST_TOOL_METADATA.get(int(agent_id_u64))
-            if cached_meta:
-                metadata = _to_dict(cached_meta)
-
     tool_name = getattr(ctx, "name", "")
     if not tool_name and hasattr(ctx, "tool_name"):
         tool_name = ctx.tool_name
     if not tool_name and current_tool_call:
         tool_name = getattr(current_tool_call, "name", "")
     tool_name = _normalize_tool_name(tool_name)
+
+    if not metadata and agent_id_u64 is not None:
+        import sys
+
+        globals_mod = sys.modules.get("_agy_bridge_globals")
+        call_id = getattr(ctx, "id", None) or getattr(ctx, "call_id", None)
+        metadata = _pop_tool_metadata(
+            globals_mod,
+            int(agent_id_u64),
+            str(call_id) if call_id else None,
+            tool_name,
+        )
 
     payload = {
         "name": tool_name,
@@ -260,11 +351,12 @@ def _build_model_target(
     entry: str | dict[str, Any],
     default_api_key: str | None = None,
     base_url: str | None = None,
+    http_headers: dict[str, str] | None = None,
     is_image: bool = False,
 ) -> Any:
     """Convert a serialized Rust `ModelEntry` dict or model name string into an SDK `ModelTarget`."""
     if isinstance(entry, str):
-        if not is_image and not base_url:
+        if not is_image and not base_url and not http_headers:
             return entry
         entry = {"name": entry}
 
@@ -302,7 +394,10 @@ def _build_model_target(
             tl_raw = gen.get("thinking_level")
             st_raw = gen.get("service_tier")
             mot_raw = gen.get("max_output_tokens")
-            tl = ThinkingLevel(str(tl_raw).lower()) if tl_raw else None
+            tl_norm = str(tl_raw).lower() if tl_raw else None
+            if tl_norm == "extra_high":
+                tl_norm = "xhigh"
+            tl = ThinkingLevel(tl_norm) if tl_norm else None
             st = ServiceTier(str(st_raw).lower()) if st_raw else None
             mot = int(mot_raw) if mot_raw is not None and int(mot_raw) > 0 else None
             opt_kwargs: dict[str, Any] = {"thinking_level": tl, "service_tier": st}
@@ -311,9 +406,12 @@ def _build_model_target(
             options = GeminiModelOptions(**opt_kwargs)
 
         endpoint = None
-        if base_url or entry_api_key or options is not None:
+        if base_url or entry_api_key or http_headers or options is not None:
             endpoint = GeminiAPIEndpoint(
-                base_url=base_url, api_key=entry_api_key, options=options
+                base_url=base_url,
+                http_headers=http_headers or None,
+                api_key=entry_api_key,
+                options=options,
             )
 
         model_types = [ModelType.IMAGE] if is_image else [ModelType.TEXT]
@@ -326,27 +424,41 @@ def _munge_config_model(
     local_config: dict[str, Any], custom_base_url: str | None = None
 ) -> None:
     """Normalize gemini_config into LocalAgentConfig top-level fields (model, models, api_key)."""
+    image_shorthand = local_config.get("_agy_image_model_shorthand")
     if "gemini_config" in local_config:
         gemini_cfg = local_config.pop("gemini_config")
         if gemini_cfg:
             top_api_key = gemini_cfg.get("api_key")
+            http_headers = gemini_cfg.get("http_headers") or None
             if top_api_key:
                 local_config["api_key"] = top_api_key
             models = gemini_cfg.get("models")
             if isinstance(models, dict) and models:
                 default_entry = models.get("default")
                 image_entry = models.get("image_generation")
+                if (
+                    isinstance(image_entry, dict)
+                    and image_shorthand
+                    and image_shorthand != "gemini-3.1-flash-lite-image"
+                    and (
+                        not image_entry.get("name")
+                        or image_entry.get("name") == "gemini-3.1-flash-lite-image"
+                    )
+                ):
+                    image_entry = {**image_entry, "name": image_shorthand}
                 if default_entry and image_entry:
                     t_default = _build_model_target(
                         default_entry,
                         default_api_key=top_api_key,
                         base_url=custom_base_url,
+                        http_headers=http_headers,
                         is_image=False,
                     )
                     t_image = _build_model_target(
                         image_entry,
                         default_api_key=top_api_key,
                         base_url=custom_base_url,
+                        http_headers=http_headers,
                         is_image=True,
                     )
                     if not isinstance(t_default, str) and not isinstance(t_image, str):
@@ -360,6 +472,7 @@ def _munge_config_model(
                             default_entry,
                             default_api_key=top_api_key,
                             base_url=custom_base_url,
+                            http_headers=http_headers,
                             is_image=False,
                         )
                     else:
@@ -369,11 +482,54 @@ def _munge_config_model(
                         image_entry,
                         default_api_key=top_api_key,
                         base_url=custom_base_url,
+                        http_headers=http_headers,
                         is_image=True,
                     )
                     if not isinstance(t_image, str):
                         local_config["models"] = [t_image]
                         local_config.pop("model", None)
+            elif http_headers or (
+                image_shorthand and image_shorthand != "gemini-3.1-flash-lite-image"
+            ):
+                t_def = _build_model_target(
+                    {"name": local_config.get("model")},
+                    default_api_key=top_api_key or local_config.get("api_key"),
+                    base_url=custom_base_url,
+                    http_headers=http_headers,
+                    is_image=False,
+                )
+                t_img = _build_model_target(
+                    {"name": image_shorthand},
+                    default_api_key=top_api_key or local_config.get("api_key"),
+                    base_url=custom_base_url,
+                    http_headers=http_headers,
+                    is_image=True,
+                )
+                if not isinstance(t_def, str) and not isinstance(t_img, str):
+                    local_config["models"] = [t_def, t_img]
+                    local_config.pop("model", None)
+    elif (
+        image_shorthand
+        and image_shorthand != "gemini-3.1-flash-lite-image"
+        and not local_config.get("vertex_config")
+        and not local_config.get("local_openai_config")
+        and not local_config.get("litert_config")
+    ):
+        t_def = _build_model_target(
+            {"name": local_config.get("model")},
+            default_api_key=local_config.get("api_key"),
+            base_url=custom_base_url,
+            is_image=False,
+        )
+        t_img = _build_model_target(
+            {"name": image_shorthand},
+            default_api_key=local_config.get("api_key"),
+            base_url=custom_base_url,
+            is_image=True,
+        )
+        if not isinstance(t_def, str) and not isinstance(t_img, str):
+            local_config["models"] = [t_def, t_img]
+            local_config.pop("model", None)
 
 
 def _extract_initial_history(local_config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -607,6 +763,9 @@ def _apply_sdk_monkeypatches(logger):
             import asyncio
             import sys
 
+            import google.antigravity as _agy_root_pkg
+
+            assert _agy_root_pkg is not None
             from google.antigravity.connections.local.local_connection import (
                 LocalConnection,
             )
@@ -623,7 +782,7 @@ def _apply_sdk_monkeypatches(logger):
                 )
                 return
 
-            MIN_SUPPORTED_SDK_VERSION = "0.1.16"
+            MIN_SUPPORTED_SDK_VERSION = "0.1.24"
             try:
                 import importlib.metadata as _meta
 
@@ -880,89 +1039,24 @@ def _apply_sdk_monkeypatches(logger):
                         patched_ep_tool_result
                     )
 
-                    async def patched_handle_tool_call(self, tool_call):
-                        import json
+                    if hasattr(LocalHarnessEventProcessor, "_execute_client_tool"):
+                        orig_exec_client = (
+                            LocalHarnessEventProcessor._execute_client_tool
+                        )
 
-                        from google.antigravity import types
-                        from google.antigravity.connections.local import event_processor
-
-                        try:
-                            args = json.loads(tool_call.arguments_json or "{}")
-                            tc = types.ToolCall(
-                                id=tool_call.id, name=tool_call.name, args=args
+                        async def patched_exec_client(self, tc):
+                            raw_id = getattr(tc, "id", None)
+                            tok = _CURRENT_CLIENT_TOOL_CALL_ID.set(
+                                str(raw_id) if raw_id else None
                             )
-                            tool_call_step = event_processor.LocalConnectionStep(
-                                id=tool_call.id,
-                                step_index=1,
-                                type=types.StepType.TOOL_CALL,
-                                source=types.StepSource.MODEL,
-                                target=types.StepTarget.ENVIRONMENT,
-                                status=types.StepStatus.ACTIVE,
-                                tool_calls=[tc],
-                            )
-                            await self.step_queue.put(tool_call_step)
+                            try:
+                                return await orig_exec_client(self, tc)
+                            finally:
+                                _CURRENT_CLIENT_TOOL_CALL_ID.reset(tok)
 
-                            if self._tool_runner:
-                                try:
-                                    results = (
-                                        await self._tool_runner.process_tool_calls(
-                                            [types.ToolCall(name=tc.name, args=tc.args)]
-                                        )
-                                    )
-                                    result = results[0]
-                                    result.id = tool_call.id
-                                except _SDK_PATCH_ERRORS as e:
-                                    result = types.ToolResult(
-                                        id=tool_call.id,
-                                        name=tool_call.name,
-                                        error=str(e),
-                                        exception=e,
-                                    )
-
-                                if self._hook_runner:
-                                    try:
-                                        from google.antigravity.hooks import hooks
-
-                                        turn_ctx = (
-                                            self._hook_router.current_turn_context
-                                            if self._hook_router
-                                            else None
-                                        ) or hooks.TurnContext(
-                                            self._hook_runner.session_context
-                                        )
-                                        op_ctx = hooks.OperationContext(turn_ctx)
-                                        await self._hook_runner.dispatch_post_tool_call(
-                                            op_ctx, result
-                                        )
-                                    except _SDK_PATCH_ERRORS as hook_err:
-                                        logger.warning(
-                                            "Error dispatching post_tool_call hook: %s",
-                                            hook_err,
-                                        )
-
-                                await self._send_tool_results([result])
-                            else:
-                                logger.warning(
-                                    "Received tool call %s but no tool runner is configured. Yielding to user.",
-                                    tool_call.name,
-                                )
-                        except _SDK_PATCH_ERRORS as e:
-                            logger.exception(
-                                "_handle_tool_call failed; returning error to model"
-                            )
-                            await self._send_tool_results(
-                                [
-                                    types.ToolResult(
-                                        id=tool_call.id,
-                                        name=tool_call.name,
-                                        error=f"Internal SDK error: {e!r}",
-                                    )
-                                ]
-                            )
-
-                    LocalHarnessEventProcessor.handle_tool_call = (
-                        patched_handle_tool_call
-                    )
+                        LocalHarnessEventProcessor._execute_client_tool = (
+                            patched_exec_client
+                        )
                     LocalHarnessEventProcessor._is_monkeypatched = True
             except (
                 ImportError,

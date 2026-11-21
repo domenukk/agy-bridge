@@ -1,6 +1,10 @@
 //! The receiving/reading side of the streaming channel pair.
 
-use std::sync::{Arc, Mutex, atomic::Ordering};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, atomic::Ordering},
+};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -9,7 +13,11 @@ use super::types::{
     ChatResponseSharedState, ChatResult, ERROR_DRAIN_TIMEOUT, ResponseEvent, StreamChunk,
     StreamError, StreamReceivers, StreamSubscriptions, ToolCallEvent,
 };
-use crate::types::{Step, UsageMetadata};
+use crate::types::{Step, StopReason, UsageMetadata};
+
+type CancelCallback = Box<
+    dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<(), crate::error::Error>> + Send>> + Send,
+>;
 
 /// Handle to a streaming chat response.
 ///
@@ -18,7 +26,6 @@ use crate::types::{Step, UsageMetadata};
 ///
 /// Each stream accessor can only be called once — subsequent calls return `None`
 /// because the underlying receiver has already been taken.
-#[derive(Debug)]
 pub struct ChatResponseHandle {
     /// All per-stream receivers, grouped for clarity.
     pub(super) rx: StreamReceivers,
@@ -31,8 +38,29 @@ pub struct ChatResponseHandle {
     pub(super) usage: Option<UsageMetadata>,
     /// Structured output from a `response_schema`-configured agent.
     pub(super) structured_output_value: Option<serde_json::Value>,
+    /// Trajectory stop reason populated when the turn finishes.
+    pub(super) stop_reason: StopReason,
+    /// Optional runtime cancellation callback wired by [`AgentHandle`](crate::agent::AgentHandle).
+    pub(super) cancel_fn: Option<CancelCallback>,
+    /// Weak liveness reference to the paired [`ChatResponseWriter`](super::writer::ChatResponseWriter).
+    pub(super) writer_alive: std::sync::Weak<()>,
     /// Shared state to receive metadata updates from the python bridge thread.
     pub(crate) shared_state: Arc<Mutex<ChatResponseSharedState>>,
+}
+
+impl std::fmt::Debug for ChatResponseHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatResponseHandle")
+            .field("rx", &self.rx)
+            .field("subs", &self.subs)
+            .field("usage", &self.usage)
+            .field("structured_output_value", &self.structured_output_value)
+            .field("stop_reason", &self.stop_reason)
+            .field("has_canceller", &self.cancel_fn.is_some())
+            .field("writer_alive", &(self.writer_alive.strong_count() > 0))
+            .field("shared_state", &self.shared_state)
+            .finish()
+    }
 }
 
 impl ChatResponseHandle {
@@ -175,6 +203,17 @@ impl ChatResponseHandle {
         if let Some(mut err_rx) = self.rx.error.take()
             && let Ok(Some(err)) = tokio::time::timeout(ERROR_DRAIN_TIMEOUT, err_rx.recv()).await
         {
+            match self.shared_state.lock() {
+                Ok(mut state) => {
+                    state.structured_output = None;
+                    state.turn_failed = true;
+                }
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    state.structured_output = None;
+                    state.turn_failed = true;
+                }
+            }
             return Err(err);
         }
 
@@ -184,16 +223,44 @@ impl ChatResponseHandle {
             text: buf,
             usage: self.usage,
             structured_output: self.structured_output_value,
+            stop_reason: self.stop_reason,
         })
     }
 
-    /// Finalize the response handle by pulling usage and structured output
+    /// Attach a turn-cancellation callback invoked by [`cancel()`](Self::cancel).
+    pub(crate) fn attach_canceller(&mut self, callback: CancelCallback) {
+        self.cancel_fn = Some(callback);
+    }
+
+    /// Return a weak reference to the paired writer's liveness token (`strong_count() == 0` once completed).
+    pub(crate) fn writer_alive_weak(&self) -> std::sync::Weak<()> {
+        self.writer_alive.clone()
+    }
+
+    /// Cancel the active turn associated with this response handle (`0.1.24`+).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`](crate::error::Error) if forwarding the halt signal to the runtime fails.
+    pub async fn cancel(&mut self) -> Result<(), crate::error::Error> {
+        if let Some(cb) = self.cancel_fn.take() {
+            cb().await?;
+        }
+        Ok(())
+    }
+
+    /// Finalize the response handle by pulling usage, stop reason, and structured output
     /// from the shared state. Called after the stream has been fully drained.
     pub fn finalize(&mut self) {
         match self.shared_state.lock() {
             Ok(state) => {
                 self.usage = state.usage.clone();
-                self.structured_output_value = state.structured_output.clone();
+                self.stop_reason = state.stop_reason;
+                self.structured_output_value = if state.turn_failed {
+                    None
+                } else {
+                    state.structured_output.clone()
+                };
             }
             Err(poisoned) => {
                 tracing::warn!(
@@ -201,18 +268,83 @@ impl ChatResponseHandle {
                 );
                 let state = poisoned.into_inner();
                 self.usage = state.usage.clone();
-                self.structured_output_value = state.structured_output.clone();
+                self.stop_reason = state.stop_reason;
+                self.structured_output_value = if state.turn_failed {
+                    None
+                } else {
+                    state.structured_output.clone()
+                };
             }
         }
     }
 
-    /// Return the structured output, if available.
+    /// Return the structured output, if available and the turn succeeded.
     ///
     /// Only populated when the agent was configured with a `response_schema`
-    /// and the model returned a valid JSON payload.
+    /// and the model returned a valid JSON payload without turn failure.
     #[must_use]
     pub const fn structured_output(&self) -> Option<&serde_json::Value> {
         self.structured_output_value.as_ref()
+    }
+
+    /// Check for any pending stream error, finalize metadata, and return the turn's
+    /// structured output (`0.1.24`+).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Stream`](crate::error::Error::Stream) if an error arrived on the stream.
+    pub fn try_structured_output(
+        &mut self,
+    ) -> Result<Option<serde_json::Value>, crate::error::Error> {
+        if let Some(ref mut err_rx) = self.rx.error {
+            match err_rx.try_recv() {
+                Ok(err) => {
+                    match self.shared_state.lock() {
+                        Ok(mut state) => {
+                            state.structured_output = None;
+                            state.turn_failed = true;
+                            if state.last_stream_error.is_none() {
+                                state.last_stream_error = Some(err.clone());
+                            }
+                        }
+                        Err(poisoned) => {
+                            let mut state = poisoned.into_inner();
+                            state.structured_output = None;
+                            state.turn_failed = true;
+                            if state.last_stream_error.is_none() {
+                                state.last_stream_error = Some(err.clone());
+                            }
+                        }
+                    }
+                    self.structured_output_value = None;
+                    return Err(crate::error::Error::Stream(err));
+                }
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                }
+            }
+        }
+        let recorded_err = match self.shared_state.lock() {
+            Ok(state) => state.last_stream_error.clone(),
+            Err(poisoned) => poisoned.into_inner().last_stream_error.clone(),
+        };
+        if let Some(err) = recorded_err {
+            self.structured_output_value = None;
+            return Err(crate::error::Error::Stream(err));
+        }
+        self.finalize();
+        Ok(self.structured_output_value.clone())
+    }
+
+    /// Return the trajectory stop reason for this turn (`StopReason::Unspecified` on normal completion).
+    #[must_use]
+    pub fn stop_reason(&self) -> StopReason {
+        if self.stop_reason != StopReason::Unspecified {
+            return self.stop_reason;
+        }
+        match self.shared_state.lock() {
+            Ok(state) => state.stop_reason,
+            Err(poisoned) => poisoned.into_inner().stop_reason,
+        }
     }
 
     /// Return the token usage metadata, if available.
@@ -239,7 +371,11 @@ impl ChatResponseHandle {
     ///
     /// Consumes the handle — use the `take_*` methods instead if you need
     /// to keep streaming individual channels.
-    pub async fn resolve(mut self) -> Vec<ResponseEvent> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StreamError`] if the backend reported an error during the turn.
+    pub async fn resolve(mut self) -> Result<Vec<ResponseEvent>, StreamError> {
         self.subs.event.store(true, Ordering::Release);
         let mut events = Vec::new();
         if let Some(mut rx) = self.rx.event.take() {
@@ -247,7 +383,23 @@ impl ChatResponseHandle {
                 events.push(event);
             }
         }
+        if let Some(mut err_rx) = self.rx.error.take()
+            && let Ok(Some(err)) = tokio::time::timeout(ERROR_DRAIN_TIMEOUT, err_rx.recv()).await
+        {
+            match self.shared_state.lock() {
+                Ok(mut state) => {
+                    state.structured_output = None;
+                    state.turn_failed = true;
+                }
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    state.structured_output = None;
+                    state.turn_failed = true;
+                }
+            }
+            return Err(err);
+        }
         self.finalize();
-        events
+        Ok(events)
     }
 }

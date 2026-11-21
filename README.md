@@ -43,7 +43,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 Install the Python SDK alongside it:
 
 ```bash
-pip install google-antigravity watchfiles
+pip install "google-antigravity>=0.1.24,<0.2.0" watchfiles
 ```
 
 > `watchfiles` is only needed for file-change triggers; timer triggers
@@ -252,7 +252,7 @@ assert_eq!(registry.definitions().len(), 1);
 Tool output is sanitized by default. `AgentConfig::tool_output_floor` (default
 `OutputSanitization::SanitizeTokens`) applies to every custom tool call. Set
 `#[llm_tool(provenance = "...")]` to mark external tools (`external_mcp` and
-`untrusted_network` wrap output in `<untrusted_tool_output>` tags by default),
+`untrusted_network` wrap output in `<tool_output_quarantine>` tags by default),
 and use `SurrogateVault` to replace secret values with placeholders:
 
 ```rust
@@ -273,10 +273,10 @@ assert_eq!(
 let vault = SurrogateVault::new();
 let ctx = ToolContext::new().with_surrogate_vault(vault);
 let handle = ctx.mint_surrogate("api_key", "sk-live-secret").unwrap();
-assert_eq!(handle.token(), "<surrogate:api_key:1>");
+assert!(handle.token().starts_with("<surrogate:api_key:"));
 assert_eq!(
     ctx.redact_surrogates("Bearer sk-live-secret").unwrap(),
-    "Bearer <surrogate:api_key:1>"
+    format!("Bearer {handle}")
 );
 ```
 
@@ -445,7 +445,8 @@ assert!(config.budget_config.is_some());
 
 ### Policies
 
-Declarative tool access control — first matching rule wins:
+Declarative tool access control — specific rules take precedence over wildcards,
+and `Deny > AskUser > Allow`:
 
 ```rust
 use agy_bridge::policies::{PolicyRule, PolicySet};

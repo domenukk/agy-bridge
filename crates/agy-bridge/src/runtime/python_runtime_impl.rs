@@ -31,11 +31,7 @@ fn validate_python_create_config(config: &crate::config::AgentConfig) -> Result<
             ),
         });
     }
-    for mcp in &config.mcp_servers {
-        mcp.validate()
-            .map_err(|message| Error::InvalidConfig { message })?;
-    }
-    Ok(())
+    crate::agent::validate_create_config(config)
 }
 
 /// Return a clone of `server` with its canonical [`server_name`](crate::config::McpServer::server_name)
@@ -80,7 +76,9 @@ fn serialize_python_agent_config(
         .iter()
         .map(with_resolved_mcp_name)
         .collect();
-    if let Some(api_key) = config.effective_api_key() {
+    let uses_non_gemini_backend =
+        patched.vertex.is_some() || patched.local_openai.is_some() || patched.litert.is_some();
+    if !uses_non_gemini_backend && let Some(api_key) = config.effective_api_key() {
         if patched.api_key.is_none() {
             patched.api_key = Some(api_key.clone());
         }
@@ -90,18 +88,19 @@ fn serialize_python_agent_config(
             gemini.api_key = Some(api_key);
         }
     }
-    let fallback_gemini_config = if let Some(base_url) = config.effective_base_url() {
-        if let Some(ref mut gemini) = patched.gemini {
-            if gemini.base_url.is_none() {
-                gemini.base_url = Some(base_url);
+    let fallback_gemini_config =
+        if !uses_non_gemini_backend && let Some(base_url) = config.effective_base_url() {
+            if let Some(ref mut gemini) = patched.gemini {
+                if gemini.base_url.is_none() {
+                    gemini.base_url = Some(base_url);
+                }
+                None
+            } else {
+                Some(BaseUrlOnlyGeminiConfig { base_url })
             }
-            None
         } else {
-            Some(BaseUrlOnlyGeminiConfig { base_url })
-        }
-    } else {
-        None
-    };
+            None
+        };
 
     let wire = PythonAgentConfigWire {
         config: patched,
@@ -210,10 +209,7 @@ impl crate::agent::Runtime for PythonRuntime {
         agent_id: crate::agent::AgentId,
         content: &crate::content::Content,
     ) -> Result<crate::streaming::ChatResponseHandle, Error> {
-        let prompt = match content {
-            crate::content::Content::Text { text } => text.clone(),
-            other => crate::content::content_to_json(other)?,
-        };
+        let prompt = super::py_scripts::PyPromptPayload::from_content(content)?;
         self.send_command("chat", |reply| PyCommand::Chat {
             agent_id: AgentId(agent_id),
             prompt,
@@ -270,10 +266,7 @@ impl crate::agent::Runtime for PythonRuntime {
         agent_id: crate::agent::AgentId,
         content: &crate::content::Content,
     ) -> Result<(), Error> {
-        let prompt = match content {
-            crate::content::Content::Text { text } => text.clone(),
-            other => crate::content::content_to_json(other)?,
-        };
+        let prompt = super::py_scripts::PyPromptPayload::from_content(content)?;
         self.send_command("send", |reply| PyCommand::Send {
             agent_id: AgentId(agent_id),
             prompt,

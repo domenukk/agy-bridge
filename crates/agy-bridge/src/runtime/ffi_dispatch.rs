@@ -29,7 +29,7 @@ pub(crate) fn dispatch_hook_by_name(
         crate::hooks::HookPoint::PreTurn => return handle_pre_turn(hook_runner, context_json),
         crate::hooks::HookPoint::PostTurn => handle_post_turn(hook_runner, context_json)?,
         crate::hooks::HookPoint::PreToolCallDecide => {
-            return handle_pre_tool_call_decide(hook_runner, context_json);
+            return handle_pre_tool_call_decide(agent_id, hook_runner, context_json);
         }
         crate::hooks::HookPoint::PostToolCall => handle_post_tool_call(hook_runner, context_json)?,
         crate::hooks::HookPoint::OnCompaction => handle_on_compaction(hook_runner, context_json)?,
@@ -115,15 +115,11 @@ fn handle_on_tool_error(
     json: &str,
 ) -> Result<String, crate::error::Error> {
     let ctx = deserialize_ctx(json, "OnToolErrorContext")?;
-    // Recover the structured error captured during dispatch (see
-    // `dispatch_rust_tool`). Taking it clears the slot so it can't leak into a
-    // later, unrelated error.
     let captured = super::bridge_state::take_last_tool_error(agent_id);
     let ctx = merge_tool_error_metadata(ctx, captured);
-    // The transform returns the error representation the model should see, or
-    // `None` to let the harness use its default formatting. Serialize as a JSON
-    // value (`null` or a JSON string) for the Python dispatcher to interpret.
-    let representation = runner.run_on_tool_error(&ctx);
+    let representation = runner
+        .run_on_tool_error(&ctx)
+        .map(|msg| super::bridge_state::sanitize_with_agent_floor(agent_id, &msg));
     serde_json::to_string(&representation).map_err(|e| crate::error::Error::BackendError {
         message: format!("Failed to serialize OnToolError result: {e}"),
     })
@@ -174,6 +170,7 @@ struct PreToolCallDecideWire<'a> {
 }
 
 fn handle_pre_tool_call_decide(
+    agent_id: u64,
     hook_runner: &crate::hooks::Hooks,
     context_json: &str,
 ) -> Result<String, crate::error::Error> {
@@ -184,10 +181,22 @@ fn handle_pre_tool_call_decide(
             ),
         })?;
     let transformed_args = hook_runner.run_transform_tool_input(&ctx);
-    let hook_result = hook_runner.run_pre_tool_call_decide(&ctx);
+    let mutated = transformed_args != ctx.tool_args;
+    if mutated {
+        super::bridge_state::invalidate_confirmed_tool_call(
+            agent_id,
+            &ctx.tool_name,
+            &ctx.tool_args,
+        );
+    }
+    let decide_ctx = crate::hooks::PreToolCallDecideContext::new(
+        ctx.tool_name.clone(),
+        transformed_args.clone(),
+    );
+    let hook_result = hook_runner.run_pre_tool_call_decide(&decide_ctx);
     let wire = PreToolCallDecideWire {
         result: &hook_result,
-        transformed_args: (transformed_args != ctx.tool_args).then_some(&transformed_args),
+        transformed_args: (hook_result.allow && mutated).then_some(&transformed_args),
     };
     serde_json::to_string(&wire).map_err(|e| crate::error::Error::BackendError {
         message: format!("Failed to serialize PreToolCallDecide result: {e}"),
@@ -322,6 +331,8 @@ pub(crate) fn dispatch_rust_policy_confirm(
                 "Failed to parse policy args JSON: {e}"
             ))
         })?;
+        let confirmed_tool_name = tool_name.clone();
+        let confirmed_args_val = args_val.clone();
         let result =
             tokio::task::spawn_blocking(move || policy_handler.confirm(&tool_name, &args_val))
                 .await
@@ -330,6 +341,13 @@ pub(crate) fn dispatch_rust_policy_confirm(
                         "Policy confirmation panicked: {e}"
                     ))
                 })?;
+        if result {
+            super::bridge_state::record_confirmed_tool_call(
+                agent_id,
+                &confirmed_tool_name,
+                confirmed_args_val,
+            );
+        }
 
         Ok(result)
     })
@@ -346,9 +364,12 @@ pub(crate) use super::bridge_state::check_tool_execution_allowed;
 /// had one set yields a context whose `conversation_id()` is `None`.
 pub(crate) fn build_tool_context(
     tool_state: llm_tool::SharedState,
+    surrogate_vault: llm_tool::SurrogateVault,
     conversation_id: Option<String>,
 ) -> crate::tools::ToolContext {
-    let ctx = crate::tools::ToolContext::new().with_shared_state(tool_state);
+    let ctx = crate::tools::ToolContext::new()
+        .with_shared_state(tool_state)
+        .with_surrogate_vault(surrogate_vault);
     match conversation_id {
         Some(id) => ctx.with_conversation_id(id),
         None => ctx,
@@ -379,7 +400,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
         )));
     }
 
-    let (registry, tool_state, conversation_id) = {
+    let (registry, tool_state, surrogate_vault, conversation_id) = {
         let map = bridge_state().read().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read BRIDGE_STATE: {e}"))
         })?;
@@ -393,10 +414,6 @@ pub(crate) fn dispatch_rust_tool<'py>(
                 "No active ToolRegistry found for agent ID {agent_id}"
             ))
         })?;
-        // Snapshot the agent's current conversation ID (if any) so the tool's
-        // `ToolContext` can identify which conversation it serves. A poisoned
-        // mutex is logged (never silently swallowed) and treated as "unset"
-        // rather than failing the dispatch over missing identity metadata.
         let conversation_id = match entry.conversation_id.lock() {
             Ok(guard) => guard.clone(),
             Err(e) => {
@@ -412,6 +429,7 @@ pub(crate) fn dispatch_rust_tool<'py>(
         (
             Arc::clone(registry),
             entry.tool_state.clone(),
+            entry.surrogate_vault.clone(),
             conversation_id,
         )
     };
@@ -421,21 +439,19 @@ pub(crate) fn dispatch_rust_tool<'py>(
     })?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let ctx = build_tool_context(tool_state, conversation_id);
+        let ctx = build_tool_context(tool_state, surrogate_vault, conversation_id);
         let output = match registry.dispatch(&name, args.clone(), &ctx).await {
             Ok(output) => {
-                // Success: drop any stale error so a later `on_tool_error`
-                // never surfaces metadata from a previous failed call.
                 super::bridge_state::clear_last_tool_error(agent_id);
                 output
             }
             Err(e) => {
-                // Cache the structured error (message + metadata) *before*
-                // collapsing it into a model-facing string, so the
-                // `on_tool_error` hook can recover the metadata. The model
-                // still sees exactly `ToolError::to_string()`.
                 super::bridge_state::record_last_tool_error(agent_id, args, &e);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()));
+                let sanitized_err = registry
+                    .output_floor()
+                    .apply_str(&e.to_string())
+                    .into_owned();
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(sanitized_err));
             }
         };
         let res = Python::attach(|py| -> PyResult<Py<PyAny>> {

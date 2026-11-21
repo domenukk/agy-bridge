@@ -1,65 +1,154 @@
-//! Interactive question/answer types for agent-user interactions.
+//! Interactive question/answer types for agent-user interactions (`0.1.24`+).
 
 use serde::{Deserialize, Serialize};
 
 use super::types::HookResult;
 
-// ── Interactive Q&A types (Python SDK parity) ───────────────────────────────
-
 /// A single selectable option in an interactive question prompt.
 ///
-/// Maps to the Python SDK's `AskQuestionOption`.
+/// Maps to `google.antigravity.types.AskQuestionOption` (`id`, `text`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskQuestionOption {
-    /// Human-readable label displayed to the user.
-    pub label: String,
-    /// Machine-readable value returned when this option is selected.
-    pub value: String,
+    /// Option identifier (1-based index string `"1"`, `"2"`, … on `localharness`).
+    #[serde(alias = "value")]
+    pub id: String,
+    /// Human-readable option text displayed to the user.
+    #[serde(alias = "label")]
+    pub text: String,
+}
+
+impl AskQuestionOption {
+    /// Create a new option with `id` and `text`.
+    #[must_use]
+    pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
 }
 
 /// A question with its list of selectable options.
 ///
-/// Maps to the Python SDK's `AskQuestionEntry`.
+/// Maps to `google.antigravity.types.AskQuestionEntry`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskQuestionEntry {
     /// The question text to present to the user.
     pub question: String,
     /// Available answer options.
     pub options: Vec<AskQuestionOption>,
+    /// Whether the user may select multiple options.
+    #[serde(default)]
+    pub is_multi_select: bool,
 }
 
-/// Full specification for an interactive ask-user interaction.
+impl AskQuestionEntry {
+    /// Create a single-select question entry.
+    #[must_use]
+    pub fn new(question: impl Into<String>, options: Vec<AskQuestionOption>) -> Self {
+        Self {
+            question: question.into(),
+            options,
+            is_multi_select: false,
+        }
+    }
+}
+
+/// Full specification for an interactive `ask_question` dialog.
 ///
-/// Contains one or more questions to present to the user in sequence.
-/// Maps to the Python SDK's `AskQuestionInteractionSpec`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Maps to `google.antigravity.types.AskQuestionInteractionSpec`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskQuestionInteractionSpec {
-    /// The questions to present to the user.
-    pub entries: Vec<AskQuestionEntry>,
+    /// Questions presented to the user in order.
+    #[serde(alias = "entries", default)]
+    pub questions: Vec<AskQuestionEntry>,
 }
 
-/// The user's response to an interactive question prompt.
-///
-/// Maps to the Python SDK's `QuestionResponse`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Individual response for an [`AskQuestionEntry`], matching `0.1.24` `QuestionResponse`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionResponse {
-    /// The selected answer values, one per question entry.
-    pub answers: Vec<String>,
+    /// Selected option IDs (e.g. `Some(vec!["1".into()])`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "answers")]
+    pub selected_option_ids: Option<Vec<String>>,
+    /// Freeform text response when the user supplies custom text.
+    #[serde(default)]
+    pub freeform_response: String,
+    /// If true, the question was skipped (`unanswered = true` on `localharness`).
+    #[serde(default)]
+    pub skipped: bool,
 }
 
-/// Combined hook result and optional question response.
-///
-/// Returned by hooks that involve interactive Q&A. The `hook_result`
-/// determines whether the agent should proceed, and `response` carries
-/// the user's answers (if any).
-///
-/// Maps to the Python SDK's `QuestionHookResult`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl QuestionResponse {
+    /// Build a response selecting one or more option IDs (e.g. `["1"]`).
+    #[must_use]
+    pub fn selected(ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            selected_option_ids: Some(ids.into_iter().map(Into::into).collect()),
+            freeform_response: String::new(),
+            skipped: false,
+        }
+    }
+
+    /// Build a freeform text response.
+    #[must_use]
+    pub fn freeform(text: impl Into<String>) -> Self {
+        Self {
+            selected_option_ids: None,
+            freeform_response: text.into(),
+            skipped: false,
+        }
+    }
+
+    /// Build a skipped response.
+    #[must_use]
+    pub const fn skipped() -> Self {
+        Self {
+            selected_option_ids: None,
+            freeform_response: String::new(),
+            skipped: true,
+        }
+    }
+}
+
+/// Result returned by [`super::Hooks::on_interaction`] callbacks (`0.1.24` `QuestionHookResult`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionHookResult {
-    /// The hook decision (allow/deny).
-    pub hook_result: HookResult,
-    /// The user's answers, if a question was asked and answered.
-    pub response: Option<QuestionResponse>,
+    /// Responses corresponding to the requested questions.
+    #[serde(default)]
+    pub responses: Vec<QuestionResponse>,
+    /// If true, the interaction was cancelled by the user/host.
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+impl QuestionHookResult {
+    /// Construct an answered interaction result with one [`QuestionResponse`] per question.
+    #[must_use]
+    pub fn answered(responses: impl IntoIterator<Item = QuestionResponse>) -> Self {
+        Self {
+            responses: responses.into_iter().collect(),
+            cancelled: false,
+        }
+    }
+
+    /// Construct a cancelled interaction result.
+    #[must_use]
+    pub const fn cancelled() -> Self {
+        Self {
+            responses: Vec::new(),
+            cancelled: true,
+        }
+    }
+}
+
+impl From<HookResult> for QuestionHookResult {
+    fn from(res: HookResult) -> Self {
+        if res.allow {
+            Self::default()
+        } else {
+            Self::cancelled()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -68,10 +157,7 @@ mod tests {
 
     #[test]
     fn ask_question_option_serde_roundtrip() {
-        let opt = AskQuestionOption {
-            label: "Yes".into(),
-            value: "y".into(),
-        };
+        let opt = AskQuestionOption::new("1", "Yes");
         let json = serde_json::to_string(&opt).unwrap();
         let parsed: AskQuestionOption = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, opt);
@@ -82,15 +168,10 @@ mod tests {
         let entry = AskQuestionEntry {
             question: "Continue?".into(),
             options: vec![
-                AskQuestionOption {
-                    label: "Yes".into(),
-                    value: "y".into(),
-                },
-                AskQuestionOption {
-                    label: "No".into(),
-                    value: "n".into(),
-                },
+                AskQuestionOption::new("1", "Yes"),
+                AskQuestionOption::new("2", "No"),
             ],
+            is_multi_select: true,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: AskQuestionEntry = serde_json::from_str(&json).unwrap();
@@ -100,18 +181,9 @@ mod tests {
     #[test]
     fn ask_question_interaction_spec_serde_roundtrip() {
         let spec = AskQuestionInteractionSpec {
-            entries: vec![
-                AskQuestionEntry {
-                    question: "Q1?".into(),
-                    options: vec![AskQuestionOption {
-                        label: "A".into(),
-                        value: "a".into(),
-                    }],
-                },
-                AskQuestionEntry {
-                    question: "Q2?".into(),
-                    options: vec![],
-                },
+            questions: vec![
+                AskQuestionEntry::new("Q1?", vec![AskQuestionOption::new("1", "A")]),
+                AskQuestionEntry::new("Q2?", vec![]),
             ],
         };
         let json = serde_json::to_string(&spec).unwrap();
@@ -120,38 +192,17 @@ mod tests {
     }
 
     #[test]
-    fn question_response_serde_roundtrip() {
-        let resp = QuestionResponse {
-            answers: vec!["yes".into(), "fast".into()],
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: QuestionResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn question_hook_result_with_response() {
-        let result = QuestionHookResult {
-            hook_result: HookResult::allow_with_message("confirmed"),
-            response: Some(QuestionResponse {
-                answers: vec!["answer1".into()],
-            }),
-        };
+    fn question_response_and_result_serde_roundtrip() {
+        let resp = QuestionResponse::selected(["1", "2"]);
+        let result = QuestionHookResult::answered([resp.clone(), QuestionResponse::skipped()]);
         let json = serde_json::to_string(&result).unwrap();
         let parsed: QuestionHookResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.hook_result, result.hook_result);
-        assert!(parsed.response.is_some());
-    }
+        assert_eq!(parsed, result);
+        assert!(!parsed.cancelled);
+        assert_eq!(parsed.responses[0], resp);
+        assert!(parsed.responses[1].skipped);
 
-    #[test]
-    fn question_hook_result_without_response() {
-        let result = QuestionHookResult {
-            hook_result: HookResult::deny("cancelled"),
-            response: None,
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let parsed: QuestionHookResult = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.hook_result.allow);
-        assert!(parsed.response.is_none());
+        let cancelled: QuestionHookResult = HookResult::deny("stop").into();
+        assert!(cancelled.cancelled);
     }
 }

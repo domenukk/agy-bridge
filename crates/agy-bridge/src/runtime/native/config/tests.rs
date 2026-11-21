@@ -199,11 +199,9 @@ fn test_v017_minimal_behavior_and_lightweight_config() {
             BuiltinTools::ViewFile,
             BuiltinTools::CreateFile,
             BuiltinTools::EditFile,
-            BuiltinTools::ListDir,
-            BuiltinTools::SearchDir,
         ]
     );
-    assert_eq!(BuiltinTools::default_tools().len(), 14);
+    assert_eq!(BuiltinTools::default_tools().len(), 11);
 
     let caps = CapabilitiesConfig::minimal();
     assert_eq!(caps.agent_behavior, AgentBehavior::Minimal);
@@ -220,7 +218,7 @@ fn test_v017_minimal_behavior_and_lightweight_config() {
     let side_tools = harness.harness_side_tools.expect("harness_side_tools");
     assert!(!side_tools.subagents.unwrap().enabled);
     assert!(!side_tools.find.unwrap().enabled);
-    assert!(side_tools.grep_search.unwrap().enabled);
+    assert!(!side_tools.grep_search.unwrap().enabled);
     assert!(side_tools.view_file.unwrap().enabled);
     assert!(side_tools.run_command.unwrap().enabled);
     assert!(!side_tools.generate_image.unwrap().enabled);
@@ -237,7 +235,8 @@ fn test_v017_minimal_behavior_and_lightweight_config() {
     assert!(default_tools.schedule.unwrap().enabled);
     assert!(default_tools.run_workflow.unwrap().enabled);
 
-    // When RunCommand and Schedule are disabled (e.g. read_only), manage_task & schedule are disabled
+    // In 0.1.24, read_only() includes Schedule (enabling schedule & manage_task),
+    // while custom_tools_only() disables both manage_task and schedule.
     let ro_cfg = AgentConfig {
         capabilities: Some(CapabilitiesConfig::read_only()),
         ..AgentConfig::default()
@@ -246,8 +245,19 @@ fn test_v017_minimal_behavior_and_lightweight_config() {
     let ro_tools = ro_harness
         .harness_side_tools
         .expect("ro harness_side_tools");
-    assert!(!ro_tools.manage_task.unwrap().enabled);
-    assert!(!ro_tools.schedule.unwrap().enabled);
+    assert!(ro_tools.manage_task.unwrap().enabled);
+    assert!(ro_tools.schedule.unwrap().enabled);
+
+    let cto_cfg = AgentConfig {
+        capabilities: Some(CapabilitiesConfig::custom_tools_only()),
+        ..AgentConfig::default()
+    };
+    let cto_harness = build_harness_config(&cto_cfg, None, None, &policies);
+    let cto_tools = cto_harness
+        .harness_side_tools
+        .expect("cto harness_side_tools");
+    assert!(!cto_tools.manage_task.unwrap().enabled);
+    assert!(!cto_tools.schedule.unwrap().enabled);
     assert!(!ro_tools.run_workflow.unwrap().enabled);
 }
 
@@ -300,6 +310,7 @@ fn test_v0122_inline_skills_subagent_skills_and_new_fields() {
         gemini: Some(GeminiConfig {
             api_key: Some("test-key".to_string()),
             base_url: None,
+            http_headers: std::collections::HashMap::new(),
             models: ModelConfig {
                 default: ModelEntry {
                     name: "gemini-2.5-pro".to_string(),
@@ -357,7 +368,8 @@ fn test_v0122_inline_skills_subagent_skills_and_new_fields() {
             let opts = ep.options.as_ref().expect("options");
             assert_eq!(opts.max_output_tokens, 32_768);
         }
-        other @ proto::localharness::model_config::Endpoint::Vertex(_) => {
+        other @ (proto::localharness::model_config::Endpoint::Vertex(_)
+        | proto::localharness::model_config::Endpoint::Gemma(_)) => {
             panic!("Unexpected endpoint: {other:?}")
         }
     }
@@ -455,6 +467,7 @@ fn test_v0123_content_proto_types() {
                             start_offset: None,
                             end_offset: None,
                             fps: 2.0,
+                            content_layers: Vec::new(),
                         },
                     )),
                 },
@@ -475,5 +488,57 @@ fn test_v0123_content_proto_types() {
         proto::genai::code_execution_call_content::code_execution_call_arguments::Language::Bash
             as i32,
         2
+    );
+}
+
+#[test]
+fn test_policy_config_workspace_containment_disabled_for_allow_all_without_workspace_only() {
+    use proto::localharness::policy_config::WorkspaceContainment;
+
+    let allow_all_set =
+        PolicySet::validated_from(vec![PolicyRule::AllowAll]).expect("valid AllowAll");
+    let allow_all_policy =
+        build_harness_config(&AgentConfig::default(), None, None, &allow_all_set)
+            .policy_config
+            .expect("policy_config");
+    assert_eq!(
+        allow_all_policy.workspace_containment,
+        WorkspaceContainment::Disabled as i32
+    );
+
+    let ws_plus_allow_set = PolicySet::validated_from(vec![
+        PolicyRule::workspace_only(["/tmp/ws"]),
+        PolicyRule::AllowAll,
+    ])
+    .expect("valid WorkspaceOnly + AllowAll");
+    let ws_plus_allow_policy =
+        build_harness_config(&AgentConfig::default(), None, None, &ws_plus_allow_set)
+            .policy_config
+            .expect("policy_config");
+    assert_eq!(
+        ws_plus_allow_policy.workspace_containment,
+        WorkspaceContainment::Enabled as i32
+    );
+
+    let standalone_ws_set =
+        PolicySet::validated_from(vec![PolicyRule::workspace_only(["/tmp/ws"])])
+            .expect("valid standalone WorkspaceOnly");
+    assert!(standalone_ws_set.evaluate("custom_tool").is_allowed());
+    let standalone_ws_policy =
+        build_harness_config(&AgentConfig::default(), None, None, &standalone_ws_set)
+            .policy_config
+            .expect("policy_config");
+    assert_eq!(
+        standalone_ws_policy.workspace_containment,
+        WorkspaceContainment::Enabled as i32
+    );
+
+    let deny_all_set = PolicySet::validated_from(vec![PolicyRule::DenyAll]).expect("valid DenyAll");
+    let deny_all_policy = build_harness_config(&AgentConfig::default(), None, None, &deny_all_set)
+        .policy_config
+        .expect("policy_config");
+    assert_eq!(
+        deny_all_policy.workspace_containment,
+        WorkspaceContainment::Unspecified as i32
     );
 }

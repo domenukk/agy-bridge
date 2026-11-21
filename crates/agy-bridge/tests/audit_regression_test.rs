@@ -109,14 +109,38 @@ fn test_policy_set_validated_from_rejects_invalid() {
 }
 
 #[test]
-fn test_policy_set_deny_all_shadows_later_rules() {
+fn test_policy_set_9_bucket_specificity_and_deny_precedence() {
     use agy_bridge::policies::{PolicyRule, PolicySet};
 
-    // DenyAll first should shadow everything after it (first-match semantics)
-    let set: PolicySet = vec![PolicyRule::DenyAll, PolicyRule::allow("view_file")].into();
+    // Within the wildcard bucket, DenyAll always beats AllowAll regardless of order.
+    let wildcard_set: PolicySet = vec![PolicyRule::AllowAll, PolicyRule::DenyAll].into();
     assert!(
-        set.evaluate("view_file").is_denied(),
-        "DenyAll should shadow the later Allow rule"
+        wildcard_set.evaluate("view_file").is_denied(),
+        "DenyAll must beat AllowAll within the wildcard bucket"
+    );
+
+    // Within the specific bucket, Deny(tool) always beats Allow(tool) regardless of order.
+    let specific_deny_set: PolicySet = vec![
+        PolicyRule::allow("view_file"),
+        PolicyRule::deny("view_file"),
+    ]
+    .into();
+    assert!(
+        specific_deny_set.evaluate("view_file").is_denied(),
+        "Specific Deny must beat Specific Allow regardless of order"
+    );
+
+    // Across buckets, Specific(Allow) has higher specificity than Wildcard(DenyAll),
+    // matching localharness and Python SDK 9-bucket precedence.
+    let specific_over_wildcard: PolicySet =
+        vec![PolicyRule::DenyAll, PolicyRule::allow("view_file")].into();
+    assert!(
+        specific_over_wildcard.evaluate("view_file").is_allowed(),
+        "Specific Allow must take precedence over Wildcard DenyAll"
+    );
+    assert!(
+        specific_over_wildcard.evaluate("run_command").is_denied(),
+        "Unlisted tools must still hit Wildcard DenyAll"
     );
 }
 

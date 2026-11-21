@@ -19,49 +19,54 @@ struct MockAddNumbersArgs {
 }
 
 impl Runtime for ToolAwareMockRuntime {
-    async fn create_agent(
+    fn create_agent(
         &self,
         agent_id: u64,
         _config: AgentConfig,
-    ) -> Result<(AgentId, Vec<crate::tools::AvailableTool>), Error> {
-        match self.last_create_id.lock() {
-            Ok(mut slot) => *slot = Some(agent_id),
-            Err(e) => tracing::error!("mock last_create_id mutex poisoned: {e}"),
-        }
-        if self.fail_create.load(Ordering::SeqCst) {
-            return Err(Error::BackendError {
-                message: "invalid config: missing system instructions".to_owned(),
-            });
-        }
-        let id = agent_id;
-        let add_numbers_def = crate::tools::ToolDefinition::from_schema::<MockAddNumbersArgs>(
-            "add_numbers",
-            "Adds two numbers together.",
-        )
-        .map_err(|e| Error::InvalidConfig {
-            message: format!("Failed to build MockAddNumbersArgs schema: {e}"),
-        })?;
-        let tools = vec![
-            crate::tools::AvailableTool {
-                name: "run_command".to_owned(),
-                description: "Execute a shell command.".to_owned(),
-                parameter_schema: serde_json::Value::Null,
-                source: crate::tools::ToolSource::Builtin,
-            },
-            crate::tools::AvailableTool {
-                name: "view_file".to_owned(),
-                description: "Read file contents.".to_owned(),
-                parameter_schema: serde_json::Value::Null,
-                source: crate::tools::ToolSource::Builtin,
-            },
-            crate::tools::AvailableTool {
-                name: add_numbers_def.name,
-                description: add_numbers_def.description,
-                parameter_schema: add_numbers_def.parameter_schema,
-                source: crate::tools::ToolSource::Custom,
-            },
-        ];
-        Ok((id, tools))
+    ) -> impl std::future::Future<
+        Output = Result<(AgentId, Vec<crate::tools::AvailableTool>), Error>,
+    > + Send {
+        let res = (|| {
+            match self.last_create_id.lock() {
+                Ok(mut slot) => *slot = Some(agent_id),
+                Err(e) => tracing::error!("mock last_create_id mutex poisoned: {e}"),
+            }
+            if self.fail_create.load(Ordering::SeqCst) {
+                return Err(Error::BackendError {
+                    message: "invalid config: missing system instructions".to_owned(),
+                });
+            }
+            let id = agent_id;
+            let add_numbers_def = crate::tools::ToolDefinition::from_schema::<MockAddNumbersArgs>(
+                "add_numbers",
+                "Adds two numbers together.",
+            )
+            .map_err(|e| Error::InvalidConfig {
+                message: format!("Failed to build MockAddNumbersArgs schema: {e}"),
+            })?;
+            let tools = vec![
+                crate::tools::AvailableTool {
+                    name: "run_command".to_owned(),
+                    description: "Execute a shell command.".to_owned(),
+                    parameter_schema: serde_json::Value::Null,
+                    source: crate::tools::ToolSource::Builtin,
+                },
+                crate::tools::AvailableTool {
+                    name: "view_file".to_owned(),
+                    description: "Read file contents.".to_owned(),
+                    parameter_schema: serde_json::Value::Null,
+                    source: crate::tools::ToolSource::Builtin,
+                },
+                crate::tools::AvailableTool {
+                    name: add_numbers_def.name,
+                    description: add_numbers_def.description,
+                    parameter_schema: add_numbers_def.parameter_schema,
+                    source: crate::tools::ToolSource::Custom,
+                },
+            ];
+            Ok((id, tools))
+        })();
+        std::future::ready(res)
     }
 
     /// # Panics
@@ -69,87 +74,113 @@ impl Runtime for ToolAwareMockRuntime {
     /// Panics if the internal `chat_count` mutex is poisoned. This is
     /// acceptable because `ToolAwareMockRuntime` is only compiled under
     /// `#[cfg(test)]`.
-    async fn chat(
+    fn chat(
         &self,
         agent_id: AgentId,
         _content: &Content,
-    ) -> Result<ChatResponseHandle, Error> {
-        if self.fail_quota.load(Ordering::SeqCst) {
-            self.fail_quota.store(false, Ordering::SeqCst);
-            return Err(Error::QuotaExceeded {
-                retry_after: Duration::from_millis(10),
-            });
-        }
+    ) -> impl std::future::Future<Output = Result<ChatResponseHandle, Error>> + Send {
+        let res = (|| {
+            if self.fail_quota.load(Ordering::SeqCst) {
+                self.fail_quota.store(false, Ordering::SeqCst);
+                return Err(Error::QuotaExceeded {
+                    retry_after: Duration::from_millis(10),
+                });
+            }
 
-        let call_num = {
-            let mut counts = self.chat_count.lock().unwrap();
-            let entry = counts.entry(agent_id).or_insert(0);
-            *entry += 1;
-            *entry
-        };
+            let call_num = {
+                let mut counts = self.chat_count.lock().unwrap();
+                let entry = counts.entry(agent_id).or_insert(0);
+                *entry += 1;
+                *entry
+            };
 
-        let (writer, handle) = streaming::channel();
-        if call_num == 1 {
-            tokio::spawn(async move {
-                let args = serde_json::to_value(MockAddNumbersArgs { x: 2, y: 3 })
-                    .expect("MockAddNumbersArgs serializes");
-                if let Err(e) = writer
-                    .tool_call_tx
-                    .send(crate::streaming::ToolCallEvent {
-                        name: "add_numbers".to_owned(),
-                        args,
-                        id: Some("call_1".to_owned()),
-                        canonical_path: None,
-                    })
-                    .await
-                {
-                    tracing::error!("Mock tool_call send failed: {e}");
-                }
-                if let Err(e) = writer.text_tx.send("Mock text response".to_owned()).await {
-                    tracing::error!("Mock text send failed: {e}");
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(e) = writer
-                    .text_tx
-                    .send("Tool result received, final answer: 5".to_owned())
-                    .await
-                {
-                    tracing::error!("Mock text send failed: {e}");
-                }
-            });
-        }
-        Ok(handle)
+            let (writer, handle) = streaming::channel();
+            if call_num == 1 {
+                tokio::spawn(async move {
+                    let args = serde_json::to_value(MockAddNumbersArgs { x: 2, y: 3 })
+                        .expect("MockAddNumbersArgs serializes");
+                    if let Err(e) = writer
+                        .tool_call_tx
+                        .send(crate::streaming::ToolCallEvent {
+                            name: "add_numbers".to_owned(),
+                            args,
+                            id: Some("call_1".to_owned()),
+                            canonical_path: None,
+                        })
+                        .await
+                    {
+                        tracing::error!("Mock tool_call send failed: {e}");
+                    }
+                    if let Err(e) = writer.text_tx.send("Mock text response".to_owned()).await {
+                        tracing::error!("Mock text send failed: {e}");
+                    }
+                });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(e) = writer
+                        .text_tx
+                        .send("Tool result received, final answer: 5".to_owned())
+                        .await
+                    {
+                        tracing::error!("Mock text send failed: {e}");
+                    }
+                });
+            }
+            Ok(handle)
+        })();
+        std::future::ready(res)
     }
 
-    async fn shutdown_agent(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn shutdown_agent(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn cancel(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn cancel(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn wait_for_idle(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn wait_for_idle(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn send(&self, _agent_id: AgentId, _content: &Content) -> Result<(), Error> {
-        Ok(())
+    fn send(
+        &self,
+        _agent_id: AgentId,
+        _content: &Content,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn signal_idle(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn signal_idle(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn wait_for_wakeup(&self, _agent_id: AgentId, _timeout: Duration) -> Result<bool, Error> {
+    fn wait_for_wakeup(
+        &self,
+        _agent_id: AgentId,
+        _timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
         // Mock always times out (returns false).
-        Ok(false)
+        std::future::ready(Ok(false))
     }
 
-    async fn history(&self, _agent_id: AgentId) -> Result<Vec<ConversationMessage>, Error> {
-        Ok(vec![
+    fn history(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Vec<ConversationMessage>, Error>> + Send {
+        std::future::ready(Ok(vec![
             ConversationMessage {
                 role: MessageRole::User,
                 content: "Hello".to_string(),
@@ -158,62 +189,89 @@ impl Runtime for ToolAwareMockRuntime {
                 role: MessageRole::Model,
                 content: "Hi there!".to_string(),
             },
-        ])
+        ]))
     }
 
-    async fn turn_count(&self, agent_id: AgentId) -> Result<u32, Error> {
-        let counts = self.chat_count.lock().unwrap();
-        Ok(*counts.get(&agent_id).unwrap_or(&0))
+    fn turn_count(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<u32, Error>> + Send {
+        let count = {
+            let counts = self.chat_count.lock().unwrap();
+            *counts.get(&agent_id).unwrap_or(&0)
+        };
+        std::future::ready(Ok(count))
     }
 
-    async fn total_usage(&self, _agent_id: AgentId) -> Result<UsageMetadata, Error> {
-        Ok(UsageMetadata {
+    fn total_usage(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<UsageMetadata, Error>> + Send {
+        std::future::ready(Ok(UsageMetadata {
             prompt_token_count: Some(500),
             cached_content_token_count: None,
             candidates_token_count: Some(200),
             thoughts_token_count: Some(100),
             total_token_count: Some(800),
             ..Default::default()
-        })
+        }))
     }
 
-    async fn last_turn_usage(&self, _agent_id: AgentId) -> Result<UsageMetadata, Error> {
-        Ok(UsageMetadata {
+    fn last_turn_usage(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<UsageMetadata, Error>> + Send {
+        std::future::ready(Ok(UsageMetadata {
             prompt_token_count: Some(100),
             cached_content_token_count: None,
             candidates_token_count: Some(50),
             thoughts_token_count: Some(20),
             total_token_count: Some(170),
             ..Default::default()
-        })
+        }))
     }
 
-    async fn clear_history(&self, agent_id: AgentId) -> Result<(), Error> {
-        {
-            let mut counts = self.chat_count.lock().unwrap();
-            counts.insert(agent_id, 0);
-        }
-        Ok(())
+    fn clear_history(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        self.chat_count.lock().unwrap().insert(agent_id, 0);
+        std::future::ready(Ok(()))
     }
 
-    async fn last_response(&self, _agent_id: AgentId) -> Result<Option<String>, Error> {
-        Ok(Some("Hi there!".to_string()))
+    fn last_response(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Option<String>, Error>> + Send {
+        std::future::ready(Ok(Some("Hi there!".to_string())))
     }
 
-    async fn compaction_indices(&self, _agent_id: AgentId) -> Result<Vec<u32>, Error> {
-        Ok(vec![3, 7])
+    fn compaction_indices(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, Error>> + Send {
+        std::future::ready(Ok(vec![3, 7]))
     }
 
-    async fn delete(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn delete(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn disconnect(&self, _agent_id: AgentId) -> Result<(), Error> {
-        Ok(())
+    fn disconnect(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn is_idle(&self, _agent_id: AgentId) -> Result<bool, Error> {
-        Ok(true)
+    fn is_idle(
+        &self,
+        _agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+        std::future::ready(Ok(true))
     }
 
     fn try_shutdown_agent(&self, _agent_id: AgentId) {

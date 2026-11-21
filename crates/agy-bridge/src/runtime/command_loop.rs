@@ -282,63 +282,14 @@ async fn cleanup_remaining_agents(registry: &AgentRegistry) {
 /// Call `__aexit__` on a single agent's context manager and clean up its
 /// global registry entries.
 async fn cleanup_single_agent(agent_id: AgentId, ctx_py: std::sync::Arc<Py<PyAny>>) {
-    let aexit_result = Python::attach(|py| {
-        let ctx_bound = ctx_py.bind(py);
-        let none = py.None();
-        let coro = ctx_bound.call_method1("__aexit__", (&none, &none, &none))?;
-        Ok::<_, PyErr>(coro.clone().unbind())
-    });
-
-    match aexit_result {
-        Ok(aexit_coro_py) => {
-            let aexit_fut = Python::attach(|py| {
-                let coro = aexit_coro_py.into_bound(py);
-                pyo3_async_runtimes::tokio::into_future(coro)
-            });
-            match aexit_fut {
-                Ok(fut) => match fut.await {
-                    Ok(_) => {
-                        tracing::debug!(agent_id = ?agent_id, "Agent __aexit__ completed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            agent_id = ?agent_id,
-                            error = %e,
-                            "Agent __aexit__ returned error during cleanup"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        agent_id = ?agent_id,
-                        error = %e,
-                        "Failed to convert __aexit__ coro to future"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                agent_id = ?agent_id,
-                error = %e,
-                "Failed to call __aexit__ during cleanup"
-            );
-        }
+    if let Err(e) = agent::run_agent_aexit_and_purge(&ctx_py, agent_id).await {
+        tracing::warn!(
+            agent_id = ?agent_id,
+            error = %e,
+            "Agent __aexit__ returned error during leftover cleanup"
+        );
     }
-
-    // Also clean up the global bridge state for this agent.
-    match super::bridge_state().write() {
-        Ok(mut map) => {
-            map.remove(&agent_id.0);
-        }
-        Err(e) => {
-            tracing::warn!(
-                agent_id = agent_id.0,
-                error = %e,
-                "BRIDGE_STATE RwLock poisoned during cleanup"
-            );
-        }
-    }
+    super::remove_agent_bridge_state(agent_id.0);
 }
 
 /// Outcome of dispatching a single command.

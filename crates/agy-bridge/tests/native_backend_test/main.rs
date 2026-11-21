@@ -93,14 +93,16 @@ impl agy_bridge::tools::RustTool for CalcTool {
     const NAME: &'static str = "calculate_sum";
     const DESCRIPTION: &'static str = "Sums two numbers";
 
-    async fn call(
+    fn call(
         &self,
         params: Self::Params,
         _ctx: &agy_bridge::tools::ToolContext,
-    ) -> Result<agy_bridge::tools::ToolOutput, agy_bridge::tools::ToolError> {
-        Ok(agy_bridge::tools::ToolOutput::new(
+    ) -> impl std::future::Future<
+        Output = Result<agy_bridge::tools::ToolOutput, agy_bridge::tools::ToolError>,
+    > + Send {
+        std::future::ready(Ok(agy_bridge::tools::ToolOutput::new(
             (params.a + params.b).to_string(),
-        ))
+        )))
     }
 }
 
@@ -185,7 +187,7 @@ async fn run_mock_chat_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),
@@ -316,7 +318,7 @@ async fn run_mock_tool_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),
@@ -504,7 +506,7 @@ async fn run_mock_hooks_and_policy_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),

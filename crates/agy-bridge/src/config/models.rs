@@ -24,6 +24,7 @@ pub enum ThinkingLevel {
     /// High reasoning depth.
     High,
     /// Maximum reasoning depth; highest latency and token usage.
+    #[serde(rename = "xhigh", alias = "extra_high")]
     ExtraHigh,
 }
 
@@ -36,7 +37,7 @@ impl ThinkingLevel {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-            Self::ExtraHigh => "extra_high",
+            Self::ExtraHigh => "xhigh",
         }
     }
 }
@@ -141,16 +142,34 @@ pub struct GeminiConfig {
     /// proxy, staging environment, or alternative API-compatible gateway).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Custom HTTP headers sent with Gemini API requests (`0.1.24`+).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub http_headers: std::collections::HashMap<String, String>,
     /// Per-modality model selection and configuration.
     #[serde(default)]
     pub models: ModelConfig,
 }
 
+impl GeminiConfig {
+    /// Validate `base_url` and `http_headers` against RFC 9110 and URL control-character rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error message when `base_url` or any entry in `http_headers` is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref url) = self.base_url {
+            super::validation::validate_http_url(url, "GeminiConfig.base_url", true)?;
+        }
+        super::validation::validate_http_headers(&self.http_headers, "GeminiConfig.http_headers")
+    }
+}
+
 impl std::fmt::Debug for GeminiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GeminiConfig")
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("api_key", &self.api_key.as_ref().map(|_k| "[REDACTED]"))
             .field("base_url", &self.base_url)
+            .field("http_headers_len", &self.http_headers.len())
             .field("models", &self.models)
             .finish()
     }
@@ -235,6 +254,7 @@ mod tests {
         let config = GeminiConfig {
             api_key: Some("global-key".to_string()),
             base_url: None,
+            http_headers: std::collections::HashMap::new(),
             models: ModelConfig {
                 default: ModelEntry {
                     name: "gemini-3.5-flash".to_string(),
@@ -268,7 +288,7 @@ mod tests {
         assert_eq!(ThinkingLevel::Low.as_str(), "low");
         assert_eq!(ThinkingLevel::Medium.as_str(), "medium");
         assert_eq!(ThinkingLevel::High.as_str(), "high");
-        assert_eq!(ThinkingLevel::ExtraHigh.as_str(), "extra_high");
+        assert_eq!(ThinkingLevel::ExtraHigh.as_str(), "xhigh");
     }
 
     #[test]
@@ -278,12 +298,14 @@ mod tests {
             (ThinkingLevel::Low, "\"low\""),
             (ThinkingLevel::Medium, "\"medium\""),
             (ThinkingLevel::High, "\"high\""),
-            (ThinkingLevel::ExtraHigh, "\"extra_high\""),
+            (ThinkingLevel::ExtraHigh, "\"xhigh\""),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected);
             let parsed: ThinkingLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant);
         }
+        let legacy: ThinkingLevel = serde_json::from_str("\"extra_high\"").unwrap();
+        assert_eq!(legacy, ThinkingLevel::ExtraHigh);
     }
 }

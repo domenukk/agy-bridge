@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    content::{Audio, Document, Image, Video},
+    content::{Audio, Content, ContentPrimitive, Document, Image, Video},
     hooks::{HookResult, Hooks},
 };
 
@@ -78,7 +78,10 @@ fn test_to_domain_step_states_and_sources() {
             output: "hi\n".to_string(),
         }),
         skill_lookup: Some(proto::localharness::ActionSkillLookup {
-            skill_name: "triage".to_string(),
+            operation: proto::localharness::action_skill_lookup::Operation::LookupSkills as i32,
+            requested_skill_names: vec!["triage".to_string()],
+            resolved_skill_names: vec!["triage".to_string()],
+            error_message: String::new(),
         }),
         ..Default::default()
     };
@@ -201,7 +204,7 @@ fn test_dispatch_pre_turn_and_pre_tool_hooks() {
             },
         )),
     };
-    let tool_outcome = dispatch_pre_tool_hook(&hooks, &tool_req);
+    let tool_outcome = dispatch_pre_tool_hook(1, &hooks, &tool_req);
     match tool_outcome {
         proto::localharness::call_hook_response::Result::PreTool(res) => {
             assert_eq!(res.decision, 2); // DENY
@@ -223,6 +226,7 @@ async fn test_handle_trajectory_state_update_flow() {
     let finished_by_tool = Arc::new(AtomicBool::new(false));
     let history = Arc::new(Mutex::new(Vec::new()));
     let last_response_text = Arc::new(Mutex::new(Some("Final reply".to_string())));
+    let root_trajectory_id = Arc::new(Mutex::new(None));
 
     let ctx = TrajectoryStateContext {
         turn_count: &turn_count,
@@ -235,6 +239,7 @@ async fn test_handle_trajectory_state_update_flow() {
         finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
+        root_trajectory_id: &root_trajectory_id,
     };
 
     let state_update = proto::localharness::TrajectoryStateUpdate {
@@ -282,9 +287,17 @@ async fn test_compaction_step_and_hook_dispatch() {
     let produced_output = Arc::new(AtomicBool::new(false));
     let turn_activity = Arc::new(AtomicBool::new(false));
     let compaction_indices = Arc::new(Mutex::new(Vec::new()));
+    let root_trajectory_id = Arc::new(Mutex::new(None));
 
+    let active_compaction = proto::localharness::StepUpdate {
+        step_index: 42,
+        state: 1,
+        compaction: Some(proto::localharness::ActionCompaction {}),
+        ..Default::default()
+    };
     let compaction_step = proto::localharness::StepUpdate {
         step_index: 42,
+        state: 2,
         compaction: Some(proto::localharness::ActionCompaction {}),
         ..Default::default()
     };
@@ -295,7 +308,15 @@ async fn test_compaction_step_and_hook_dispatch() {
         produced_output: &produced_output,
         turn_activity: &turn_activity,
         compaction_indices: &compaction_indices,
+        root_trajectory_id: &root_trajectory_id,
+        event_tx: None,
+        emitted_builtin_tool_steps: None,
+        answered_question_steps: None,
     };
+    // STATE_ACTIVE (1) compaction must NOT record premature index
+    handle_step_update(1, active_compaction, &step_ctx).await;
+    assert!(compaction_indices.lock().unwrap().is_empty());
+
     handle_step_update(1, compaction_step.clone(), &step_ctx).await;
     // Duplicate step update should not duplicate the index
     handle_step_update(1, compaction_step, &step_ctx).await;
@@ -321,6 +342,7 @@ async fn test_empty_completion_without_activity_yields_error() {
     let finished_by_tool = Arc::new(AtomicBool::new(false));
     let history = Arc::new(Mutex::new(Vec::new()));
     let last_response_text = Arc::new(Mutex::new(None));
+    let root_trajectory_id = Arc::new(Mutex::new(None));
 
     let ctx = TrajectoryStateContext {
         turn_count: &turn_count,
@@ -333,6 +355,7 @@ async fn test_empty_completion_without_activity_yields_error() {
         finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
+        root_trajectory_id: &root_trajectory_id,
     };
 
     let state_update = proto::localharness::TrajectoryStateUpdate {
@@ -368,6 +391,7 @@ async fn test_empty_completion_with_activity_is_ok() {
     let finished_by_tool = Arc::new(AtomicBool::new(false));
     let history = Arc::new(Mutex::new(Vec::new()));
     let last_response_text = Arc::new(Mutex::new(None));
+    let root_trajectory_id = Arc::new(Mutex::new(None));
 
     let ctx = TrajectoryStateContext {
         turn_count: &turn_count,
@@ -380,6 +404,7 @@ async fn test_empty_completion_with_activity_is_ok() {
         finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
+        root_trajectory_id: &root_trajectory_id,
     };
 
     let state_update = proto::localharness::TrajectoryStateUpdate {
@@ -412,6 +437,9 @@ async fn test_finish_on_tools_halts_without_fabricating_assistant_text() {
     let (event_tx, mut event_rx) = mpsc::channel(16);
     let turn_activity = Arc::new(AtomicBool::new(false));
     let finished_by_tool = Arc::new(AtomicBool::new(false));
+    let root_trajectory_id = Arc::new(Mutex::new(None));
+    let turn_epoch = Arc::new(AtomicU64::new(1));
+    let is_idle = Arc::new(AtomicBool::new(false));
 
     let tool_ctx = ToolCallDispatchContext {
         active_writer: Arc::clone(&active_writer),
@@ -419,10 +447,13 @@ async fn test_finish_on_tools_halts_without_fabricating_assistant_text() {
         turn_activity: Arc::clone(&turn_activity),
         finish_on_tools: Arc::new(HashSet::from(["report_submit".to_string()])),
         finished_by_tool: Arc::clone(&finished_by_tool),
+        root_trajectory_id: Arc::clone(&root_trajectory_id),
+        turn_epoch: Arc::clone(&turn_epoch),
+        is_idle: Arc::clone(&is_idle),
     };
 
     emit_tool_result_event("report_submit", "call-1", PAYLOAD, "", &active_writer).await;
-    apply_finish_on_tool_completion(&tool_ctx).await;
+    apply_finish_on_tool_completion(&tool_ctx, 1).await;
     assert!(finished_by_tool.load(Ordering::SeqCst));
 
     let halt_ev = event_rx.recv().await.expect("expected HaltRequest event");
@@ -433,7 +464,6 @@ async fn test_finish_on_tools_halts_without_fabricating_assistant_text() {
 
     // The harness reports the client halt as an error; it must not fail the turn.
     let turn_count = Arc::new(AtomicU32::new(0));
-    let is_idle = Arc::new(AtomicBool::new(false));
     let idle_notify = Arc::new(Notify::new());
     let last_error = Arc::new(Mutex::new(None));
     let produced_output = Arc::new(AtomicBool::new(false));
@@ -450,6 +480,7 @@ async fn test_finish_on_tools_halts_without_fabricating_assistant_text() {
         finished_by_tool: &finished_by_tool,
         history: &history,
         last_response_text: &last_response_text,
+        root_trajectory_id: &root_trajectory_id,
     };
     let state_update = proto::localharness::TrajectoryStateUpdate {
         state: 3,

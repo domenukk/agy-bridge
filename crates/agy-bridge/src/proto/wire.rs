@@ -47,7 +47,7 @@ fn encode_varint(mut value: u64, buf: &mut Vec<u8>) {
 }
 
 fn encode_tag(field_number: u32, wire_type: u32, buf: &mut Vec<u8>) {
-    encode_varint(u64::from((field_number << 3) | wire_type), buf);
+    encode_varint(u64::from(field_number) << 3 | u64::from(wire_type), buf);
 }
 
 fn encode_string_field(field_number: u32, value: &str, buf: &mut Vec<u8>) {
@@ -78,6 +78,9 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64, WireError> {
         }
         result |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
+            if i > 0 && byte == 0 {
+                return Err(WireError::new("overlong varint encoding"));
+            }
             return Ok(result);
         }
         shift += 7;
@@ -89,6 +92,9 @@ fn decode_tag(bytes: &[u8], pos: &mut usize) -> Result<(u32, u32), WireError> {
     let tag = decode_varint(bytes, pos)?;
     let field_number = u32::try_from(tag >> 3)
         .map_err(|e| WireError::new(format!("field number overflow: {e}")))?;
+    if field_number == 0 {
+        return Err(WireError::new("invalid protobuf field number 0"));
+    }
     let wire_type = u32::from((tag & 0x07).to_le_bytes()[0]);
     Ok((field_number, wire_type))
 }
@@ -217,10 +223,6 @@ impl InputConfig {
             encode_string_field(2, v, &mut entry);
             encode_bytes_field(5, &entry, buf);
         }
-        if self.use_interactions_api {
-            encode_tag(6, WIRE_TYPE_VARINT, buf);
-            encode_varint(1, buf);
-        }
         Ok(())
     }
 
@@ -254,9 +256,6 @@ impl InputConfig {
                     let slice = decode_len_slice(bytes, &mut pos)?;
                     let (k, v) = decode_map_entry(slice)?;
                     config.env.insert(k, v);
-                }
-                (6, WIRE_TYPE_VARINT) => {
-                    config.use_interactions_api = decode_varint(bytes, &mut pos)? != 0;
                 }
                 _ => skip_field(wire_type, bytes, &mut pos)?,
             }

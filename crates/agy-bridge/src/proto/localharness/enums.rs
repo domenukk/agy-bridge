@@ -77,3 +77,15 @@ define_proto_enum! {
         Document = 5 => "DOCUMENT",
     }
 }
+
+define_proto_enum! {
+    pub enum ThinkingEffort {
+        #[default]
+        Unspecified = 0 => "THINKING_EFFORT_UNSPECIFIED",
+        Minimal = 1 => "THINKING_EFFORT_MINIMAL",
+        Low = 2 => "THINKING_EFFORT_LOW",
+        Medium = 3 => "THINKING_EFFORT_MEDIUM",
+        High = 4 => "THINKING_EFFORT_HIGH",
+        Max = 5 => "THINKING_EFFORT_MAX",
+    }
+}

@@ -1,7 +1,16 @@
 //! Generative AI content, tool call, and citation definitions (`genai`).
 
+mod agent_tools;
+mod elicitation;
 mod media;
+mod steps;
+mod steps_tools;
+
+pub use agent_tools::*;
+pub use elicitation::*;
 pub use media::*;
+pub use steps::*;
+pub use steps_tools::*;
 
 /// Skill definitions (`genai.skills`).
 pub mod skills {
@@ -77,6 +86,38 @@ pub struct Struct {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub fields: Vec<Field>,
 }
+
+impl Struct {
+    /// Converts a `serde_json::Map` into a `genai::Struct` protobuf message.
+    ///
+    /// Returns `None` if any nested number is non-finite (`NaN`/`Infinity`).
+    #[must_use]
+    pub fn from_json_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        let mut fields = Vec::with_capacity(map.len());
+        for (name, val) in map {
+            fields.push(Field {
+                name: name.clone(),
+                value: Some(Value::from_json_value(val)?),
+            });
+        }
+        Some(Self { fields })
+    }
+
+    /// Converts this `genai::Struct` protobuf message into a `serde_json::Value::Object`.
+    #[must_use]
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(self.fields.len());
+        for field in &self.fields {
+            let val = match field.value.as_ref() {
+                Some(v) => v.to_json_value(),
+                None => serde_json::Value::Null,
+            };
+            map.insert(field.name.clone(), val);
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Field {
@@ -90,6 +131,69 @@ pub struct Field {
 pub struct Value {
     #[serde(flatten, skip_serializing_if = "Option::is_none", default)]
     pub kind: Option<value::Kind>,
+}
+
+impl Value {
+    /// Converts a `serde_json::Value` into a `genai::Value` protobuf message.
+    ///
+    /// Returns `None` if a number cannot be represented as a finite `f64`.
+    #[must_use]
+    pub fn from_json_value(val: &serde_json::Value) -> Option<Self> {
+        let kind = match val {
+            serde_json::Value::Null => value::Kind::Null(0),
+            serde_json::Value::Bool(b) => value::Kind::Bool(*b),
+            serde_json::Value::Number(n) => {
+                let f = n.as_f64()?;
+                if !f.is_finite() {
+                    return None;
+                }
+                value::Kind::Number(f)
+            }
+            serde_json::Value::String(s) => value::Kind::String(s.clone()),
+            serde_json::Value::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(Self::from_json_value(item)?);
+                }
+                value::Kind::List(ListValue { values })
+            }
+            serde_json::Value::Object(map) => value::Kind::Struct(Struct::from_json_object(map)?),
+        };
+        Some(Self { kind: Some(kind) })
+    }
+
+    /// Converts this `genai::Value` protobuf message into a `serde_json::Value`.
+    #[must_use]
+    pub fn to_json_value(&self) -> serde_json::Value {
+        match self.kind.as_ref() {
+            None | Some(value::Kind::Null(_)) => serde_json::Value::Null,
+            Some(value::Kind::Bool(b)) => serde_json::Value::Bool(*b),
+            Some(value::Kind::Number(n)) => {
+                const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0;
+                if n.is_finite()
+                    && n.fract() == 0.0
+                    && (-MAX_EXACT_F64_INT..=MAX_EXACT_F64_INT).contains(n)
+                    && let Ok(exact_int) = format!("{n:.0}").parse::<i64>()
+                {
+                    return serde_json::Value::Number(serde_json::Number::from(exact_int));
+                }
+                serde_json::Number::from_f64(*n)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+            }
+            Some(value::Kind::String(s)) => serde_json::Value::String(s.clone()),
+            Some(value::Kind::Struct(st)) => st.to_json_value(),
+            Some(value::Kind::List(lv)) => {
+                serde_json::Value::Array(lv.values.iter().map(Self::to_json_value).collect())
+            }
+            Some(value::Kind::Content(c)) => match serde_json::to_value(c) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed converting genai::Content Value to JSON");
+                    serde_json::Value::Null
+                }
+            },
+        }
+    }
 }
 /// Nested message and enum types in `Value`.
 pub mod value {

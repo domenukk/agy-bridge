@@ -45,7 +45,8 @@ async fn run_mock_budget_and_subagents_session(listener: TcpListener) {
             Box::new(proto::localharness::StepUpdate {
                 text_delta: "Budget-constrained answer".to_string(),
                 text: "Budget-constrained answer".to_string(),
-                parent_trajectory_id: "native-cascade-budget".to_string(),
+                cascade_id: "native-cascade-budget".to_string(),
+                trajectory_id: "native-cascade-budget".to_string(),
                 ..Default::default()
             }),
         )),
@@ -85,7 +86,7 @@ async fn run_mock_budget_and_subagents_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     stop_reason: 1, // MAX_MODEL_CALLS_EXCEEDED
                     ..Default::default()
                 },
@@ -161,7 +162,9 @@ async fn handle_mock_stop_hook_exchange(
                         response_text: "Checking final work".to_string(),
                         trajectory_id: "traj-stop-1".to_string(),
                         continuation_count: 0,
-                        stop_reason: "MAX_MODEL_CALLS_EXCEEDED".to_string(),
+                        stop_reason:
+                            proto::localharness::trajectory_state_update::StopReason::MaxModelCallsExceeded
+                                as i32,
                         error_message: String::new(),
                     },
                 )),
@@ -263,7 +266,7 @@ async fn run_mock_v016_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),
@@ -388,7 +391,7 @@ async fn run_mock_v017_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),
@@ -507,7 +510,11 @@ async fn run_mock_v0_1_22_session(listener: TcpListener) {
                     output: "Triage phase complete".to_string(),
                 }),
                 skill_lookup: Some(proto::localharness::ActionSkillLookup {
-                    skill_name: "inline_sec_skill".to_string(),
+                    operation: proto::localharness::action_skill_lookup::Operation::LookupSkills
+                        as i32,
+                    requested_skill_names: vec!["inline_sec_skill".to_string()],
+                    resolved_skill_names: vec!["inline_sec_skill".to_string()],
+                    error_message: String::new(),
                 }),
                 text_delta: "v0.1.22 workflow done".to_string(),
                 text: "v0.1.22 workflow done".to_string(),
@@ -526,7 +533,7 @@ async fn run_mock_v0_1_22_session(listener: TcpListener) {
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),

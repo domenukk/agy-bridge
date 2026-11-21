@@ -10,14 +10,14 @@ use crate::{
     types::ToolCallInfo,
 };
 
-/// SDK tool names reported for harness-side builtin step actions.
+/// SDK tool names reported for harness-side builtin step actions (`0.1.24`).
 mod tool_names {
     pub(super) const VIEW_FILE: &str = "view_file";
-    pub(super) const WRITE_TO_FILE: &str = "write_to_file";
+    pub(super) const CREATE_FILE: &str = "create_file";
     pub(super) const EDIT_FILE: &str = "edit_file";
-    pub(super) const LIST_DIR: &str = "list_dir";
-    pub(super) const FIND_BY_NAME: &str = "find_by_name";
-    pub(super) const GREP_SEARCH: &str = "grep_search";
+    pub(super) const LIST_DIRECTORY: &str = "list_directory";
+    pub(super) const FIND_FILE: &str = "find_file";
+    pub(super) const SEARCH_DIRECTORY: &str = "search_directory";
     pub(super) const RUN_COMMAND: &str = "run_command";
     pub(super) const INVOKE_SUBAGENT: &str = "invoke_subagent";
     pub(super) const GENERATE_IMAGE: &str = "generate_image";
@@ -80,10 +80,14 @@ struct ReadUrlArgs<'a> {
     url: &'a str,
 }
 
-/// Arguments reported for a `skill_lookup` step.
+/// Arguments reported for a `skill_lookup` step (`0.1.24`+).
 #[derive(Serialize)]
 struct SkillLookupArgs<'a> {
-    skill_name: &'a str,
+    operation: &'a str,
+    requested_skill_names: &'a [String],
+    resolved_skill_names: &'a [String],
+    #[serde(skip_serializing_if = "str::is_empty")]
+    error_message: &'a str,
 }
 
 /// Arguments reported for a `run_workflow` step.
@@ -148,6 +152,19 @@ fn typed_args<T: Serialize>(tool_name: &str, args: &T) -> serde_json::Value {
     }
 }
 
+const WIRE_PATH_ARGUMENT_KEYS: [&str; 10] = [
+    "path",
+    "file_path",
+    "directory_path",
+    "TargetFile",
+    "AbsolutePath",
+    "DirectoryPath",
+    "SearchPath",
+    "output_path",
+    "script_path",
+    "ScriptPath",
+];
+
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -157,7 +174,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn percent_decode_uri_path(raw: &str) -> String {
+fn percent_decode_uri_path_strict(raw: &str) -> Result<String, String> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0;
@@ -166,14 +183,23 @@ fn percent_decode_uri_path(raw: &str) -> String {
             && idx + 2 < bytes.len()
             && let (Some(hi), Some(lo)) = (hex_nibble(bytes[idx + 1]), hex_nibble(bytes[idx + 2]))
         {
-            out.push((hi << 4) | lo);
+            let decoded = (hi << 4) | lo;
+            if decoded == 0 {
+                return Err("percent-encoded NUL byte (%00) is forbidden in wire path".to_owned());
+            }
+            out.push(decoded);
             idx += 3;
             continue;
+        }
+        if bytes[idx] == 0 {
+            return Err("raw NUL byte is forbidden in wire path".to_owned());
         }
         out.push(bytes[idx]);
         idx += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    std::str::from_utf8(&out)
+        .map(str::to_owned)
+        .map_err(|e| format!("invalid UTF-8 after percent-decoding wire path: {e}"))
 }
 
 fn strip_ascii_case_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -183,154 +209,232 @@ fn strip_ascii_case_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
         .flatten()
 }
 
-/// Translates wire-format `file://` URIs (`file:///...`) into clean absolute
-/// filesystem paths, matching `google.antigravity.connections.connection.normalize_wire_path`.
-#[must_use]
-pub(crate) fn normalize_wire_path(path: &str) -> String {
+fn contains_percent_nul(s: &str) -> bool {
+    s.as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1] == b'0' && w[2] == b'0')
+}
+
+fn has_non_drive_uri_scheme(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else {
+        return false;
+    };
+    if !rest.starts_with("//") {
+        return false;
+    }
+    scheme.len() >= 2
+        && scheme
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn normalize_filesystem_lexical(raw_path: &str) -> String {
+    if raw_path.is_empty() {
+        return String::new();
+    }
+    let normalized = crate::policies::normalize_path(std::path::Path::new(raw_path));
+    normalized.to_string_lossy().into_owned()
+}
+
+/// Strictly validates and normalizes wire-format `file://` URIs and filesystem paths:
+/// - Rejects embedded `\0` or `%00` bytes;
+/// - Rejects `?query` and `#fragment` components on `file://` URIs;
+/// - Rejects non-`localhost` remote authorities on `file://host/...` URIs;
+/// - Percent-decodes UTF-8 strictly and lexically collapses `.` and `..` segments
+///   so `file:///ws/%2e%2e/etc/passwd` resolves to `/etc/passwd`.
+pub(crate) fn try_normalize_wire_path(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    if path.contains('\0') || contains_percent_nul(path) {
+        return Err(format!("NUL byte in wire path is forbidden: {path:?}"));
+    }
     if let Some(after_scheme) = strip_ascii_case_prefix(path, "file://") {
-        let raw_url_path = if let Some(rest) = after_scheme.strip_prefix("localhost/") {
+        if after_scheme.contains('?') || after_scheme.contains('#') {
+            return Err(format!(
+                "query or fragment in file:// URI is forbidden: {path:?}"
+            ));
+        }
+        let raw_url_path = if let Some(rest) = strip_ascii_case_prefix(after_scheme, "localhost/") {
             format!("/{rest}")
+        } else if after_scheme.eq_ignore_ascii_case("localhost") {
+            "/".to_owned()
         } else if after_scheme.starts_with('/') {
-            after_scheme.to_owned()
-        } else if let Some((_host, rest)) = after_scheme.split_once('/') {
-            format!("/{rest}")
+            let trimmed = after_scheme.trim_start_matches('/');
+            format!("/{trimmed}")
         } else {
-            return path.to_owned();
+            return Err(format!(
+                "non-localhost authority in file:// URI is forbidden: {path:?}"
+            ));
         };
-        let decoded = percent_decode_uri_path(&raw_url_path);
+        let decoded = percent_decode_uri_path_strict(&raw_url_path)?;
         #[cfg(windows)]
         if let [b'/', drive, b':', ..] = decoded.as_bytes()
             && drive.is_ascii_alphabetic()
         {
-            return decoded[1..].replace('/', "\\");
+            let win_path = decoded[1..].replace('/', "\\");
+            return Ok(normalize_filesystem_lexical(&win_path));
         }
-        return decoded;
+        return Ok(normalize_filesystem_lexical(&decoded));
     }
-    path.to_owned()
+    if has_non_drive_uri_scheme(path) {
+        return Ok(path.to_owned());
+    }
+    Ok(normalize_filesystem_lexical(path))
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-enum WirePathField {
-    Text(String),
-    NonString(serde_json::Value),
-}
-
-impl WirePathField {
-    fn normalize_in_place(&mut self) -> Option<String> {
-        match self {
-            Self::Text(s) if !s.is_empty() => {
-                let normalized = normalize_wire_path(s);
-                s.clone_from(&normalized);
-                Some(normalized)
-            }
-            Self::Text(_) | Self::NonString(_) => None,
+/// Translates wire-format `file://` URIs (`file:///...`) into clean absolute
+/// filesystem paths with `.` and `..` collapsed, matching SDK `0.1.24`
+/// `google.antigravity.connections.connection.normalize_wire_path`.
+#[must_use]
+pub(crate) fn normalize_wire_path(path: &str) -> String {
+    match try_normalize_wire_path(path) {
+        Ok(normalized) => normalized,
+        Err(err) => {
+            tracing::warn!(error = %err, raw_path = path, "Rejected unsafe wire path; keeping raw input for display");
+            path.to_owned()
         }
     }
 }
 
-/// Distinguishes an omitted JSON object key (`Absent`) from an explicit JSON value
-/// (`Present`, including explicit `null`), preventing `skip_serializing_if` from
-/// dropping `"file_path": null` entries on re-serialization.
-#[derive(Default)]
-enum WireFieldSlot {
-    #[default]
-    Absent,
-    Present(WirePathField),
-}
+struct StrictJsonValue(serde_json::Value);
 
-impl WireFieldSlot {
-    const fn is_absent(&self) -> bool {
-        matches!(self, Self::Absent)
-    }
-
-    fn normalize_in_place(&mut self) -> Option<String> {
-        match self {
-            Self::Absent => None,
-            Self::Present(field) => field.normalize_in_place(),
-        }
-    }
-}
-
-impl serde::Serialize for WireFieldSlot {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Absent => serializer.serialize_none(),
-            Self::Present(val) => val.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for WireFieldSlot {
+impl<'de> serde::Deserialize<'de> for StrictJsonValue {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        WirePathField::deserialize(deserializer).map(Self::Present)
+        struct StrictVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+            type Value = StrictJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Bool(v)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Number(v.into())))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Number(v.into())))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                let num = serde_json::Number::from_f64(v)
+                    .ok_or_else(|| E::custom("non-finite float in JSON"))?;
+                Ok(StrictJsonValue(serde_json::Value::Number(num)))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::String(v.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::String(v)))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(StrictJsonValue(elem)) = seq.next_element::<StrictJsonValue>()? {
+                    items.push(elem);
+                }
+                Ok(StrictJsonValue(serde_json::Value::Array(items)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut map = serde_json::Map::new();
+                while let Some(key) = access.next_key::<String>()? {
+                    if map.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON object key {key:?} in tool arguments"
+                        )));
+                    }
+                    let StrictJsonValue(val) = access.next_value::<StrictJsonValue>()?;
+                    map.insert(key, val);
+                }
+                Ok(StrictJsonValue(serde_json::Value::Object(map)))
+            }
+        }
+
+        deserializer.deserialize_any(StrictVisitor)
     }
 }
 
-/// Strongly-typed tool call JSON object matching
-/// `google.antigravity.local_connection_config.WIRE_PATH_ARGUMENT_KEYS` (`0.1.23`):
-/// `("path", "file_path", "directory_path", "TargetFile", "output_path", "script_path", "ScriptPath")`.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct NormalizedToolArgs {
-    #[serde(default, skip_serializing_if = "WireFieldSlot::is_absent")]
-    path: WireFieldSlot,
-    #[serde(default, skip_serializing_if = "WireFieldSlot::is_absent")]
-    file_path: WireFieldSlot,
-    #[serde(default, skip_serializing_if = "WireFieldSlot::is_absent")]
-    directory_path: WireFieldSlot,
-    #[serde(
-        default,
-        rename = "TargetFile",
-        skip_serializing_if = "WireFieldSlot::is_absent"
-    )]
-    target_file: WireFieldSlot,
-    #[serde(default, skip_serializing_if = "WireFieldSlot::is_absent")]
-    output_path: WireFieldSlot,
-    #[serde(default, skip_serializing_if = "WireFieldSlot::is_absent")]
-    script_path: WireFieldSlot,
-    #[serde(
-        default,
-        rename = "ScriptPath",
-        skip_serializing_if = "WireFieldSlot::is_absent"
-    )]
-    script_path_pascal: WireFieldSlot,
-    #[serde(flatten)]
-    extra: std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-impl NormalizedToolArgs {
-    /// Normalize all non-empty wire-path fields in-place and return the highest-priority
-    /// canonical path, matching `local_connection_config.normalize_path_arguments`.
-    fn normalize_in_place(&mut self) -> Option<String> {
-        let mut canonical_path: Option<String> = None;
-        for field in [
-            &mut self.path,
-            &mut self.file_path,
-            &mut self.directory_path,
-            &mut self.target_file,
-            &mut self.output_path,
-            &mut self.script_path,
-            &mut self.script_path_pascal,
-        ] {
-            if let Some(normalized) = field.normalize_in_place()
-                && canonical_path.is_none()
-            {
+/// Normalize all `WIRE_PATH_ARGUMENT_KEYS` (`"path"`, `"file_path"`, `"directory_path"`,
+/// `"TargetFile"`, `"output_path"`, `"script_path"`, `"ScriptPath"`) in-place inside `value`,
+/// returning the highest-priority normalized `canonical_path`.
+pub(crate) fn normalize_json_object_paths_in_place(
+    value: &mut serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(map) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let mut canonical_path: Option<String> = None;
+    for key in WIRE_PATH_ARGUMENT_KEYS {
+        if let Some(serde_json::Value::String(raw)) = map.get_mut(key)
+            && !raw.is_empty()
+        {
+            let normalized = try_normalize_wire_path(raw)?;
+            raw.clone_from(&normalized);
+            if canonical_path.is_none() {
                 canonical_path = Some(normalized);
             }
         }
-        canonical_path
     }
+    Ok(canonical_path)
 }
 
 /// Parsed tool argument payload with wire-format path URIs normalized in-place.
 pub(crate) struct NormalizedToolPayload {
     pub(crate) args: serde_json::Value,
-    pub(crate) normalized_json: String,
     pub(crate) canonical_path: Option<String>,
 }
 
-/// Parse `arguments_json`, normalize all `WIRE_PATH_ARGUMENT_KEYS` (`file:///`)
-/// in-place inside the JSON payload, and extract the priority-ordered `canonical_path`.
+/// Strictly parse `arguments_json` (rejecting duplicate JSON keys at any depth, malformed JSON,
+/// `%00`, `?query`/`#fragment`, and remote `file://host/` URIs), normalize all
+/// `WIRE_PATH_ARGUMENT_KEYS` in-place, and extract `canonical_path`.
+pub(crate) fn try_parse_and_normalize_tool_args(
+    arguments_json: &str,
+    context: &str,
+) -> Result<NormalizedToolPayload, String> {
+    if arguments_json.trim().is_empty() {
+        return Ok(NormalizedToolPayload {
+            args: serde_json::Value::Null,
+            canonical_path: None,
+        });
+    }
+    let StrictJsonValue(mut args) = serde_json::from_str::<StrictJsonValue>(arguments_json)
+        .map_err(|e| format!("Invalid tool arguments JSON in {context}: {e}"))?;
+    let canonical_path = normalize_json_object_paths_in_place(&mut args)?;
+    Ok(NormalizedToolPayload {
+        args,
+        canonical_path,
+    })
+}
+
+/// Best-effort display variant of [`try_parse_and_normalize_tool_args`] for non-gating
+/// event/step telemetry (logs and falls back cleanly on non-JSON inputs).
 #[must_use]
 pub(crate) fn parse_and_normalize_tool_args(
     arguments_json: &str,
@@ -339,50 +443,19 @@ pub(crate) fn parse_and_normalize_tool_args(
     if arguments_json.is_empty() {
         return NormalizedToolPayload {
             args: serde_json::Value::Null,
-            normalized_json: String::new(),
             canonical_path: None,
         };
     }
-    match serde_json::from_str::<NormalizedToolArgs>(arguments_json) {
-        Ok(mut parsed) => {
-            let canonical_path = parsed.normalize_in_place();
-            let normalized_json = match serde_json::to_string(&parsed) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        context,
-                        "Failed to re-serialize normalized tool arguments; keeping raw JSON"
-                    );
-                    arguments_json.to_owned()
-                }
-            };
-            let args = match serde_json::to_value(&parsed) {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        context,
-                        "Failed to convert normalized tool arguments to Value"
-                    );
-                    parse_json_or_null(arguments_json, context)
-                }
-            };
-            NormalizedToolPayload {
-                args,
-                normalized_json,
-                canonical_path,
-            }
-        }
+    match try_parse_and_normalize_tool_args(arguments_json, context) {
+        Ok(payload) => payload,
         Err(err) => {
             tracing::trace!(
                 error = %err,
                 context,
-                "Tool arguments are not a JSON object for wire-path normalization"
+                "Tool arguments failed strict normalization for telemetry display"
             );
             NormalizedToolPayload {
                 args: parse_json_or_null(arguments_json, context),
-                normalized_json: arguments_json.to_owned(),
                 canonical_path: None,
             }
         }
@@ -428,7 +501,7 @@ fn extract_fs_step_tool_calls(update: &StepUpdate, calls: &mut Vec<ToolCallInfo>
             file_path: &norm_path,
         };
         calls.push(builtin_call(
-            tool_names::WRITE_TO_FILE,
+            tool_names::CREATE_FILE,
             &args,
             canonical(&norm_path),
         ));
@@ -450,7 +523,7 @@ fn extract_fs_step_tool_calls(update: &StepUpdate, calls: &mut Vec<ToolCallInfo>
             directory_path: &norm_dir,
         };
         calls.push(builtin_call(
-            tool_names::LIST_DIR,
+            tool_names::LIST_DIRECTORY,
             &args,
             canonical(&norm_dir),
         ));
@@ -462,7 +535,7 @@ fn extract_fs_step_tool_calls(update: &StepUpdate, calls: &mut Vec<ToolCallInfo>
             query: &ff.query,
         };
         calls.push(builtin_call(
-            tool_names::FIND_BY_NAME,
+            tool_names::FIND_FILE,
             &args,
             canonical(&norm_dir),
         ));
@@ -474,7 +547,7 @@ fn extract_fs_step_tool_calls(update: &StepUpdate, calls: &mut Vec<ToolCallInfo>
             query: &sd.query,
         };
         calls.push(builtin_call(
-            tool_names::GREP_SEARCH,
+            tool_names::SEARCH_DIRECTORY,
             &args,
             canonical(&norm_dir),
         ));
@@ -500,7 +573,18 @@ pub(crate) fn extract_step_tool_calls(update: &StepUpdate) -> Vec<ToolCallInfo> 
     if let Some(ref ct) = update.custom_tool
         && let Some(ref tc) = ct.tool_call
     {
-        let normalized = parse_and_normalize_tool_args(&tc.arguments_json, &tc.name);
+        let fallback_json;
+        let args_str = if tc.arguments_json.trim().is_empty() {
+            if let Some(ref st) = tc.arguments {
+                fallback_json = st.to_json_value().to_string();
+                fallback_json.as_str()
+            } else {
+                ""
+            }
+        } else {
+            tc.arguments_json.as_str()
+        };
+        let normalized = parse_and_normalize_tool_args(args_str, &tc.name);
         calls.push(ToolCallInfo {
             name: tc.name.clone(),
             args: normalized.args,
@@ -539,9 +623,14 @@ pub(crate) fn extract_step_tool_calls(update: &StepUpdate) -> Vec<ToolCallInfo> 
         ));
     }
     if let Some(ref mt) = update.mcp_tool {
-        let normalized = parse_and_normalize_tool_args(&mt.arguments_json, &mt.tool_name);
+        let qualified_name = if mt.server_name.is_empty() || mt.tool_name.contains('/') {
+            mt.tool_name.clone()
+        } else {
+            format!("{}/{}", mt.server_name, mt.tool_name)
+        };
+        let normalized = parse_and_normalize_tool_args(&mt.arguments_json, &qualified_name);
         calls.push(ToolCallInfo {
-            name: mt.tool_name.clone(),
+            name: qualified_name,
             args: normalized.args,
             id: None,
             canonical_path: normalized.canonical_path,
@@ -549,8 +638,14 @@ pub(crate) fn extract_step_tool_calls(update: &StepUpdate) -> Vec<ToolCallInfo> 
     }
     extract_web_step_tool_calls(update, &mut calls);
     if let Some(ref sl) = update.skill_lookup {
+        let op_str =
+            crate::proto::localharness::action_skill_lookup::Operation::try_from(sl.operation)
+                .map_or("OPERATION_UNSPECIFIED", |op| op.as_str_name());
         let args = SkillLookupArgs {
-            skill_name: &sl.skill_name,
+            operation: op_str,
+            requested_skill_names: &sl.requested_skill_names,
+            resolved_skill_names: &sl.resolved_skill_names,
+            error_message: &sl.error_message,
         };
         calls.push(builtin_call(tool_names::SKILL_LOOKUP, &args, None));
     }
@@ -581,7 +676,7 @@ mod tests {
     fn test_build_available_tools_default() {
         let config = AgentConfig::default();
         let tools = build_available_tools(&config);
-        assert_eq!(tools.len(), BuiltinTools::all_tools().len());
+        assert_eq!(tools.len(), BuiltinTools::default_tools().len());
         for tool in tools {
             assert_eq!(tool.source, ToolSource::Builtin);
         }
@@ -596,7 +691,7 @@ mod tests {
         );
         let config = AgentConfig::builder().tools(vec![custom_tool]).build();
         let tools = build_available_tools(&config);
-        assert_eq!(tools.len(), BuiltinTools::all_tools().len() + 1);
+        assert_eq!(tools.len(), BuiltinTools::default_tools().len() + 1);
         let custom = tools.iter().find(|t| t.name == "calculate").unwrap();
         assert_eq!(custom.source, ToolSource::Custom);
         assert_eq!(custom.description, "Math calculation");
@@ -623,7 +718,10 @@ mod tests {
             )
             .build();
         let tools_disabled = build_available_tools(&config_disabled);
-        assert_eq!(tools_disabled.len(), BuiltinTools::all_tools().len() - 1);
+        assert_eq!(
+            tools_disabled.len(),
+            BuiltinTools::default_tools().len() - 1
+        );
         assert!(tools_disabled.iter().all(|t| t.name != "view_file"));
     }
 
@@ -726,8 +824,10 @@ mod tests {
             p_null.args,
             serde_json::json!({"file_path": null, "ScriptPath": "/g", "count": 3})
         );
-        let reparsed: serde_json::Value =
-            serde_json::from_str(&p_null.normalized_json).expect("valid normalized_json");
+        let reparsed: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&p_null.args).expect("serialize normalized args"),
+        )
+        .expect("valid normalized_json");
         assert_eq!(
             reparsed,
             serde_json::json!({"file_path": null, "ScriptPath": "/g", "count": 3})
@@ -805,7 +905,7 @@ mod tests {
             Some("/dev/shm/workspace/foo.py")
         );
 
-        assert_eq!(calls[2].name, tool_names::WRITE_TO_FILE);
+        assert_eq!(calls[2].name, tool_names::CREATE_FILE);
         assert_eq!(calls[2].args["file_path"], "/var/tmp/workspace/notes.md");
         assert_eq!(
             calls[2].canonical_path.as_deref(),
@@ -816,7 +916,7 @@ mod tests {
         assert_eq!(calls[3].args["working_dir"], "/tmp/ws");
         assert_eq!(calls[3].canonical_path.as_deref(), Some("/tmp/ws"));
 
-        assert_eq!(calls[4].name, "analyze");
+        assert_eq!(calls[4].name, "ghidra/analyze");
         assert_eq!(
             calls[4].args,
             serde_json::json!({"TargetFile": "/tmp/bin.elf", "ScriptPath": "/tmp/script.py"})

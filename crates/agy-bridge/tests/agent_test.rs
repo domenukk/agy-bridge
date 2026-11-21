@@ -24,12 +24,14 @@ impl MockRuntime {
 }
 
 impl agy_bridge::agent::Runtime for MockRuntime {
-    async fn create_agent(
+    fn create_agent(
         &self,
         agent_id: u64,
         _config: AgentConfig,
-    ) -> Result<(agy_bridge::agent::AgentId, Vec<agy_bridge::AvailableTool>), Error> {
-        Ok((
+    ) -> impl std::future::Future<
+        Output = Result<(agy_bridge::agent::AgentId, Vec<agy_bridge::AvailableTool>), Error>,
+    > + Send {
+        std::future::ready(Ok((
             agent_id,
             vec![agy_bridge::AvailableTool {
                 name: "mock_tool".to_owned(),
@@ -37,14 +39,15 @@ impl agy_bridge::agent::Runtime for MockRuntime {
                 parameter_schema: serde_json::Value::Null,
                 source: agy_bridge::ToolSource::Custom,
             }],
-        ))
+        )))
     }
 
-    async fn chat(
+    fn chat(
         &self,
         _agent_id: agy_bridge::agent::AgentId,
         content: &agy_bridge::content::Content,
-    ) -> Result<agy_bridge::streaming::ChatResponseHandle, Error> {
+    ) -> impl std::future::Future<Output = Result<agy_bridge::streaming::ChatResponseHandle, Error>> + Send
+    {
         // Record the user message in history.
         let text = content.as_text().unwrap_or("(non-text)").to_owned();
 
@@ -56,6 +59,7 @@ impl agy_bridge::agent::Runtime for MockRuntime {
             role: agy_bridge::types::MessageRole::User,
             content: text,
         });
+        drop(h);
 
         self.turn_count.fetch_add(1, Ordering::SeqCst);
 
@@ -69,89 +73,110 @@ impl agy_bridge::agent::Runtime for MockRuntime {
             // writer is dropped here, closing the channel
         });
 
-        Ok(handle)
+        std::future::ready(Ok(handle))
     }
 
-    async fn shutdown_agent(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<(), Error> {
-        Ok(())
+    fn shutdown_agent(
+        &self,
+        _agent_id: agy_bridge::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn cancel(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<(), Error> {
-        Ok(())
+    fn cancel(
+        &self,
+        _agent_id: agy_bridge::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn wait_for_idle(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<(), Error> {
-        Ok(())
+    fn wait_for_idle(
+        &self,
+        _agent_id: agy_bridge::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn send(
+    fn send(
         &self,
         _agent_id: agy_bridge::agent::AgentId,
         _content: &agy_bridge::content::Content,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn signal_idle(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<(), Error> {
-        Ok(())
+    fn signal_idle(
+        &self,
+        _agent_id: agy_bridge::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
     }
 
-    async fn wait_for_wakeup(
+    fn wait_for_wakeup(
         &self,
         _agent_id: agy_bridge::agent::AgentId,
         _timeout: std::time::Duration,
-    ) -> Result<bool, Error> {
-        Ok(false)
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+        std::future::ready(Ok(false))
     }
 
-    async fn history(
+    fn history(
         &self,
         _agent_id: agy_bridge::agent::AgentId,
-    ) -> Result<Vec<agy_bridge::types::ConversationMessage>, Error> {
-        let h = self.history.lock().unwrap();
-        Ok(h.clone())
+    ) -> impl std::future::Future<
+        Output = Result<Vec<agy_bridge::types::ConversationMessage>, Error>,
+    > + Send {
+        let cloned = self.history.lock().unwrap().clone();
+        std::future::ready(Ok(cloned))
     }
 
-    async fn turn_count(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<u32, Error> {
-        Ok(self.turn_count.load(Ordering::SeqCst))
-    }
-
-    async fn total_usage(
+    fn turn_count(
         &self,
         _agent_id: agy_bridge::agent::AgentId,
-    ) -> Result<agy_bridge::types::UsageMetadata, Error> {
-        Ok(agy_bridge::types::UsageMetadata {
+    ) -> impl std::future::Future<Output = Result<u32, Error>> + Send {
+        std::future::ready(Ok(self.turn_count.load(Ordering::SeqCst)))
+    }
+
+    fn total_usage(
+        &self,
+        _agent_id: agy_bridge::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<agy_bridge::types::UsageMetadata, Error>> + Send
+    {
+        std::future::ready(Ok(agy_bridge::types::UsageMetadata {
             prompt_token_count: Some(500),
             cached_content_token_count: None,
             candidates_token_count: Some(200),
             thoughts_token_count: Some(100),
             total_token_count: Some(800),
             ..Default::default()
-        })
+        }))
     }
 
-    async fn last_turn_usage(
+    fn last_turn_usage(
         &self,
         _agent_id: agy_bridge::agent::AgentId,
-    ) -> Result<agy_bridge::types::UsageMetadata, Error> {
-        Ok(agy_bridge::types::UsageMetadata {
+    ) -> impl std::future::Future<Output = Result<agy_bridge::types::UsageMetadata, Error>> + Send
+    {
+        std::future::ready(Ok(agy_bridge::types::UsageMetadata {
             prompt_token_count: Some(100),
             cached_content_token_count: None,
             candidates_token_count: Some(50),
             thoughts_token_count: Some(20),
             total_token_count: Some(170),
             ..Default::default()
-        })
+        }))
     }
 
-    async fn clear_history(&self, _agent_id: agy_bridge::agent::AgentId) -> Result<(), Error> {
-        let mut h = self
-            .history
+    fn clear_history(
+        &self,
+        _agent_id: agy_bridge::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        self.history
             .lock()
-            .expect("history mutex poisoned in test mock");
-        h.clear();
+            .expect("history mutex poisoned in test mock")
+            .clear();
         self.turn_count.store(0, Ordering::SeqCst);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 

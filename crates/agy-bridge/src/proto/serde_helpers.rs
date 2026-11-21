@@ -222,6 +222,8 @@ impl<E: ProtoEnum> ProtoEnumField<E> {
     }
 }
 
+const MAX_PREALLOCATED_ENUM_ELEMENTS: usize = 1024;
+
 /// Adapter for repeated `Vec<i32>` struct fields backed by a protobuf enum `E`.
 pub struct ProtoEnumVec<E>(PhantomData<E>);
 
@@ -282,7 +284,7 @@ impl<E: ProtoEnum> ProtoEnumVec<E> {
                 A: SeqAccess<'de>,
             {
                 let mut out = match seq.size_hint() {
-                    Some(cap) => Vec::with_capacity(cap),
+                    Some(cap) => Vec::with_capacity(cap.min(MAX_PREALLOCATED_ENUM_ELEMENTS)),
                     None => Vec::new(),
                 };
                 while let Some(elem) = seq.next_element::<EnumWrapper<E>>()? {
@@ -579,11 +581,11 @@ where
     deserializer.deserialize_any(U32Visitor)
 }
 
-/// Deserializes an `f64` from either a JSON number or string (including `"NaN"`, `"Infinity"`, `"-Infinity"`).
+/// Deserializes a finite `f64` from either a JSON number or numeric string, rejecting `NaN` and `Infinity`.
 ///
 /// # Errors
 ///
-/// Returns an error if the value cannot be parsed as `f64`.
+/// Returns an error if the value cannot be parsed as a finite `f64`.
 pub fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: Deserializer<'de>,
@@ -594,28 +596,48 @@ where
         type Value = f64;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("an f64 number or numeric string")
+            formatter.write_str("a finite f64 number or numeric string")
         }
 
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            v.to_string()
+            let parsed = v
+                .to_string()
                 .parse::<f64>()
-                .map_err(|_err| E::invalid_value(de::Unexpected::Signed(v), &self))
+                .map_err(|_err| E::invalid_value(de::Unexpected::Signed(v), &self))?;
+            if !parsed.is_finite() {
+                return Err(E::custom("non-finite f64 value is not allowed"));
+            }
+            Ok(parsed)
         }
 
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            v.to_string()
+            let parsed = v
+                .to_string()
                 .parse::<f64>()
-                .map_err(|_err| E::invalid_value(de::Unexpected::Unsigned(v), &self))
+                .map_err(|_err| E::invalid_value(de::Unexpected::Unsigned(v), &self))?;
+            if !parsed.is_finite() {
+                return Err(E::custom("non-finite f64 value is not allowed"));
+            }
+            Ok(parsed)
         }
 
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            if !v.is_finite() {
+                return Err(E::custom("non-finite f64 (NaN or Infinity) is not allowed"));
+            }
             Ok(v)
         }
 
         fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse::<f64>()
-                .map_err(|_err| E::invalid_value(de::Unexpected::Str(v), &self))
+            let parsed = v
+                .parse::<f64>()
+                .map_err(|_err| E::invalid_value(de::Unexpected::Str(v), &self))?;
+            if !parsed.is_finite() {
+                return Err(E::custom(format!(
+                    "non-finite f64 string '{v}' is not allowed"
+                )));
+            }
+            Ok(parsed)
         }
 
         fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -630,27 +652,32 @@ where
     deserializer.deserialize_any(F64Visitor)
 }
 
-/// Codec for `f64` inside tuple enum variants or struct fields.
+/// Codec for finite `f64` inside tuple enum variants or struct fields.
 pub mod f64_num {
     use super::{Deserializer, Serialize, Serializer, deserialize_f64};
 
-    /// Serializes an `f64` as a JSON number.
+    /// Serializes a finite `f64` as a JSON number, rejecting `NaN` and `Infinity`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the serializer fails.
+    /// Returns an error if `value` is not finite or the serializer fails.
     pub fn serialize<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        if !value.is_finite() {
+            return Err(serde::ser::Error::custom(format!(
+                "non-finite f64 ({value}) cannot be serialized as a JSON number"
+            )));
+        }
         value.serialize(serializer)
     }
 
-    /// Deserializes an `f64` from a JSON number or numeric string.
+    /// Deserializes a finite `f64` from a JSON number or numeric string.
     ///
     /// # Errors
     ///
-    /// Returns an error if the value cannot be parsed as `f64`.
+    /// Returns an error if the value cannot be parsed as a finite `f64`.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
     where
         D: Deserializer<'de>,

@@ -3,7 +3,11 @@
 use pyo3::prelude::*;
 use tokio::sync::oneshot;
 
-use super::super::{AgentId, command_loop::AgentRegistry, py_scripts::decode_prompt_py};
+use super::super::{
+    AgentId,
+    command_loop::AgentRegistry,
+    py_scripts::{PyPromptPayload, decode_prompt_payload_py},
+};
 use crate::error::Error;
 
 /// Lock the agent registry, recovering from mutex poisoning.
@@ -61,7 +65,14 @@ async fn run_py_async_op<T, F, E>(
     // 2. Build the Python coroutine and convert it to a Rust future.
     let fut = Python::attach(|py| -> Result<_, Error> {
         let agent_bound = agent_instance.bind(py);
-        let coro = build_coro(py, agent_bound)?;
+        let coro = build_coro(py, agent_bound).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("SUPPORTED_DOCUMENT_MIMES") {
+                Error::InvalidConfig { message: msg }
+            } else {
+                Error::from(e)
+            }
+        })?;
         pyo3_async_runtimes::tokio::into_future(coro).map_err(|e| Error::BackendError {
             message: e.to_string(),
         })
@@ -177,6 +188,7 @@ pub(in crate::runtime) fn handle_clear_history(
                 conv.call_method0("clear_history")?;
             }
         }
+        super::agent::purge_python_agent_globals(py, agent_id);
         Ok(())
     });
 
@@ -188,7 +200,7 @@ pub(in crate::runtime) fn handle_clear_history(
 pub(in crate::runtime) async fn handle_send(
     registry: AgentRegistry,
     agent_id: AgentId,
-    prompt: String,
+    prompt: PyPromptPayload,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
     run_py_async_op(
@@ -198,7 +210,7 @@ pub(in crate::runtime) async fn handle_send(
         "send",
         |py, agent| {
             let conv = agent.getattr("conversation")?;
-            let decoded = decode_prompt_py(py, &prompt)?;
+            let decoded = decode_prompt_payload_py(py, &prompt)?;
             conv.call_method1("send", (decoded,))
         },
         |_py_none| (),
@@ -206,23 +218,72 @@ pub(in crate::runtime) async fn handle_send(
     .await;
 }
 
+type OptionalPyFuture =
+    Option<std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<Py<PyAny>>> + Send>>>;
+
 pub(in crate::runtime) async fn handle_signal_idle(
     registry: AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
-    run_py_async_op(
-        registry,
-        agent_id,
-        reply,
-        "signal_idle",
-        |_, agent| {
-            let conv = agent.getattr("conversation")?;
-            conv.call_method0("signal_idle")
-        },
-        |_py_none| (),
-    )
-    .await;
+    let Some((_ctx, agent_instance)) = clone_agent_refs(&registry, agent_id) else {
+        if let Err(e) = reply.send(Err(Error::BackendError {
+            message: format!("Agent ID {agent_id} not found in registry"),
+        })) {
+            tracing::warn!(agent_id = ?agent_id, error = ?e, "signal_idle reply receiver dropped");
+        }
+        return;
+    };
+
+    let outcome = Python::attach(|py| -> Result<OptionalPyFuture, Error> {
+        let agent_bound = agent_instance.bind(py);
+        if !agent_bound.hasattr("conversation")? {
+            return Ok(None);
+        }
+        let conv = agent_bound.getattr("conversation")?;
+        if conv.is_none() {
+            return Ok(None);
+        }
+        if conv.hasattr("signal_idle")? {
+            let ret = conv.call_method0("signal_idle")?;
+            let inspect = py.import("inspect")?;
+            if inspect
+                .call_method1("isawaitable", (&ret,))?
+                .extract::<bool>()?
+            {
+                let fut = pyo3_async_runtimes::tokio::into_future(ret).map_err(|e| {
+                    Error::BackendError {
+                        message: e.to_string(),
+                    }
+                })?;
+                return Ok(Some(Box::pin(fut)));
+            }
+            return Ok(None);
+        }
+        if conv.hasattr("connection")? {
+            let connection_obj = conv.getattr("connection")?;
+            if connection_obj.hasattr("_processor")? {
+                let proc_obj = connection_obj.getattr("_processor")?;
+                if proc_obj.hasattr("is_idle")? {
+                    proc_obj.getattr("is_idle")?.call_method0("set")?;
+                    return Ok(None);
+                }
+            }
+            if connection_obj.hasattr("_is_idle")? {
+                connection_obj.getattr("_is_idle")?.call_method0("set")?;
+            }
+        }
+        Ok(None)
+    });
+
+    let res = match outcome {
+        Ok(Some(fut)) => fut.await.map(|_none| ()).map_err(Error::from),
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = reply.send(res) {
+        tracing::warn!(agent_id = ?agent_id, error = ?e, "signal_idle reply receiver dropped");
+    }
 }
 
 pub(in crate::runtime) async fn handle_wait_for_wakeup(
@@ -255,38 +316,112 @@ pub(in crate::runtime) async fn handle_wait_for_wakeup(
     .await;
 }
 
-/// Delete the conversation and all associated state via the async Python API.
+fn extract_python_agent_persistence_target(
+    agent_instance: &Py<PyAny>,
+    agent_id: AgentId,
+) -> (Option<std::path::PathBuf>, Option<String>, bool) {
+    Python::attach(|py| {
+        let agent_bound = agent_instance.bind(py);
+        let has_conv_delete = agent_bound
+            .getattr("conversation")
+            .and_then(|c| c.hasattr("delete"))
+            .unwrap_or_else(|e| {
+                tracing::debug!(agent_id = ?agent_id, error = %e, "Failed probing conversation.delete");
+                false
+            });
+        let save_dir = agent_bound
+            .getattr("_config")
+            .and_then(|cfg| cfg.getattr("save_dir"))
+            .and_then(|sd| {
+                if sd.is_none() {
+                    Ok(None)
+                } else {
+                    sd.str()
+                        .and_then(|s| s.extract::<String>())
+                        .map(|s| (!s.is_empty()).then(|| std::path::PathBuf::from(s)))
+                }
+            })
+            .unwrap_or_else(|e| {
+                tracing::debug!(agent_id = ?agent_id, error = %e, "Failed reading agent._config.save_dir");
+                None
+            });
+        let conv_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id.0).or_else(
+            || {
+                agent_bound
+                    .getattr("conversation_id")
+                    .and_then(|cid| {
+                        if cid.is_none() {
+                            Ok(None)
+                        } else {
+                            cid.extract::<String>().map(|s| (!s.is_empty()).then_some(s))
+                        }
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(agent_id = ?agent_id, error = %e, "Failed reading agent.conversation_id");
+                        None
+                    })
+            },
+        );
+        (save_dir, conv_id, has_conv_delete)
+    })
+}
+
+/// Delete the conversation and all associated state via the async Python API,
+/// then run `__aexit__` cleanup so lifecycle coroutines and subprocesses exit cleanly.
 pub(in crate::runtime) async fn handle_delete(
     registry: AgentRegistry,
     agent_id: AgentId,
     reply: oneshot::Sender<Result<(), Error>>,
 ) {
-    let reg_cleanup = std::sync::Arc::clone(&registry);
-    let (op_tx, op_rx) = oneshot::channel();
-    run_py_async_op(
-        registry,
-        agent_id,
-        op_tx,
-        "delete",
-        |_, agent| {
-            let conv = agent.getattr("conversation")?;
-            conv.call_method0("delete")
-        },
-        |_py_none| (),
-    )
-    .await;
-    lock_registry(&reg_cleanup).remove(&agent_id);
-    match op_rx.await {
-        Ok(res) => {
-            if let Err(send_err) = reply.send(res) {
-                tracing::debug!(agent_id = ?agent_id, error = ?send_err, "delete reply receiver dropped");
+    let Some((ctx_py, agent_instance)) = lock_registry(&registry).remove(&agent_id) else {
+        if let Err(e) = reply.send(Err(Error::BackendError {
+            message: format!("Agent ID {agent_id} not found in registry"),
+        })) {
+            tracing::warn!(
+                agent_id = ?agent_id,
+                error = ?e,
+                "delete reply receiver dropped (agent not found)",
+            );
+        }
+        return;
+    };
+
+    let (save_dir_opt, conv_id_opt, has_conv_delete) =
+        extract_python_agent_persistence_target(&agent_instance, agent_id);
+
+    let mut delete_res = Ok(());
+    if has_conv_delete {
+        let coro_res = Python::attach(|py| -> Result<_, Error> {
+            let conv = agent_instance.bind(py).getattr("conversation")?;
+            let coro = conv.call_method0("delete")?;
+            pyo3_async_runtimes::tokio::into_future(coro).map_err(|e| Error::BackendError {
+                message: e.to_string(),
+            })
+        });
+        delete_res = match coro_res {
+            Ok(fut) => fut.await.map(|_obj| ()).map_err(Error::from),
+            Err(e) => Err(e),
+        };
+    }
+
+    let aexit_res = super::agent::run_agent_aexit_and_purge(&ctx_py, agent_id).await;
+    let final_res = delete_res.and(aexit_res).and_then(|()| {
+        if let Some(ref cid) = conv_id_opt {
+            crate::runtime::bridge_state::validate_conversation_id(cid)?;
+            if let Some(ref save_dir) = save_dir_opt {
+                crate::runtime::bridge_state::remove_persisted_conversation_files(save_dir, cid)?;
             }
         }
-        Err(e) => tracing::debug!(error = %e, "delete operation channel closed"),
+        Ok(())
+    });
+
+    if let Err(send_err) = reply.send(final_res) {
+        tracing::debug!(agent_id = ?agent_id, error = ?send_err, "delete reply receiver dropped");
     }
 }
 
-/// Disconnect from the agent without deleting state via the async Python API.
+/// Disconnect from the agent without deleting state via the async Python API,
+/// then run `__aexit__` cleanup so lifecycle coroutines and subprocesses exit cleanly.
 pub(in crate::runtime) async fn handle_disconnect(
     registry: AgentRegistry,
     agent_id: AgentId,
@@ -306,7 +441,16 @@ pub(in crate::runtime) async fn handle_disconnect(
         |_py_none| (),
     )
     .await;
-    lock_registry(&reg_cleanup).remove(&agent_id);
+    let removed = lock_registry(&reg_cleanup).remove(&agent_id);
+    if let Some((ctx_py, _instance)) = removed
+        && let Err(aexit_err) = super::agent::run_agent_aexit_and_purge(&ctx_py, agent_id).await
+    {
+        tracing::warn!(
+            agent_id = ?agent_id,
+            error = %aexit_err,
+            "Agent __aexit__ returned error during disconnect cleanup"
+        );
+    }
     match op_rx.await {
         Ok(res) => {
             if let Err(send_err) = reply.send(res) {
@@ -415,7 +559,13 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let agent_id = AgentId(100);
 
-        handle_send(registry, agent_id, "hello".to_owned(), tx).await;
+        handle_send(
+            registry,
+            agent_id,
+            PyPromptPayload::PlainText("hello".to_owned()),
+            tx,
+        )
+        .await;
 
         let result = rx.await.expect("reply channel should not be dropped");
         assert!(result.is_err());

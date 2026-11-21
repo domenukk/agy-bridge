@@ -210,9 +210,19 @@ fn test_ask_user_policy_custom_tool_gating() {
             policies,
             policy_handler: Some(Arc::clone(&handler) as Arc<dyn crate::policies::AskUserHandler>),
             tool_state: llm_tool::SharedState::new(),
+            surrogate_vault: llm_tool::SurrogateVault::new(),
+            tool_output_floor: crate::tools::OutputSanitization::SanitizeTokens,
             conversation_id: Arc::new(std::sync::Mutex::new(None)),
-            last_tool_error: std::sync::Mutex::new(None),
-            last_tool_output: std::sync::Mutex::new(None),
+            tool_errors: std::sync::Mutex::new(super::bridge_state::TrackedToolMap::default()),
+            tool_outputs: std::sync::Mutex::new(super::bridge_state::TrackedToolMap::default()),
+            confirmed_tool_calls: std::sync::Mutex::new(Vec::new()),
+            restored_structured_output: std::sync::Mutex::new(None),
+            #[cfg(feature = "native")]
+            pre_tool_evaluated_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(feature = "native")]
+            session_start_fired: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "native")]
+            session_end_fired: std::sync::atomic::AtomicBool::new(false),
         },
     );
 
@@ -250,8 +260,8 @@ fn builtins_default_config_returns_all() {
     let builtins = super::compute_active_builtins(&config);
     assert_eq!(
         builtins.len(),
-        crate::config::BuiltinTools::all_tools().len(),
-        "default config should produce all builtins"
+        crate::config::BuiltinTools::default_tools().len(),
+        "default config should produce default_tools() builtins"
     );
 }
 
@@ -264,7 +274,7 @@ fn builtins_no_capabilities_returns_all() {
     let builtins = super::compute_active_builtins(&config);
     assert_eq!(
         builtins.len(),
-        crate::config::BuiltinTools::all_tools().len(),
+        crate::config::BuiltinTools::default_tools().len(),
     );
 }
 
@@ -301,8 +311,8 @@ fn builtins_disabled_tools_excludes() {
         "RunCommand should be excluded"
     );
     assert!(
-        builtins.len() == crate::config::BuiltinTools::all_tools().len() - 1,
-        "should have all builtins minus the disabled one"
+        builtins.len() == crate::config::BuiltinTools::default_tools().len() - 1,
+        "should have default_tools() minus the disabled one"
     );
 }
 
@@ -343,7 +353,11 @@ fn builtins_all_sdk_names_non_empty() {
 
 #[test]
 fn tool_context_carries_conversation_id_when_set() {
-    let ctx = build_tool_context(llm_tool::SharedState::new(), Some("conv-xyz".to_owned()));
+    let ctx = build_tool_context(
+        llm_tool::SharedState::new(),
+        llm_tool::SurrogateVault::new(),
+        Some("conv-xyz".to_owned()),
+    );
     assert_eq!(
         ctx.conversation_id(),
         Some("conv-xyz"),
@@ -353,7 +367,11 @@ fn tool_context_carries_conversation_id_when_set() {
 
 #[test]
 fn tool_context_omits_conversation_id_when_unset() {
-    let ctx = build_tool_context(llm_tool::SharedState::new(), None);
+    let ctx = build_tool_context(
+        llm_tool::SharedState::new(),
+        llm_tool::SurrogateVault::new(),
+        None,
+    );
     assert_eq!(
         ctx.conversation_id(),
         None,
@@ -374,9 +392,19 @@ fn conversation_id_updates_are_visible_through_shared_arc() {
         policies: crate::policies::PolicySet::new(),
         policy_handler: None,
         tool_state: llm_tool::SharedState::new(),
+        surrogate_vault: llm_tool::SurrogateVault::new(),
+        tool_output_floor: crate::tools::OutputSanitization::SanitizeTokens,
         conversation_id: Arc::clone(&shared),
-        last_tool_error: std::sync::Mutex::new(None),
-        last_tool_output: std::sync::Mutex::new(None),
+        tool_errors: std::sync::Mutex::new(super::bridge_state::TrackedToolMap::default()),
+        tool_outputs: std::sync::Mutex::new(super::bridge_state::TrackedToolMap::default()),
+        confirmed_tool_calls: std::sync::Mutex::new(Vec::new()),
+        restored_structured_output: std::sync::Mutex::new(None),
+        #[cfg(feature = "native")]
+        pre_tool_evaluated_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+        #[cfg(feature = "native")]
+        session_start_fired: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "native")]
+        session_end_fired: std::sync::atomic::AtomicBool::new(false),
     };
 
     // Initially unset: a dispatch would build a context without an ID.
@@ -391,6 +419,10 @@ fn conversation_id_updates_are_visible_through_shared_arc() {
         Some("conv-live"),
         "update via the shared Arc must be visible through the bridge-state entry"
     );
-    let ctx = build_tool_context(entry.tool_state.clone(), snapshot);
+    let ctx = build_tool_context(
+        entry.tool_state.clone(),
+        entry.surrogate_vault.clone(),
+        snapshot,
+    );
     assert_eq!(ctx.conversation_id(), Some("conv-live"));
 }

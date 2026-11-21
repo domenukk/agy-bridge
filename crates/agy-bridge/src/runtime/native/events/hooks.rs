@@ -14,7 +14,10 @@ use crate::{
         PreTurnContext,
     },
     proto,
-    runtime::bridge_state::bridge_state,
+    runtime::bridge_state::{
+        bridge_state, mark_pre_tool_evaluated, sanitize_with_agent_floor, take_tool_error_for_call,
+        take_tool_output_for_call,
+    },
 };
 
 pub(super) fn dispatch_pre_turn_hook(
@@ -69,42 +72,85 @@ fn dispatch_post_turn_hook(
 }
 
 pub(super) fn dispatch_pre_tool_hook(
+    agent_id: AgentId,
     hr: &crate::hooks::Hooks,
     req: &proto::localharness::CallHookRequest,
 ) -> proto::localharness::call_hook_response::Result {
-    let (tool_name, args_val) = match req.args {
+    let (tool_name, call_id, args_res) = match req.args {
         Some(proto::localharness::call_hook_request::Args::PreTool(ref a)) => {
-            let normalized = crate::runtime::native::tools::parse_and_normalize_tool_args(
+            let parsed = crate::runtime::native::tools::try_parse_and_normalize_tool_args(
                 &a.arguments_json,
                 "dispatch_pre_tool_hook",
             );
-            (a.tool_name.clone(), normalized.args)
+            (a.tool_name.clone(), a.call_id.clone(), parsed)
         }
-        _ => (String::new(), serde_json::Value::Null),
+        _ => (
+            String::new(),
+            String::new(),
+            Ok(crate::runtime::native::tools::NormalizedToolPayload {
+                args: serde_json::Value::Null,
+                canonical_path: None,
+            }),
+        ),
     };
-    let ctx = PreToolCallDecideContext::new(tool_name, args_val);
-    let res = hr.run_pre_tool_call_decide(&ctx);
+    let normalized = match args_res {
+        Ok(payload) => payload,
+        Err(reason) => {
+            return proto::localharness::call_hook_response::Result::PreTool(
+                proto::localharness::PreToolResult {
+                    decision: 2,
+                    reason: sanitize_with_agent_floor(agent_id, &reason),
+                    modified_args: None,
+                },
+            );
+        }
+    };
+
+    let initial_ctx = PreToolCallDecideContext::new(tool_name.clone(), normalized.args);
+    let mut transformed = hr.run_transform_tool_input(&initial_ctx);
+    if transformed != initial_ctx.tool_args {
+        crate::runtime::bridge_state::invalidate_confirmed_tool_call(
+            agent_id,
+            &tool_name,
+            &initial_ctx.tool_args,
+        );
+        if let Err(reason) =
+            crate::runtime::native::tools::normalize_json_object_paths_in_place(&mut transformed)
+        {
+            return proto::localharness::call_hook_response::Result::PreTool(
+                proto::localharness::PreToolResult {
+                    decision: 2,
+                    reason: sanitize_with_agent_floor(agent_id, &reason),
+                    modified_args: None,
+                },
+            );
+        }
+    }
+
+    let decide_ctx = PreToolCallDecideContext::new(tool_name, transformed.clone());
+    let res = hr.run_pre_tool_call_decide(&decide_ctx);
     if !res.allow {
         return proto::localharness::call_hook_response::Result::PreTool(
             proto::localharness::PreToolResult {
                 decision: 2,
-                reason: res.message,
-                modified_arguments_json: String::new(),
+                reason: sanitize_with_agent_floor(agent_id, &res.message),
                 modified_args: None,
             },
         );
     }
-    let transformed = hr.run_transform_tool_input(&ctx);
-    let modified_arguments_json = if transformed == ctx.tool_args {
-        String::new()
+
+    mark_pre_tool_evaluated(agent_id, &call_id);
+    let modified_args = if transformed == initial_ctx.tool_args {
+        None
     } else {
-        transformed.to_string()
+        transformed
+            .as_object()
+            .and_then(proto::genai::Struct::from_json_object)
     };
     proto::localharness::call_hook_response::Result::PreTool(proto::localharness::PreToolResult {
         decision: 1,
         reason: res.message,
-        modified_arguments_json,
-        modified_args: None,
+        modified_args,
     })
 }
 
@@ -113,14 +159,13 @@ fn dispatch_post_tool_hook(
     hr: &crate::hooks::Hooks,
     req: &proto::localharness::CallHookRequest,
 ) -> proto::localharness::call_hook_response::Result {
-    let (tool_name, result) = match req.args {
+    let (tool_name, call_id, result) = match req.args {
         Some(proto::localharness::call_hook_request::Args::PostTool(ref a)) => {
-            (a.tool_name.clone(), a.result.clone())
+            (a.tool_name.clone(), a.call_id.clone(), a.result.clone())
         }
-        _ => (String::new(), String::new()),
+        _ => (String::new(), String::new(), String::new()),
     };
-    let (tool_args, metadata) = match crate::runtime::bridge_state::take_last_tool_output(agent_id)
-    {
+    let (tool_args, metadata) = match take_tool_output_for_call(agent_id, &call_id) {
         Some(captured) => (captured.tool_args, captured.metadata),
         None => (serde_json::Value::Null, serde_json::Value::Null),
     };
@@ -139,14 +184,15 @@ fn dispatch_on_tool_error_hook(
     hr: &crate::hooks::Hooks,
     req: &proto::localharness::CallHookRequest,
 ) -> proto::localharness::call_hook_response::Result {
-    let (tool_name, error_message) = match req.args {
-        Some(proto::localharness::call_hook_request::Args::OnToolError(ref a)) => {
-            (a.tool_name.clone(), a.error_message.clone())
-        }
-        _ => (String::new(), String::new()),
+    let (tool_name, call_id, error_message) = match req.args {
+        Some(proto::localharness::call_hook_request::Args::OnToolError(ref a)) => (
+            a.tool_name.clone(),
+            a.call_id.clone(),
+            a.error_message.clone(),
+        ),
+        _ => (String::new(), String::new(), String::new()),
     };
-    // `OnToolErrorContext` documents `Null` as "no tool arguments / metadata".
-    let (tool_args, metadata) = match crate::runtime::bridge_state::take_last_tool_error(agent_id) {
+    let (tool_args, metadata) = match take_tool_error_for_call(agent_id, &call_id) {
         Some(captured) => {
             let metadata = match captured.metadata {
                 Some(map) => serde_json::Value::Object(map),
@@ -165,7 +211,7 @@ fn dispatch_on_tool_error_hook(
     let res = hr.run_on_tool_error(&ctx);
     let mut err_result = proto::localharness::OnToolErrorResult::default();
     if let Some(msg) = res {
-        err_result.custom_error_message = msg;
+        err_result.custom_error_message = sanitize_with_agent_floor(agent_id, &msg);
     }
     proto::localharness::call_hook_response::Result::OnToolError(err_result)
 }
@@ -174,16 +220,18 @@ fn dispatch_on_session_start_hook(
     agent_id: AgentId,
     hr: &crate::hooks::Hooks,
 ) -> proto::localharness::call_hook_response::Result {
-    let session_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id)
-        .unwrap_or_else(|| format!("agent-{agent_id}"));
-    let ctx = crate::hooks::OnSessionStartContext {
-        session: crate::hooks::SessionContext {
-            session_id,
-            agent_id,
-            started_at: std::time::SystemTime::now(),
-        },
-    };
-    hr.run_on_session_start(&ctx);
+    if crate::runtime::bridge_state::claim_session_start_once(agent_id) {
+        let session_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id)
+            .unwrap_or_else(|| format!("agent-{agent_id}"));
+        let ctx = crate::hooks::OnSessionStartContext {
+            session: crate::hooks::SessionContext {
+                session_id,
+                agent_id,
+                started_at: std::time::SystemTime::now(),
+            },
+        };
+        hr.run_on_session_start(&ctx);
+    }
     proto::localharness::call_hook_response::Result::Empty(proto::localharness::EmptyResult {})
 }
 
@@ -191,31 +239,23 @@ fn dispatch_on_session_end_hook(
     agent_id: AgentId,
     hr: &crate::hooks::Hooks,
 ) -> proto::localharness::call_hook_response::Result {
-    let session_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id)
-        .unwrap_or_else(|| format!("agent-{agent_id}"));
-    let ctx = crate::hooks::OnSessionEndContext {
-        session: crate::hooks::SessionContext {
-            session_id,
-            agent_id,
-            started_at: std::time::SystemTime::now(),
-        },
-    };
-    hr.run_on_session_end(&ctx);
+    if crate::runtime::bridge_state::claim_session_end_once(agent_id) {
+        let session_id = crate::runtime::bridge_state::get_agent_conversation_id(agent_id)
+            .unwrap_or_else(|| format!("agent-{agent_id}"));
+        let ctx = crate::hooks::OnSessionEndContext {
+            session: crate::hooks::SessionContext {
+                session_id,
+                agent_id,
+                started_at: std::time::SystemTime::now(),
+            },
+        };
+        hr.run_on_session_end(&ctx);
+    }
     proto::localharness::call_hook_response::Result::Empty(proto::localharness::EmptyResult {})
 }
 
 fn parse_stop_args(a: &proto::localharness::StopArgs) -> crate::hooks::StopArgs {
-    let stop_reason = match a.stop_reason.parse::<crate::types::StopReason>() {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                raw_stop_reason = %a.stop_reason,
-                "failed to parse stop_reason proto field, defaulting to Unknown"
-            );
-            crate::types::StopReason::Unknown
-        }
-    };
+    let stop_reason = crate::types::StopReason::from_proto_i32(a.stop_reason);
     let continuation_count = match u32::try_from(a.continuation_count) {
         Ok(c) => c,
         Err(err) => {
@@ -282,7 +322,7 @@ pub(crate) async fn handle_call_hook_request(
             2 => Some(dispatch_on_session_end_hook(agent_id, &hr)),
             3 => Some(dispatch_pre_turn_hook(&hr, &req, turn)),
             4 => Some(dispatch_post_turn_hook(&hr, &req, turn)),
-            5 => Some(dispatch_pre_tool_hook(&hr, &req)),
+            5 => Some(dispatch_pre_tool_hook(agent_id, &hr, &req)),
             6 => Some(dispatch_post_tool_hook(agent_id, &hr, &req)),
             7 => Some(dispatch_on_tool_error_hook(agent_id, &hr, &req)),
             8 => Some(dispatch_on_compaction_hook(&hr)),

@@ -101,7 +101,7 @@ pub(crate) fn configure_python_sys_path(py: Python<'_>) -> PyResult<()> {
 }
 
 /// Minimum supported version of `google-antigravity`.
-pub const MIN_SUPPORTED_SDK_VERSION: &str = "0.1.16";
+pub const MIN_SUPPORTED_SDK_VERSION: &str = "0.1.24";
 
 /// Parses a semver-like version string (e.g. "0.1.16" or "0.1.16.post1") into `(major, minor, patch)`.
 pub fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -260,12 +260,15 @@ mod tests {
 
     #[test]
     fn test_is_version_compatible() {
-        assert!(is_version_compatible("0.1.16", "0.1.16"));
-        assert!(is_version_compatible("0.1.17", "0.1.16"));
-        assert!(is_version_compatible("0.2.0", "0.1.16"));
-        assert!(is_version_compatible("1.0.0", "0.1.16"));
-        assert!(!is_version_compatible("0.1.15", "0.1.16"));
-        assert!(!is_version_compatible("0.0.9", "0.1.16"));
-        assert!(!is_version_compatible("not-a-version", "0.1.16"));
+        assert!(is_version_compatible("0.1.24", MIN_SUPPORTED_SDK_VERSION));
+        assert!(is_version_compatible("0.1.25", MIN_SUPPORTED_SDK_VERSION));
+        assert!(is_version_compatible("0.2.0", MIN_SUPPORTED_SDK_VERSION));
+        assert!(is_version_compatible("1.0.0", MIN_SUPPORTED_SDK_VERSION));
+        assert!(!is_version_compatible("0.1.23", MIN_SUPPORTED_SDK_VERSION));
+        assert!(!is_version_compatible("0.0.9", MIN_SUPPORTED_SDK_VERSION));
+        assert!(!is_version_compatible(
+            "not-a-version",
+            MIN_SUPPORTED_SDK_VERSION
+        ));
     }
 }

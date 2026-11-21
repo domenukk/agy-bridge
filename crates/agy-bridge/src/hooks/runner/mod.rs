@@ -284,11 +284,21 @@ impl Hooks {
         });
     }
 
+    /// Returns `true` if at least one [`HookPoint::OnInteraction`] callback is registered.
+    #[must_use]
+    pub fn has_on_interaction(&self) -> bool {
+        self.iter_at(HookPoint::OnInteraction).next().is_some()
+    }
+
     /// Run all [`HookPoint::OnInteraction`] callbacks in registration order.
     ///
-    /// If a callback panics, the panic is logged and execution continues
-    /// (the interaction is not blocked).
-    pub fn run_on_interaction(&self, ctx: &OnInteractionContext) -> HookResult {
+    /// Returns the first non-empty / cancelled [`super::interactive::QuestionHookResult`],
+    /// or [`super::interactive::QuestionHookResult::default()`] when all callbacks allow
+    /// without answers. If a callback panics, the panic is logged and execution continues.
+    pub fn run_on_interaction(
+        &self,
+        ctx: &OnInteractionContext,
+    ) -> super::interactive::QuestionHookResult {
         for (_, name, cb) in self.iter_at(HookPoint::OnInteraction) {
             tracing::trace!(hook = %name, "firing on_interaction hook");
             if let HookCallback::OnInteraction(f) = cb {
@@ -304,12 +314,12 @@ impl Hooks {
                         continue;
                     }
                 };
-                if !result.allow {
+                if result.cancelled || !result.responses.is_empty() {
                     return result;
                 }
             }
         }
-        HookResult::allow()
+        super::interactive::QuestionHookResult::default()
     }
 
     /// Run all [`HookPoint::Stop`] callbacks in registration order.
@@ -464,12 +474,16 @@ impl Hooks {
     /// Register a [`HookPoint::OnInteraction`] callback.
     ///
     /// Convenience wrapper matching the Python SDK's `@on_interaction` decorator.
-    pub fn on_interaction(
+    /// Callbacks may return either [`super::interactive::QuestionHookResult`] or [`HookResult`].
+    pub fn on_interaction<R: Into<super::interactive::QuestionHookResult>>(
         &mut self,
         name: impl Into<String>,
-        f: impl Fn(&OnInteractionContext) -> HookResult + Send + Sync + 'static,
+        f: impl Fn(&OnInteractionContext) -> R + Send + Sync + 'static,
     ) -> &mut Self {
-        self.register(name, HookCallback::OnInteraction(Box::new(f)))
+        self.register(
+            name,
+            HookCallback::OnInteraction(Box::new(move |ctx| f(ctx).into())),
+        )
     }
 
     /// Register a [`HookPoint::OnSessionStart`] callback.
@@ -614,10 +628,10 @@ impl Hooks {
     /// This is the owned-self variant of
     /// [`on_interaction`](Self::on_interaction).
     #[must_use]
-    pub fn with_interaction(
+    pub fn with_interaction<R: Into<super::interactive::QuestionHookResult>>(
         mut self,
         name: impl Into<String>,
-        f: impl Fn(&OnInteractionContext) -> HookResult + Send + Sync + 'static,
+        f: impl Fn(&OnInteractionContext) -> R + Send + Sync + 'static,
     ) -> Self {
         self.on_interaction(name, f);
         self

@@ -255,7 +255,7 @@ fn test_stop_hook_types_and_runner() {
 #[test]
 fn test_target_antigravity_sdk_version_exported() {
     let version = env!("TARGET_ANTIGRAVITY_SDK_VERSION");
-    assert_eq!(version, "0.1.23");
+    assert_eq!(version, "0.1.24");
 }
 
 #[cfg(feature = "python")]

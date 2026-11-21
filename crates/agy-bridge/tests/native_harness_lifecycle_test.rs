@@ -154,7 +154,7 @@ async fn handle_mock_agent_session(
         event: Some(
             proto::localharness::output_event::Event::TrajectoryStateUpdate(
                 proto::localharness::TrajectoryStateUpdate {
-                    state: 3,
+                    state: proto::localharness::trajectory_state_update::State::FullyIdle as i32,
                     ..Default::default()
                 },
             ),

@@ -5,12 +5,13 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32},
+        atomic::{AtomicBool, AtomicU32, AtomicU64},
     },
 };
 
 use tokio::sync::{Notify, mpsc};
 
+use super::HarnessCacheKey;
 use crate::{
     proto,
     streaming::ChatResponseWriter,
@@ -22,10 +23,13 @@ pub(crate) struct NativeAgentSession {
     pub(crate) event_tx: mpsc::Sender<proto::localharness::InputEvent>,
     pub(crate) history: Arc<Mutex<Vec<ConversationMessage>>>,
     pub(crate) total_usage: Arc<Mutex<UsageMetadata>>,
+    pub(crate) turn_start_usage: Arc<Mutex<UsageMetadata>>,
     pub(crate) last_turn_usage: Arc<Mutex<UsageMetadata>>,
     pub(crate) last_response_text: Arc<Mutex<Option<String>>>,
     pub(crate) compaction_indices: Arc<Mutex<Vec<u32>>>,
+    pub(crate) root_trajectory_id: Arc<Mutex<Option<String>>>,
     pub(crate) turn_count: Arc<AtomicU32>,
+    pub(crate) turn_epoch: Arc<AtomicU64>,
     pub(crate) is_idle: Arc<AtomicBool>,
     pub(crate) idle_notify: Arc<Notify>,
     pub(crate) wakeup_notify: Arc<Notify>,
@@ -43,8 +47,14 @@ pub(crate) struct NativeAgentSession {
     pub(crate) finish_on_tools: Arc<HashSet<String>>,
     /// Set when a tool in `finish_on_tools` completes with `Ok` during the turn.
     pub(crate) finished_by_tool: Arc<AtomicBool>,
+    /// Deduplication set `(step_index, tool_name)` for builtin/MCP tool-call stream emission.
+    pub(crate) emitted_builtin_tool_steps: Arc<Mutex<HashSet<(u32, String)>>>,
+    /// Deduplication set `(trajectory_id, step_index)` for `ask_question` responses.
+    pub(crate) answered_question_steps: Arc<Mutex<HashSet<(String, u32)>>>,
     /// Storage directory associated with this session's localharness process.
     pub(crate) save_dir: PathBuf,
+    /// Shared harness slot key `(canonical_save_dir, sorted_env)` for deterministic deregistration.
+    pub(crate) harness_key: HarnessCacheKey,
     /// OS command sandbox status reported by the harness.
     pub(crate) sandbox_status: Option<crate::types::SandboxStatus>,
 }
@@ -52,10 +62,12 @@ pub(crate) struct NativeAgentSession {
 /// Initial state returned by `initialize_harness` when starting or resuming a conversation.
 pub(crate) struct InitialHarnessState {
     pub(crate) cascade_id: Option<String>,
+    pub(crate) root_trajectory_id: Option<String>,
     pub(crate) usage: UsageMetadata,
     pub(crate) sandbox_status: Option<crate::types::SandboxStatus>,
     pub(crate) history: Vec<ConversationMessage>,
     pub(crate) last_response_text: Option<String>,
+    pub(crate) restored_structured_output: Option<serde_json::Value>,
     pub(crate) compaction_indices: Vec<u32>,
     pub(crate) turn_count: u32,
 }
@@ -65,16 +77,21 @@ impl NativeAgentSession {
         event_tx: mpsc::Sender<proto::localharness::InputEvent>,
         init: InitialHarnessState,
         save_dir: PathBuf,
+        harness_key: HarnessCacheKey,
         finish_on_tools: HashSet<String>,
     ) -> Self {
+        let baseline = init.usage.clone();
         Self {
             event_tx,
             history: Arc::new(Mutex::new(init.history)),
             total_usage: Arc::new(Mutex::new(init.usage)),
+            turn_start_usage: Arc::new(Mutex::new(baseline)),
             last_turn_usage: Arc::new(Mutex::new(UsageMetadata::default())),
             last_response_text: Arc::new(Mutex::new(init.last_response_text)),
             compaction_indices: Arc::new(Mutex::new(init.compaction_indices)),
+            root_trajectory_id: Arc::new(Mutex::new(init.root_trajectory_id)),
             turn_count: Arc::new(AtomicU32::new(init.turn_count)),
+            turn_epoch: Arc::new(AtomicU64::new(0)),
             is_idle: Arc::new(AtomicBool::new(true)),
             idle_notify: Arc::new(Notify::new()),
             wakeup_notify: Arc::new(Notify::new()),
@@ -85,7 +102,10 @@ impl NativeAgentSession {
             connected: Arc::new(AtomicBool::new(true)),
             finish_on_tools: Arc::new(finish_on_tools),
             finished_by_tool: Arc::new(AtomicBool::new(false)),
+            emitted_builtin_tool_steps: Arc::new(Mutex::new(HashSet::new())),
+            answered_question_steps: Arc::new(Mutex::new(HashSet::new())),
             save_dir,
+            harness_key,
             sandbox_status: init.sandbox_status,
         }
     }

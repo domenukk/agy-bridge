@@ -60,25 +60,22 @@ impl BuiltinTools {
     pub const START_SUBAGENT: Self = Self::InvokeSubagent;
 
     #[must_use]
-    /// Returns tools that only read (no writes, no command execution).
+    /// Returns tools that only read state (no writes, deletes, or commands), matching `0.1.24`.
+    ///
+    /// Excludes `ListDir`, `SearchDir`, and `FindFile`, which are deprecated and off by default.
     pub const fn read_only() -> &'static [Self] {
         &[
-            Self::ListDir,
-            Self::SearchDir,
-            Self::FindFile,
             Self::ViewFile,
             Self::ReadUrlContent,
+            Self::Schedule,
             Self::Finish,
         ]
     }
 
-    /// Returns tools that cannot delete content (all except `RunCommand`).
+    /// Returns tools that cannot delete content, matching `0.1.24` (excludes deprecated tools and `RunCommand`).
     #[must_use]
     pub const fn nondestructive() -> &'static [Self] {
         &[
-            Self::ListDir,
-            Self::SearchDir,
-            Self::FindFile,
             Self::ViewFile,
             Self::CreateFile,
             Self::EditFile,
@@ -130,9 +127,9 @@ impl BuiltinTools {
         &[]
     }
 
-    /// Returns the minimal set of software engineering tools.
+    /// Returns the minimal set of software engineering tools (`0.1.24`).
     ///
-    /// Includes `RunCommand`, `ViewFile`, `CreateFile`, `EditFile`, `ListDir`, and `SearchDir`.
+    /// Includes `RunCommand`, `ViewFile`, `CreateFile`, and `EditFile`.
     #[must_use]
     pub const fn minimal() -> &'static [Self] {
         &[
@@ -140,18 +137,21 @@ impl BuiltinTools {
             Self::ViewFile,
             Self::CreateFile,
             Self::EditFile,
-            Self::ListDir,
-            Self::SearchDir,
         ]
     }
 
-    /// Returns the default set of builtin tools for autonomous agents (all except `AskQuestion`).
+    /// Returns deprecated/legacy builtin tools disabled by default in `0.1.24`.
+    #[must_use]
+    pub const fn deprecated() -> &'static [Self] {
+        &[Self::ListDir, Self::SearchDir, Self::FindFile]
+    }
+
+    /// Returns the default set of builtin tools for autonomous agents (`0.1.24`).
+    ///
+    /// Excludes `AskQuestion` and [`Self::deprecated()`] (`ListDir`, `SearchDir`, `FindFile`).
     #[must_use]
     pub const fn default_tools() -> &'static [Self] {
         &[
-            Self::ListDir,
-            Self::SearchDir,
-            Self::FindFile,
             Self::ViewFile,
             Self::CreateFile,
             Self::EditFile,
@@ -322,6 +322,10 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     #[builder(default)]
     pub disable_define_subagent_tool: bool,
+    /// When true, disables the `manage_subagents` tool (`0.1.24`+).
+    #[serde(default)]
+    #[builder(default)]
+    pub disable_manage_subagents_tool: bool,
 }
 
 /// Configuration for the builtin `run_command` tool.
@@ -402,27 +406,27 @@ impl CapabilitiesConfig {
         Ok(())
     }
 
-    /// Resolve which builtin tools are active for `caps`.
+    /// Resolve which builtin tools are active for `caps` (`0.1.24` semantics).
     ///
     /// - `enabled_tools: Some(list)` → only those tools are active.
-    /// - `disabled_tools: Some(list)` → all builtin tools minus the disabled ones.
-    /// - Neither set (or `caps` is `None`) → all builtin tools are active.
+    /// - `disabled_tools: Some(list)` → [`BuiltinTools::default_tools()`] minus the disabled ones.
+    /// - Neither set (or `caps` is `None`) → [`BuiltinTools::default_tools()`] are active.
     #[must_use]
     pub fn resolve_active_builtins(caps: Option<&Self>) -> Vec<BuiltinTools> {
         let Some(c) = caps else {
-            return BuiltinTools::all_tools().to_vec();
+            return BuiltinTools::default_tools().to_vec();
         };
         if let Some(enabled) = c.enabled_tools.as_ref() {
             return enabled.clone();
         }
         if let Some(disabled) = c.disabled_tools.as_ref() {
-            return BuiltinTools::all_tools()
+            return BuiltinTools::default_tools()
                 .iter()
                 .copied()
                 .filter(|t| !disabled.contains(t))
                 .collect();
         }
-        BuiltinTools::all_tools().to_vec()
+        BuiltinTools::default_tools().to_vec()
     }
 }
 
@@ -443,12 +447,24 @@ mod tests {
     #[test]
     fn test_builtin_tools() {
         let read_only = BuiltinTools::read_only();
-        assert_eq!(read_only.len(), 6);
-        assert!(read_only.contains(&BuiltinTools::ListDir));
+        assert_eq!(read_only.len(), 4);
+        assert!(!read_only.contains(&BuiltinTools::ListDir));
+        assert!(read_only.contains(&BuiltinTools::ViewFile));
         assert!(!read_only.contains(&BuiltinTools::SearchWeb));
         assert!(read_only.contains(&BuiltinTools::ReadUrlContent));
+        assert!(read_only.contains(&BuiltinTools::Schedule));
         assert!(read_only.contains(&BuiltinTools::Finish));
         assert!(!read_only.contains(&BuiltinTools::CreateFile));
+        assert_eq!(
+            BuiltinTools::deprecated(),
+            &[
+                BuiltinTools::ListDir,
+                BuiltinTools::SearchDir,
+                BuiltinTools::FindFile
+            ]
+        );
+        assert_eq!(BuiltinTools::minimal().len(), 4);
+        assert_eq!(BuiltinTools::default_tools().len(), 11);
 
         let all = BuiltinTools::all_tools();
         assert_eq!(all.len(), 15);
@@ -807,26 +823,28 @@ mod tests {
     fn resolve_active_builtins_covers_none_default_enabled_and_disabled() {
         assert_eq!(
             CapabilitiesConfig::resolve_active_builtins(None),
-            BuiltinTools::all_tools()
+            BuiltinTools::default_tools()
         );
         let default_caps = CapabilitiesConfig::default();
         assert_eq!(
             CapabilitiesConfig::resolve_active_builtins(Some(&default_caps)),
-            BuiltinTools::all_tools()
+            BuiltinTools::default_tools()
         );
         let enabled_caps =
-            CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile, BuiltinTools::Finish]);
+            CapabilitiesConfig::with_tools(vec![BuiltinTools::ViewFile, BuiltinTools::ListDir]);
         assert_eq!(
             CapabilitiesConfig::resolve_active_builtins(Some(&enabled_caps)),
-            vec![BuiltinTools::ViewFile, BuiltinTools::Finish]
+            vec![BuiltinTools::ViewFile, BuiltinTools::ListDir]
         );
         let disabled_caps = CapabilitiesConfig {
-            disabled_tools: Some(vec![BuiltinTools::RunCommand, BuiltinTools::AskQuestion]),
+            disabled_tools: Some(vec![BuiltinTools::RunCommand, BuiltinTools::SearchWeb]),
             ..CapabilitiesConfig::default()
         };
         let resolved = CapabilitiesConfig::resolve_active_builtins(Some(&disabled_caps));
-        assert_eq!(resolved.len(), BuiltinTools::all_tools().len() - 2);
+        assert_eq!(resolved.len(), BuiltinTools::default_tools().len() - 2);
         assert!(!resolved.contains(&BuiltinTools::RunCommand));
+        assert!(!resolved.contains(&BuiltinTools::SearchWeb));
         assert!(!resolved.contains(&BuiltinTools::AskQuestion));
+        assert!(!resolved.contains(&BuiltinTools::ListDir));
     }
 }

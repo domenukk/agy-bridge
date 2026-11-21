@@ -74,6 +74,28 @@ pub struct RuntimeConfig {
     pub harness_binary_path: Option<std::path::PathBuf>,
 }
 
+impl RuntimeConfig {
+    /// Validate runtime channel capacities (`>= 1` so bounded channels never panic).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::InvalidConfig`] if `channel_capacity == 0` or
+    /// `streaming_channel_buffer == Some(0)`.
+    pub fn validate(&self) -> Result<(), crate::error::Error> {
+        if self.channel_capacity == 0 {
+            return Err(crate::error::Error::InvalidConfig {
+                message: "RuntimeConfig.channel_capacity must be >= 1".to_string(),
+            });
+        }
+        if self.streaming_channel_buffer == Some(0) {
+            return Err(crate::error::Error::InvalidConfig {
+                message: "RuntimeConfig.streaming_channel_buffer must be >= 1".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {

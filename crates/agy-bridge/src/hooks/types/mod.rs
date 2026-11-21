@@ -136,19 +136,34 @@ impl OnCompactionContext {
 
 /// Context passed to [`HookPoint::OnInteraction`] hooks.
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnInteractionContext {
-    /// The interaction message content.
+    /// Optional summary or interaction message string.
+    #[serde(default)]
     pub message: String,
+    /// Structured questions from an `ask_question` interaction (`0.1.24`+).
+    #[serde(default)]
+    pub questions: Vec<super::interactive::AskQuestionEntry>,
 }
 
 impl OnInteractionContext {
-    /// Create a new interaction hook context.
+    /// Create a new interaction hook context with a message string.
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            questions: Vec::new(),
         }
+    }
+
+    /// Create an interaction hook context from structured [`AskQuestionEntry`](super::interactive::AskQuestionEntry) items.
+    #[must_use]
+    pub fn from_questions(questions: Vec<super::interactive::AskQuestionEntry>) -> Self {
+        let message = match questions.first() {
+            Some(q) => q.question.clone(),
+            None => String::new(),
+        };
+        Self { message, questions }
     }
 }
 
@@ -711,8 +726,10 @@ pub enum HookCallback {
     OnSessionEnd(Box<dyn Fn(&OnSessionEndContext) + Send + Sync>),
     /// Callback invoked when conversation history is compacted.
     OnCompaction(Box<dyn Fn(&OnCompactionContext) + Send + Sync>),
-    /// Callback invoked on each interaction event.
-    OnInteraction(Box<dyn Fn(&OnInteractionContext) -> HookResult + Send + Sync>),
+    /// Callback invoked on each interaction event (`ask_question`).
+    OnInteraction(
+        Box<dyn Fn(&OnInteractionContext) -> super::interactive::QuestionHookResult + Send + Sync>,
+    ),
     /// Callback invoked when the turn reaches fully idle to decide whether to stop or continue.
     Stop(Box<dyn Fn(&StopArgs) -> StopHookResult + Send + Sync>),
     /// Transform tool input arguments before execution.

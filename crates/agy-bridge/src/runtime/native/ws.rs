@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use futures::{SinkExt, stream::StreamExt};
@@ -35,6 +38,12 @@ use crate::{
 };
 
 pub(super) type HarnessWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const INIT_HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) use crate::runtime::bridge_state::{
+    remove_persisted_conversation_files, validate_conversation_id,
+};
 
 pub(super) async fn connect_to_harness(port: u16, api_key: &str) -> Result<HarnessWsStream, Error> {
     let ws_url = format!("ws://127.0.0.1:{port}/");
@@ -96,21 +105,27 @@ pub(super) async fn initialize_harness(
         message: format!("Failed to serialize InitializeConversationEvent: {e}"),
     })?;
 
-    ws.send(Message::Text(init_json.into()))
-        .await
-        .map_err(|e| Error::BackendError {
-            message: format!("Failed to send InitializeConversationEvent: {e}"),
-        })?;
+    let first_msg = tokio::time::timeout(INIT_HARNESS_TIMEOUT, async {
+        ws.send(Message::Text(init_json.into()))
+            .await
+            .map_err(|e| Error::BackendError {
+                message: format!("Failed to send InitializeConversationEvent: {e}"),
+            })?;
 
-    let first_msg = ws
-        .next()
-        .await
-        .ok_or_else(|| Error::BackendError {
-            message: "WebSocket closed before InitializeConversationResponse".to_string(),
-        })?
-        .map_err(|e| Error::BackendError {
-            message: format!("WebSocket read error: {e}"),
-        })?;
+        ws.next()
+            .await
+            .ok_or_else(|| Error::BackendError {
+                message: "WebSocket closed before InitializeConversationResponse".to_string(),
+            })?
+            .map_err(|e| Error::BackendError {
+                message: format!("WebSocket read error: {e}"),
+            })
+    })
+    .await
+    .map_err(|_elapsed| Error::Timeout {
+        duration: INIT_HARNESS_TIMEOUT,
+        operation: "initialize_harness WebSocket handshake".to_string(),
+    })??;
 
     let first_text = first_msg.to_text().map_err(|e| Error::BackendError {
         message: format!("Expected text message for init response: {e}"),
@@ -124,15 +139,83 @@ pub(super) async fn initialize_harness(
     Ok(parse_init_response(&init_resp, config))
 }
 
+fn apply_resumed_history_steps(
+    history_steps: &[proto::localharness::StepUpdate],
+    root_trajectory_id: &mut Option<String>,
+    compaction_indices: &mut Vec<u32>,
+    restored_structured_output: &mut Option<serde_json::Value>,
+    history: &mut Vec<ConversationMessage>,
+    last_response_text: &mut Option<String>,
+    turn_count: &mut u32,
+) {
+    for step_update in history_steps {
+        if !step_update.parent_trajectory_id.is_empty() {
+            continue;
+        }
+        if let Some(rid) = root_trajectory_id.as_ref()
+            && !step_update.trajectory_id.is_empty()
+            && &step_update.trajectory_id != rid
+        {
+            continue;
+        }
+        if root_trajectory_id.is_none() && !step_update.trajectory_id.is_empty() {
+            *root_trajectory_id = Some(step_update.trajectory_id.clone());
+        }
+        if step_update.compaction.is_some()
+            && step_update.state == 2
+            && !compaction_indices.contains(&step_update.step_index)
+        {
+            compaction_indices.push(step_update.step_index);
+        }
+        if step_update.state != 4
+            && let Some(ref finish) = step_update.finish
+            && !finish.output_string.is_empty()
+        {
+            match serde_json::from_str::<serde_json::Value>(&finish.output_string) {
+                Ok(val) => *restored_structured_output = Some(val),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Ignoring non-JSON finish output_string in resumed history");
+                }
+            }
+        }
+        if step_update.source == 2 {
+            let text = if step_update.request_text.is_empty() {
+                step_update.text.clone()
+            } else {
+                step_update.request_text.clone()
+            };
+            if !text.is_empty() {
+                history.push(ConversationMessage {
+                    role: MessageRole::User,
+                    content: text,
+                });
+                *turn_count = turn_count.saturating_add(1);
+            }
+        } else if (step_update.source == 3 || step_update.source == 0)
+            && (step_update.target == 1 || step_update.target == 0)
+            && step_update.state != 4
+            && !step_update.text.is_empty()
+        {
+            history.push(ConversationMessage {
+                role: MessageRole::Model,
+                content: step_update.text.clone(),
+            });
+            *last_response_text = Some(step_update.text.clone());
+        }
+    }
+}
+
 fn parse_init_response(
     init_resp: &proto::localharness::OutputEvent,
     config: &AgentConfig,
 ) -> InitialHarnessState {
     let mut cascade_id = None;
+    let mut root_trajectory_id = None;
     let mut usage = UsageMetadata::default();
     let mut sandbox_status = None;
     let mut history = Vec::new();
     let mut last_response_text = None;
+    let mut restored_structured_output = None;
     let mut compaction_indices = Vec::new();
     let mut turn_count = 0u32;
 
@@ -156,35 +239,15 @@ fn parse_init_response(
                 },
             });
         }
-        for step_update in &resp.history {
-            if step_update.compaction.is_some()
-                && !compaction_indices.contains(&step_update.step_index)
-            {
-                compaction_indices.push(step_update.step_index);
-            }
-            if step_update.source == 2 {
-                let text = if step_update.request_text.is_empty() {
-                    step_update.text.clone()
-                } else {
-                    step_update.request_text.clone()
-                };
-                if !text.is_empty() {
-                    history.push(ConversationMessage {
-                        role: MessageRole::User,
-                        content: text,
-                    });
-                    turn_count = turn_count.saturating_add(1);
-                }
-            } else if (step_update.source == 3 || step_update.source == 0)
-                && !step_update.text.is_empty()
-            {
-                history.push(ConversationMessage {
-                    role: MessageRole::Model,
-                    content: step_update.text.clone(),
-                });
-                last_response_text = Some(step_update.text.clone());
-            }
-        }
+        apply_resumed_history_steps(
+            &resp.history,
+            &mut root_trajectory_id,
+            &mut compaction_indices,
+            &mut restored_structured_output,
+            &mut history,
+            &mut last_response_text,
+            &mut turn_count,
+        );
     }
 
     if history.is_empty() && !config.initial_history.is_empty() {
@@ -213,33 +276,14 @@ fn parse_init_response(
 
     InitialHarnessState {
         cascade_id,
+        root_trajectory_id,
         usage,
         sandbox_status,
         history,
         last_response_text,
+        restored_structured_output,
         compaction_indices,
         turn_count,
-    }
-}
-
-pub(super) fn remove_persisted_conversation_files(save_dir: &std::path::Path, cascade_id: &str) {
-    if cascade_id.is_empty() {
-        return;
-    }
-    for candidate in [
-        save_dir.join(format!("{cascade_id}.db")),
-        save_dir.join(format!("traj-{cascade_id}")),
-        save_dir.join(cascade_id),
-    ] {
-        if candidate.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(&candidate) {
-                tracing::debug!(path = %candidate.display(), error = %e, "Failed removing persisted conversation dir");
-            }
-        } else if candidate.is_file()
-            && let Err(e) = std::fs::remove_file(&candidate)
-        {
-            tracing::debug!(path = %candidate.display(), error = %e, "Failed removing persisted conversation file");
-        }
     }
 }
 
@@ -290,10 +334,15 @@ struct SessionReaderContext {
     turn_activity: Arc<AtomicBool>,
     finish_on_tools: Arc<std::collections::HashSet<String>>,
     finished_by_tool: Arc<AtomicBool>,
+    emitted_builtin_tool_steps: Arc<Mutex<std::collections::HashSet<(u32, String)>>>,
+    answered_question_steps: Arc<Mutex<std::collections::HashSet<(String, u32)>>>,
     compaction_indices: Arc<Mutex<Vec<u32>>>,
+    root_trajectory_id: Arc<Mutex<Option<String>>>,
     event_tx: mpsc::Sender<proto::localharness::InputEvent>,
     turn_count: Arc<AtomicU32>,
+    turn_epoch: Arc<AtomicU64>,
     total_usage: Arc<Mutex<crate::types::UsageMetadata>>,
+    turn_start_usage: Arc<Mutex<crate::types::UsageMetadata>>,
     last_turn_usage: Arc<Mutex<crate::types::UsageMetadata>>,
     is_idle: Arc<AtomicBool>,
     idle_notify: Arc<Notify>,
@@ -311,10 +360,15 @@ impl SessionReaderContext {
             turn_activity: Arc::clone(&session.turn_activity),
             finish_on_tools: Arc::clone(&session.finish_on_tools),
             finished_by_tool: Arc::clone(&session.finished_by_tool),
+            emitted_builtin_tool_steps: Arc::clone(&session.emitted_builtin_tool_steps),
+            answered_question_steps: Arc::clone(&session.answered_question_steps),
             compaction_indices: Arc::clone(&session.compaction_indices),
+            root_trajectory_id: Arc::clone(&session.root_trajectory_id),
             event_tx: session.event_tx.clone(),
             turn_count: Arc::clone(&session.turn_count),
+            turn_epoch: Arc::clone(&session.turn_epoch),
             total_usage: Arc::clone(&session.total_usage),
+            turn_start_usage: Arc::clone(&session.turn_start_usage),
             last_turn_usage: Arc::clone(&session.last_turn_usage),
             is_idle: Arc::clone(&session.is_idle),
             idle_notify: Arc::clone(&session.idle_notify),
@@ -394,6 +448,10 @@ async fn dispatch_output_event(
                 produced_output: &ctx.produced_output,
                 turn_activity: &ctx.turn_activity,
                 compaction_indices: &ctx.compaction_indices,
+                root_trajectory_id: &ctx.root_trajectory_id,
+                event_tx: Some(&ctx.event_tx),
+                emitted_builtin_tool_steps: Some(&ctx.emitted_builtin_tool_steps),
+                answered_question_steps: Some(&ctx.answered_question_steps),
             };
             handle_step_update(agent_id, *step_update, &step_ctx).await;
         }
@@ -404,6 +462,9 @@ async fn dispatch_output_event(
                 turn_activity: Arc::clone(&ctx.turn_activity),
                 finish_on_tools: Arc::clone(&ctx.finish_on_tools),
                 finished_by_tool: Arc::clone(&ctx.finished_by_tool),
+                root_trajectory_id: Arc::clone(&ctx.root_trajectory_id),
+                turn_epoch: Arc::clone(&ctx.turn_epoch),
+                is_idle: Arc::clone(&ctx.is_idle),
             };
             ctx.runtime.spawn(async move {
                 handle_tool_call(agent_id, tool_call, &tool_ctx).await;
@@ -426,6 +487,7 @@ async fn dispatch_output_event(
             handle_usage_update(
                 usage,
                 &ctx.total_usage,
+                &ctx.turn_start_usage,
                 &ctx.last_turn_usage,
                 &ctx.active_writer,
             )
@@ -443,6 +505,7 @@ async fn dispatch_output_event(
                 finished_by_tool: &ctx.finished_by_tool,
                 history: &ctx.history,
                 last_response_text: &ctx.last_response_text,
+                root_trajectory_id: &ctx.root_trajectory_id,
             };
             handle_trajectory_state_update(state_update, &traj_ctx).await;
         }
@@ -450,11 +513,6 @@ async fn dispatch_output_event(
     }
 }
 
-/// Clean up session state after the harness WebSocket reader loop terminates.
-///
-/// Marks the session disconnected and, if a turn was still active, surfaces a
-/// disconnect error to its writer so the consumer observes a failure rather
-/// than a misleading empty `Ok` response.
 async fn handle_ws_reader_exit(
     connected: &Arc<AtomicBool>,
     is_idle: &Arc<AtomicBool>,
@@ -465,18 +523,15 @@ async fn handle_ws_reader_exit(
     is_idle.store(true, Ordering::SeqCst);
     idle_notify.notify_waiters();
     let mut writer_guard = active_writer.lock().await;
-    if let Some(writer) = writer_guard.take() {
-        // The socket closed while a turn was still active. Report it as an
-        // error so the consumer sees a failure rather than an empty `Ok`.
-        if let Err(e) = writer
+    if let Some(writer) = writer_guard.take()
+        && let Err(e) = writer
             .send_error(crate::streaming::StreamError::new(
                 "Harness WebSocket closed before the turn completed; \
                  the agent session has terminated",
             ))
             .await
-        {
-            tracing::debug!(error = %e, "Failed to send disconnect error to active writer");
-        }
+    {
+        tracing::debug!(error = %e, "Failed to send disconnect error to active writer");
     }
 }
 
@@ -520,5 +575,15 @@ mod tests {
                 .contains("Harness WebSocket closed before the turn completed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_conversation_id_rejects_traversal_and_empty() {
+        assert!(validate_conversation_id("eb92a4f4_ok-123").is_ok());
+        assert!(validate_conversation_id("").is_err());
+        assert!(validate_conversation_id("../etc").is_err());
+        assert!(validate_conversation_id("a/b").is_err());
+        assert!(validate_conversation_id("a\\b").is_err());
+        assert!(validate_conversation_id(&"x".repeat(129)).is_err());
     }
 }

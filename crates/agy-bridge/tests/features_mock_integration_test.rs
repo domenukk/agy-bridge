@@ -89,6 +89,7 @@ for line in sys.stdin:
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::AllowAll])
@@ -176,6 +177,7 @@ for line in sys.stdin:
                 api_key: Some("test-key".into()),
                 base_url: Some(gemini.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::AllowAll])
@@ -232,6 +234,7 @@ fn capabilities_custom_tools_only_works() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::AllowAll])
@@ -263,6 +266,7 @@ fn capabilities_read_only_agent() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::read_only())
             .policies([PolicyRule::AllowAll])
@@ -326,6 +330,7 @@ fn combined_tools_hooks_policies() {
                 api_key: Some("test-key".into()),
                 base_url: Some(server.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([
@@ -411,6 +416,7 @@ for line in sys.stdin:
                 api_key: Some("test-key".into()),
                 base_url: Some(gemini.base_url()),
                 models: agy_bridge::config::ModelConfig::default(),
+                ..Default::default()
             })
             .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
             .policies([PolicyRule::AllowAll])

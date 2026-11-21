@@ -5,7 +5,7 @@ use std::{sync::atomic::AtomicBool, time::Duration};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::types::{Step, UsageMetadata};
+use crate::types::{Step, StopReason, UsageMetadata};
 
 /// The result of draining a chat response via [`super::ChatResponseHandle::text()`].
 ///
@@ -39,6 +39,7 @@ pub struct ChatResult {
     pub(super) text: String,
     pub(super) usage: Option<UsageMetadata>,
     pub(super) structured_output: Option<serde_json::Value>,
+    pub(super) stop_reason: StopReason,
 }
 
 impl ChatResult {
@@ -61,10 +62,16 @@ impl ChatResult {
     }
 
     /// Structured output (JSON), if the agent was configured with a
-    /// `response_schema` and the model returned valid JSON.
+    /// `response_schema` and the model returned valid JSON without turn errors.
     #[must_use]
     pub fn structured_output(&self) -> Option<&serde_json::Value> {
         self.structured_output.as_ref()
+    }
+
+    /// Trajectory stop reason reported for this turn (`StopReason::Unspecified` on normal completion).
+    #[must_use]
+    pub const fn stop_reason(&self) -> StopReason {
+        self.stop_reason
     }
 }
 
@@ -131,6 +138,10 @@ pub struct StreamError {
     /// fallback for errors that carry no structured code.
     #[serde(default)]
     pub http_code: u16,
+    /// Canonical `google.rpc.Code` string reported on `TrajectoryStateUpdate.error_code`
+    /// (e.g. `"RESOURCE_EXHAUSTED"`, `"UNAVAILABLE"`, `"CANCELLED"`), if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 impl StreamError {
@@ -140,6 +151,7 @@ impl StreamError {
         Self {
             message: message.into(),
             http_code: crate::error::HTTP_CODE_UNKNOWN,
+            error_code: None,
         }
     }
 
@@ -149,6 +161,32 @@ impl StreamError {
         Self {
             message: message.into(),
             http_code,
+            error_code: None,
+        }
+    }
+
+    /// Create a stream error carrying a canonical `google.rpc.Code` string.
+    #[must_use]
+    pub fn with_error_code(message: impl Into<String>, error_code: impl Into<String>) -> Self {
+        let code = error_code.into();
+        Self {
+            message: message.into(),
+            http_code: crate::error::HTTP_CODE_UNKNOWN,
+            error_code: (!code.is_empty()).then_some(code),
+        }
+    }
+
+    /// Create a stream error carrying optional HTTP and `google.rpc.Code` metadata.
+    #[must_use]
+    pub fn with_codes(
+        message: impl Into<String>,
+        http_code: u16,
+        error_code: Option<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            http_code,
+            error_code: error_code.filter(|c| !c.is_empty()),
         }
     }
 }
@@ -206,6 +244,12 @@ pub struct ChatResponseSharedState {
     pub usage: Option<UsageMetadata>,
     /// Structured output, populated by the writer after the stream completes.
     pub structured_output: Option<serde_json::Value>,
+    /// Trajectory stop reason reported when the turn finished.
+    pub stop_reason: StopReason,
+    /// Set when the turn terminated with an unrecovered error; withholds `structured_output`.
+    pub turn_failed: bool,
+    /// First terminal stream error observed for this turn, if any.
+    pub last_stream_error: Option<StreamError>,
 }
 
 /// Tracks which streaming "views" a consumer has subscribed to.

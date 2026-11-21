@@ -107,11 +107,11 @@ pub struct PreToolArgs {
     pub trajectory_id: String,
     #[serde(
         alias = "step_index",
-        deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+        deserialize_with = "crate::proto::serde_helpers::deserialize_u32",
         skip_serializing_if = "crate::proto::serde_helpers::is_default",
         default
     )]
-    pub step_index: i32,
+    pub step_index: u32,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -138,11 +138,11 @@ pub struct PostToolArgs {
     pub trajectory_id: String,
     #[serde(
         alias = "step_index",
-        deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+        deserialize_with = "crate::proto::serde_helpers::deserialize_u32",
         skip_serializing_if = "crate::proto::serde_helpers::is_default",
         default
     )]
-    pub step_index: i32,
+    pub step_index: u32,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -171,11 +171,11 @@ pub struct OnToolErrorArgs {
     pub trajectory_id: String,
     #[serde(
         alias = "step_index",
-        deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+        deserialize_with = "crate::proto::serde_helpers::deserialize_u32",
         skip_serializing_if = "crate::proto::serde_helpers::is_default",
         default
     )]
-    pub step_index: i32,
+    pub step_index: u32,
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -216,11 +216,11 @@ pub struct OnCompactionArgs {
     pub trajectory_id: String,
     #[serde(
         alias = "step_index",
-        deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+        deserialize_with = "crate::proto::serde_helpers::deserialize_u32",
         skip_serializing_if = "crate::proto::serde_helpers::is_default",
         default
     )]
-    pub step_index: i32,
+    pub step_index: u32,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub summary: String,
 }
@@ -248,10 +248,11 @@ pub struct StopArgs {
     pub continuation_count: i32,
     #[serde(
         alias = "stop_reason",
-        skip_serializing_if = "String::is_empty",
+        with = "crate::proto::serde_helpers::ProtoEnumField::<super::trajectory_state_update::StopReason>",
+        skip_serializing_if = "crate::proto::serde_helpers::is_default",
         default
     )]
-    pub stop_reason: String,
+    pub stop_reason: i32,
     #[serde(
         alias = "error_message",
         skip_serializing_if = "String::is_empty",
@@ -263,13 +264,24 @@ pub struct StopArgs {
 #[serde(rename_all = "camelCase", default)]
 pub struct StopResult {
     #[serde(
-        deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+        with = "crate::proto::serde_helpers::ProtoEnumField::<stop_result::Decision>",
         skip_serializing_if = "crate::proto::serde_helpers::is_default",
         default
     )]
     pub decision: i32,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub reason: String,
+}
+/// Nested message and enum types in `StopResult`.
+pub mod stop_result {
+    crate::proto::serde_helpers::define_proto_enum! {
+        pub enum Decision {
+            #[default]
+            Unspecified = 0 => "DECISION_UNSPECIFIED",
+            AllowStop = 1 => "ALLOW_STOP",
+            Continue = 2 => "CONTINUE",
+        }
+    }
 }
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -297,12 +309,6 @@ pub struct PreToolResult {
     pub decision: i32,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub reason: String,
-    #[serde(
-        alias = "modified_arguments_json",
-        skip_serializing_if = "String::is_empty",
-        default
-    )]
-    pub modified_arguments_json: String,
     #[serde(
         alias = "modified_args",
         skip_serializing_if = "Option::is_none",
@@ -513,8 +519,13 @@ pub mod policy_config {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AutoPolicyConfig {
+    #[serde(
+        skip_serializing_if = "crate::proto::serde_helpers::is_default",
+        default
+    )]
+    pub enabled: bool,
     #[serde(skip_serializing_if = "String::is_empty", default)]
-    pub prompt: String,
+    pub model: String,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]

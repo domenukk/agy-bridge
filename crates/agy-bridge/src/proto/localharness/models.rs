@@ -61,6 +61,12 @@ pub struct VertexEndpoint {
     #[serde(alias = "api_key", skip_serializing_if = "String::is_empty", default)]
     pub api_key: String,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GemmaEndpoint {
+    #[serde(alias = "base_url", skip_serializing_if = "String::is_empty", default)]
+    pub base_url: String,
+}
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelConfig {
@@ -84,6 +90,8 @@ pub mod model_config {
         GeminiApi(super::GeminiApiEndpoint),
         #[serde(rename = "vertexEndpoint", alias = "vertex_endpoint")]
         Vertex(super::VertexEndpoint),
+        #[serde(rename = "gemmaEndpoint", alias = "gemma_endpoint")]
+        Gemma(super::GemmaEndpoint),
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -372,6 +380,12 @@ pub struct SubagentsConfig {
         default
     )]
     pub disable_define_subagent_tool: bool,
+    #[serde(
+        alias = "disable_manage_subagents_tool",
+        skip_serializing_if = "crate::proto::serde_helpers::is_default",
+        default
+    )]
+    pub disable_manage_subagents_tool: bool,
 }
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,

@@ -80,11 +80,13 @@ mod tests;
 pub(crate) use bridge_state::AgentId;
 pub(crate) use bridge_state::{AgentBridgeState, bridge_state, initializing_hook_runners};
 pub use bridge_state::{
-    CapturedToolError, CapturedToolOutput, agent_hooks, agent_policies, agent_policy_handler,
-    agent_registry, agent_tool_state, check_tool_execution_allowed, clear_last_tool_error,
+    CapturedToolError, CapturedToolOutput, agent_hooks, agent_output_floor, agent_policies,
+    agent_policy_handler, agent_registry, agent_surrogate_vault, agent_tool_state,
+    check_tool_execution_allowed, clear_last_tool_error, clear_tool_error_for_call,
     get_agent_conversation_id, next_agent_id, record_last_tool_error, record_last_tool_output,
-    remove_agent_bridge_state, set_agent_conversation_id, take_last_tool_error,
-    take_last_tool_output,
+    record_tool_error_for_call, record_tool_output_for_call, remove_agent_bridge_state,
+    set_agent_conversation_id, take_last_tool_error, take_last_tool_output,
+    take_tool_error_for_call, take_tool_output_for_call,
 };
 pub use config::{BackendLogLevel, RuntimeConfig};
 #[cfg(feature = "python")]
@@ -120,114 +122,146 @@ impl UnconfiguredRuntime {
 }
 
 impl crate::agent::Runtime for UnconfiguredRuntime {
-    async fn create_agent(
+    fn create_agent(
         &self,
         _agent_id: u64,
         _config: crate::config::AgentConfig,
-    ) -> Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<
+        Output = Result<(crate::agent::AgentId, Vec<crate::tools::AvailableTool>), Error>,
+    > + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn chat(
+    fn chat(
         &self,
         _agent_id: crate::agent::AgentId,
         _content: &crate::content::Content,
-    ) -> Result<crate::streaming::ChatResponseHandle, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<crate::streaming::ChatResponseHandle, Error>> + Send
+    {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn shutdown_agent(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
+    fn shutdown_agent(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn cancel(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
+    fn cancel(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn wait_for_idle(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
+    fn wait_for_idle(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn send(
+    fn send(
         &self,
         _agent_id: crate::agent::AgentId,
         _content: &crate::content::Content,
-    ) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn signal_idle(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
+    fn signal_idle(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn wait_for_wakeup(
+    fn wait_for_wakeup(
         &self,
         _agent_id: crate::agent::AgentId,
         _timeout: Duration,
-    ) -> Result<bool, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn history(
+    fn history(
         &self,
         _agent_id: crate::agent::AgentId,
-    ) -> Result<Vec<crate::types::ConversationMessage>, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<Vec<crate::types::ConversationMessage>, Error>> + Send
+    {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn turn_count(&self, _agent_id: crate::agent::AgentId) -> Result<u32, Error> {
-        Err(Error::RuntimeNotStarted)
-    }
-
-    async fn total_usage(
+    fn turn_count(
         &self,
         _agent_id: crate::agent::AgentId,
-    ) -> Result<crate::types::UsageMetadata, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<u32, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn last_turn_usage(
+    fn total_usage(
         &self,
         _agent_id: crate::agent::AgentId,
-    ) -> Result<crate::types::UsageMetadata, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<crate::types::UsageMetadata, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn clear_history(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
-    }
-
-    async fn last_response(
+    fn last_turn_usage(
         &self,
         _agent_id: crate::agent::AgentId,
-    ) -> Result<Option<String>, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<crate::types::UsageMetadata, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn compaction_indices(
+    fn clear_history(
         &self,
         _agent_id: crate::agent::AgentId,
-    ) -> Result<Vec<u32>, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 
-    async fn delete(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
-    }
-
-    async fn disconnect(&self, _agent_id: crate::agent::AgentId) -> Result<(), Error> {
-        Err(Error::RuntimeNotStarted)
-    }
-
-    async fn is_idle(&self, _agent_id: crate::agent::AgentId) -> Result<bool, Error> {
-        Err(Error::RuntimeNotStarted)
-    }
-
-    async fn sandbox_status(
+    fn last_response(
         &self,
         _agent_id: crate::agent::AgentId,
-    ) -> Result<Option<crate::types::SandboxStatus>, Error> {
-        Err(Error::RuntimeNotStarted)
+    ) -> impl std::future::Future<Output = Result<Option<String>, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
+    }
+
+    fn compaction_indices(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
+    }
+
+    fn delete(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
+    }
+
+    fn disconnect(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
+    }
+
+    fn is_idle(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+        std::future::ready(Err(Error::RuntimeNotStarted))
+    }
+
+    fn sandbox_status(
+        &self,
+        _agent_id: crate::agent::AgentId,
+    ) -> impl std::future::Future<Output = Result<Option<crate::types::SandboxStatus>, Error>> + Send
+    {
+        std::future::ready(Err(Error::RuntimeNotStarted))
     }
 }
 
@@ -258,7 +292,7 @@ pub(crate) enum PyCommand {
     /// Send a chat message to an agent.
     Chat {
         agent_id: AgentId,
-        prompt: String,
+        prompt: py_scripts::PyPromptPayload,
         reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
     },
     /// Shut down a specific agent.
@@ -279,7 +313,7 @@ pub(crate) enum PyCommand {
     /// Send a message without waiting for completion (fire-and-forget).
     Send {
         agent_id: AgentId,
-        prompt: String,
+        prompt: py_scripts::PyPromptPayload,
         reply: oneshot::Sender<Result<(), Error>>,
     },
     /// Signal that the agent is idle.
@@ -407,6 +441,7 @@ impl PythonRuntime {
     /// Returns `Error::BackendError` if the thread fails to spawn or
     /// Python initialization fails.
     pub fn new(config: RuntimeConfig) -> Result<Self, Error> {
+        config.validate()?;
         ensure_python_initialized()?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(config.channel_capacity);

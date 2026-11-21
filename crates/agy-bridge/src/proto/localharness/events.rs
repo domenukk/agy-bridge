@@ -132,11 +132,10 @@ pub struct TrajectoryStateUpdate {
     pub error: String,
     #[serde(
         alias = "error_code",
-        deserialize_with = "crate::proto::serde_helpers::deserialize_u32",
-        skip_serializing_if = "crate::proto::serde_helpers::is_default",
+        skip_serializing_if = "String::is_empty",
         default
     )]
-    pub error_code: u32,
+    pub error_code: String,
     #[serde(
         alias = "stop_reason",
         with = "crate::proto::serde_helpers::ProtoEnumField::<trajectory_state_update::StopReason>",

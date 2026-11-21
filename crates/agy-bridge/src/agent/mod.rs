@@ -1,11 +1,11 @@
 //! Agent lifecycle management for the Antigravity SDK bridge.
 //!
-//! Provides [`AgentHandle`](crate::agent::AgentHandle) which wraps the lifecycle of a single SDK agent:
+//! Provides [`AgentHandle`] which wraps the lifecycle of a single SDK agent:
 //! creation, chatting, conversation tracking, and shutdown with RAII warnings.
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 pub use crate::DefaultRuntime;
@@ -19,94 +19,13 @@ use crate::{
 
 #[cfg(test)]
 pub(crate) mod mock;
+mod validation;
+
+pub(crate) use validation::{floored_registry, reconcile_workspace_only_policies};
+pub use validation::{validate_create_config, validate_tool_config};
 
 /// Unique identifier for an agent within the bridge.
 pub type AgentId = u64;
-
-/// Freeze `registry` with its output floor raised to at least `floor`.
-///
-/// Never lowers a stricter floor the caller already set on the registry.
-pub(crate) fn floored_registry(
-    mut registry: crate::tools::ToolRegistry,
-    floor: crate::tools::OutputSanitization,
-) -> Arc<crate::tools::ToolRegistry> {
-    let effective = registry.output_floor().at_least(floor);
-    registry.set_output_floor(effective);
-    Arc::new(registry)
-}
-
-/// Validate [`AgentConfig`] capabilities, response schema, and MCP server specs
-/// before creating an agent session.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidConfig`] if `capabilities`, `response_schema`, or
-/// any `mcp_servers` entry fails structural validation.
-pub fn validate_create_config(config: &AgentConfig) -> Result<(), Error> {
-    if let Some(ref caps) = config.capabilities {
-        caps.validate().map_err(|msg| Error::InvalidConfig {
-            message: msg.to_string(),
-        })?;
-    }
-    if let Some(ref schema) = config.response_schema {
-        schema.validate().map_err(|msg| Error::InvalidConfig {
-            message: msg.to_string(),
-        })?;
-    }
-    for mcp in &config.mcp_servers {
-        mcp.validate()
-            .map_err(|message| Error::InvalidConfig { message })?;
-    }
-    Ok(())
-}
-
-/// Reject tool configurations that would silently not do what they say.
-///
-/// - every `finish_on_tools` entry must name a registered custom tool;
-/// - the registry's output floor must be at least `tool_output_floor`.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidConfig`] if `finish_on_tools` names an unregistered
-/// tool or the `ToolRegistry` output sanitization floor is weaker than
-/// `config.tool_output_floor`.
-pub fn validate_tool_config(
-    config: &AgentConfig,
-    registry: Option<&crate::tools::ToolRegistry>,
-) -> Result<(), Error> {
-    if let Some(reg) = registry {
-        let floor = reg.output_floor();
-        if floor.at_least(config.tool_output_floor) != floor {
-            return Err(Error::InvalidConfig {
-                message: format!(
-                    "ToolRegistry output floor {floor:?} is weaker than \
-                     AgentConfig.tool_output_floor {:?}; build agents via \
-                     AgyBridge::agent(..).tools(..) or call ToolRegistry::set_output_floor",
-                    config.tool_output_floor
-                ),
-            });
-        }
-    }
-    let unknown: Vec<&str> = config
-        .finish_on_tools
-        .iter()
-        .map(String::as_str)
-        .filter(|name| !registry.is_some_and(|reg| reg.contains(name)))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    let registered: Vec<&str> = match registry {
-        Some(reg) => reg.iter().map(|(name, _)| name).collect(),
-        None => Vec::new(),
-    };
-    Err(Error::InvalidConfig {
-        message: format!(
-            "finish_on_tools names unregistered tools {unknown:?}; registered custom tools: \
-             {registered:?}"
-        ),
-    })
-}
 
 /// Trait abstracting the Python runtime interface.
 ///
@@ -316,6 +235,9 @@ pub struct AgentHandle<R: Runtime + 'static> {
     /// Wrapped in a `Mutex` so `chat()` can take `&self` instead of `&mut self`,
     /// enabling concurrent usage patterns. The lock is brief (pointer swap only).
     last_shared_state: Mutex<Option<Arc<Mutex<ChatResponseSharedState>>>>,
+    /// Monotonically increasing turn epoch used to scope `ChatResponseHandle::cancel()`
+    /// strictly to the turn that created the handle.
+    turn_epoch: Arc<AtomicU64>,
 }
 
 /// RAII guard that removes an agent's entry from the initializing hook-runner
@@ -353,11 +275,17 @@ impl<R: Runtime> AgentHandle<R> {
     /// Python error, or quota exceeded).
     pub async fn new(
         runtime: Arc<R>,
-        config: AgentConfig,
+        mut config: AgentConfig,
         registry: Option<Arc<crate::tools::ToolRegistry>>,
         hook_runner: Option<Arc<crate::hooks::Hooks>>,
         policy_handler: Option<Arc<dyn crate::policies::AskUserHandler>>,
     ) -> Result<Self, Error> {
+        if let Some(ref reg) = registry
+            && config.tools.is_empty()
+        {
+            config.tools = reg.definitions();
+        }
+        reconcile_workspace_only_policies(&mut config);
         validate_tool_config(&config, registry.as_deref())?;
 
         // Allocate the (process-globally-unique) agent ID up front so we can
@@ -429,6 +357,7 @@ impl<R: Runtime> AgentHandle<R> {
             is_shutdown: AtomicBool::new(false),
             available_tools,
             last_shared_state: Mutex::new(None),
+            turn_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -447,9 +376,23 @@ impl<R: Runtime> AgentHandle<R> {
             policies: policies_set,
             policy_handler: policy_handler.map(Arc::clone),
             tool_state: llm_tool::SharedState::new(),
+            surrogate_vault: llm_tool::SurrogateVault::new(),
+            tool_output_floor: config.tool_output_floor,
             conversation_id: Arc::clone(&conversation_id),
-            last_tool_error: std::sync::Mutex::new(None),
-            last_tool_output: std::sync::Mutex::new(None),
+            tool_errors: std::sync::Mutex::new(
+                crate::runtime::bridge_state::TrackedToolMap::default(),
+            ),
+            tool_outputs: std::sync::Mutex::new(
+                crate::runtime::bridge_state::TrackedToolMap::default(),
+            ),
+            confirmed_tool_calls: std::sync::Mutex::new(Vec::new()),
+            restored_structured_output: std::sync::Mutex::new(None),
+            #[cfg(feature = "native")]
+            pre_tool_evaluated_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(feature = "native")]
+            session_start_fired: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "native")]
+            session_end_fired: std::sync::atomic::AtomicBool::new(false),
         };
         let bridge_insert_failed = match crate::runtime::bridge_state().write() {
             Ok(mut map) => {
@@ -501,7 +444,22 @@ impl<R: Runtime> AgentHandle<R> {
         if !self.is_started() {
             return Err(Error::AgentNotStarted);
         }
-        let handle = self.runtime.chat(self.id, content).await?;
+        let captured_epoch = self.turn_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut handle = self.runtime.chat(self.id, content).await?;
+        let rt_clone = Arc::clone(&self.runtime);
+        let epoch_ref = Arc::clone(&self.turn_epoch);
+        let alive_ref = handle.writer_alive_weak();
+        let agent_id = self.id;
+        handle.attach_canceller(Box::new(move || {
+            Box::pin(async move {
+                if alive_ref.strong_count() == 0
+                    || epoch_ref.load(Ordering::Acquire) != captured_epoch
+                {
+                    return Ok(());
+                }
+                rt_clone.cancel(agent_id).await
+            })
+        }));
         match self.last_shared_state.lock() {
             Ok(mut guard) => {
                 *guard = Some(Arc::clone(&handle.shared_state));
@@ -674,7 +632,13 @@ impl<R: Runtime> AgentHandle<R> {
     ///
     /// Returns [`Error`] if the operation fails.
     pub async fn clear_history(&self) -> Result<(), Error> {
-        self.runtime.clear_history(self.id).await
+        self.runtime.clear_history(self.id).await?;
+        crate::runtime::bridge_state::set_restored_structured_output(self.id, None);
+        match self.last_shared_state.lock() {
+            Ok(mut guard) => *guard = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+        Ok(())
     }
 
     /// Return the OS command sandbox status reported by the harness, if any.
@@ -776,7 +740,9 @@ impl<R: Runtime> AgentHandle<R> {
             );
             e.into_inner()
         });
-        let state_arc = guard.as_ref()?;
+        let Some(state_arc) = guard.as_ref() else {
+            return crate::runtime::bridge_state::agent_restored_structured_output(self.id);
+        };
         let state = state_arc.lock().unwrap_or_else(|e| {
             tracing::warn!(
                 agent_id = self.id,
@@ -785,7 +751,37 @@ impl<R: Runtime> AgentHandle<R> {
             );
             e.into_inner()
         });
-        state.structured_output.clone()
+        if state.turn_failed {
+            None
+        } else {
+            state.structured_output.clone()
+        }
+    }
+
+    /// Return the [`StopReason`](crate::types::StopReason) from the most recent completed turn
+    /// (`StopReason::Unspecified` before the first turn or after [`clear_history`](Self::clear_history)).
+    #[must_use]
+    pub fn last_stop_reason(&self) -> crate::types::StopReason {
+        let guard = self.last_shared_state.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                agent_id = self.id,
+                error = %e,
+                "last_shared_state mutex was poisoned, recovering"
+            );
+            e.into_inner()
+        });
+        let Some(state_arc) = guard.as_ref() else {
+            return crate::types::StopReason::Unspecified;
+        };
+        let state = state_arc.lock().unwrap_or_else(|e| {
+            tracing::warn!(
+                agent_id = self.id,
+                error = %e,
+                "ChatResponseSharedState mutex was poisoned, recovering"
+            );
+            e.into_inner()
+        });
+        state.stop_reason
     }
 
     /// Return the structured output from the last chat response deserialized into `T`.
@@ -924,9 +920,14 @@ impl<R: Runtime> AgentHandle<R> {
         registry: impl Into<Option<crate::tools::ToolRegistry>>,
     ) -> Result<Self, Error> {
         let opt_registry = registry.into();
-        if let Some(disp) = &opt_registry
-            && config.tools.is_empty()
-        {
+        if let Some(ref disp) = opt_registry {
+            if !config.tools.is_empty() {
+                return Err(Error::InvalidConfig {
+                    message: "config.tools is non-empty and a ToolRegistry was also provided; \
+                              pass tools via the registry or via config.tools, not both"
+                        .to_string(),
+                });
+            }
             config.tools = disp.definitions();
         }
         let arc_registry =

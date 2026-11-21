@@ -207,9 +207,51 @@ pub struct AudioContent {
         default
     )]
     pub data_or_uri: Option<audio_content::DataOrUri>,
+    #[serde(
+        alias = "processing_oneof",
+        flatten,
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub processing_oneof: Option<audio_content::ProcessingOneof>,
 }
 /// Nested message and enum types in `AudioContent`.
 pub mod audio_content {
+    #[derive(
+        Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(rename_all = "camelCase", default)]
+    pub struct StaticMediaProcessing {
+        #[serde(
+            alias = "start_offset",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        pub start_offset: Option<crate::proto::google::protobuf::Duration>,
+        #[serde(alias = "end_offset", skip_serializing_if = "Option::is_none", default)]
+        pub end_offset: Option<crate::proto::google::protobuf::Duration>,
+    }
+    #[derive(
+        Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(rename_all = "camelCase", default)]
+    pub struct MediaProcessing {
+        #[serde(
+            rename = "type",
+            flatten,
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        pub r#type: Option<media_processing::Type>,
+    }
+    /// Nested message and enum types in `MediaProcessing`.
+    pub mod media_processing {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub enum Type {
+            Static(super::StaticMediaProcessing),
+        }
+    }
     crate::proto::serde_helpers::define_proto_enum! {
         pub enum MimeType {
             #[default]
@@ -231,11 +273,28 @@ pub mod audio_content {
             Webm = 15 => "TYPE_WEBM",
         }
     }
+    crate::proto::serde_helpers::define_proto_enum! {
+        pub enum Processing {
+            #[default]
+            Unspecified = 0 => "PROCESSING_UNSPECIFIED",
+            Static = 1 => "STATIC",
+        }
+    }
     #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub enum DataOrUri {
         Data(#[serde(with = "crate::proto::serde_helpers::base64_bytes")] Vec<u8>),
         Uri(String),
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum ProcessingOneof {
+        #[serde(alias = "processing_type")]
+        ProcessingType(
+            #[serde(with = "crate::proto::serde_helpers::ProtoEnumField::<Processing>")] i32,
+        ),
+        #[serde(alias = "processing_config")]
+        ProcessingConfig(MediaProcessing),
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -255,12 +314,25 @@ pub struct DocumentContent {
     )]
     pub mime_type_string: String,
     #[serde(
+        with = "crate::proto::serde_helpers::ProtoEnumField::<MediaResolution>",
+        skip_serializing_if = "crate::proto::serde_helpers::is_default",
+        default
+    )]
+    pub resolution: i32,
+    #[serde(
         alias = "data_or_uri",
         flatten,
         skip_serializing_if = "Option::is_none",
         default
     )]
     pub data_or_uri: Option<document_content::DataOrUri>,
+    #[serde(
+        alias = "processing_oneof",
+        flatten,
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub processing_oneof: Option<document_content::ProcessingOneof>,
 }
 /// Nested message and enum types in `DocumentContent`.
 pub mod document_content {
@@ -270,6 +342,136 @@ pub mod document_content {
             Unspecified = 0 => "TYPE_UNSPECIFIED",
             Pdf = 1 => "TYPE_PDF",
             Csv = 2 => "TYPE_CSV",
+            Pptx = 3 => "TYPE_PPTX",
+            Ppt = 4 => "TYPE_PPT",
+            Odp = 5 => "TYPE_ODP",
+            Docx = 6 => "TYPE_DOCX",
+            Doc = 7 => "TYPE_DOC",
+            Dotx = 8 => "TYPE_DOTX",
+            Odt = 9 => "TYPE_ODT",
+            Xlsx = 10 => "TYPE_XLSX",
+            Xls = 11 => "TYPE_XLS",
+            Ods = 12 => "TYPE_ODS",
+        }
+    }
+    crate::proto::serde_helpers::define_proto_enum! {
+        pub enum Processing {
+            #[default]
+            Unspecified = 0 => "PROCESSING_UNSPECIFIED",
+            Static = 1 => "STATIC",
+        }
+    }
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", default)]
+    pub struct PageProcessingOptions {
+        #[serde(
+            alias = "start_page",
+            deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+            skip_serializing_if = "crate::proto::serde_helpers::is_default",
+            default
+        )]
+        pub start_page: i32,
+        #[serde(
+            alias = "end_page",
+            deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+            skip_serializing_if = "crate::proto::serde_helpers::is_default",
+            default
+        )]
+        pub end_page: i32,
+        #[serde(
+            alias = "content_layers",
+            with = "crate::proto::serde_helpers::ProtoEnumVec::<page_processing_options::ContentLayer>",
+            skip_serializing_if = "Vec::is_empty",
+            default
+        )]
+        pub content_layers: Vec<i32>,
+    }
+    /// Nested message and enum types in `PageProcessingOptions`.
+    pub mod page_processing_options {
+        crate::proto::serde_helpers::define_proto_enum! {
+            pub enum ContentLayer {
+                #[default]
+                Unspecified = 0 => "CONTENT_LAYER_UNSPECIFIED",
+                PageImage = 1 => "PAGE_IMAGE",
+                PageText = 2 => "PAGE_TEXT",
+            }
+        }
+    }
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", default)]
+    pub struct SpreadsheetProcessingOptions {
+        #[serde(
+            alias = "visible_cells",
+            skip_serializing_if = "String::is_empty",
+            default
+        )]
+        pub visible_cells: String,
+        #[serde(
+            alias = "sheet_index",
+            deserialize_with = "crate::proto::serde_helpers::deserialize_i32",
+            skip_serializing_if = "crate::proto::serde_helpers::is_default",
+            default
+        )]
+        pub sheet_index: i32,
+        #[serde(
+            alias = "content_layers",
+            with = "crate::proto::serde_helpers::ProtoEnumVec::<spreadsheet_processing_options::ContentLayer>",
+            skip_serializing_if = "Vec::is_empty",
+            default
+        )]
+        pub content_layers: Vec<i32>,
+    }
+    /// Nested message and enum types in `SpreadsheetProcessingOptions`.
+    pub mod spreadsheet_processing_options {
+        crate::proto::serde_helpers::define_proto_enum! {
+            pub enum ContentLayer {
+                #[default]
+                Unspecified = 0 => "CONTENT_LAYER_UNSPECIFIED",
+                Visual = 1 => "VISUAL",
+                Data = 2 => "DATA",
+                Formulas = 3 => "FORMULAS",
+            }
+        }
+    }
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", default)]
+    pub struct StaticMediaProcessing {
+        #[serde(
+            alias = "format_options",
+            flatten,
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        pub format_options: Option<static_media_processing::FormatOptions>,
+    }
+    /// Nested message and enum types in `StaticMediaProcessing`.
+    pub mod static_media_processing {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub enum FormatOptions {
+            #[serde(alias = "page_options")]
+            PageOptions(super::PageProcessingOptions),
+            #[serde(alias = "spreadsheet_options")]
+            SpreadsheetOptions(super::SpreadsheetProcessingOptions),
+        }
+    }
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", default)]
+    pub struct MediaProcessing {
+        #[serde(
+            rename = "type",
+            flatten,
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        pub r#type: Option<media_processing::Type>,
+    }
+    /// Nested message and enum types in `MediaProcessing`.
+    pub mod media_processing {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub enum Type {
+            Static(super::StaticMediaProcessing),
         }
     }
     #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -277,6 +479,16 @@ pub mod document_content {
     pub enum DataOrUri {
         Data(#[serde(with = "crate::proto::serde_helpers::base64_bytes")] Vec<u8>),
         Uri(String),
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum ProcessingOneof {
+        #[serde(alias = "processing_type")]
+        ProcessingType(
+            #[serde(with = "crate::proto::serde_helpers::ProtoEnumField::<Processing>")] i32,
+        ),
+        #[serde(alias = "processing_config")]
+        ProcessingConfig(MediaProcessing),
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -320,7 +532,7 @@ pub struct VideoContent {
 }
 /// Nested message and enum types in `VideoContent`.
 pub mod video_content {
-    #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase", default)]
     pub struct StaticMediaProcessing {
         #[serde(
@@ -332,13 +544,32 @@ pub mod video_content {
         #[serde(alias = "end_offset", skip_serializing_if = "Option::is_none", default)]
         pub end_offset: Option<crate::proto::google::protobuf::Duration>,
         #[serde(
-            deserialize_with = "crate::proto::serde_helpers::deserialize_f64",
+            with = "crate::proto::serde_helpers::f64_num",
             skip_serializing_if = "crate::proto::serde_helpers::is_default",
             default
         )]
         pub fps: f64,
+        #[serde(
+            alias = "content_layers",
+            with = "crate::proto::serde_helpers::ProtoEnumVec::<static_media_processing::ContentLayer>",
+            skip_serializing_if = "Vec::is_empty",
+            default
+        )]
+        pub content_layers: Vec<i32>,
     }
-    #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    /// Nested message and enum types in `StaticMediaProcessing`.
+    pub mod static_media_processing {
+        crate::proto::serde_helpers::define_proto_enum! {
+            pub enum ContentLayer {
+                #[default]
+                Unspecified = 0 => "CONTENT_LAYER_UNSPECIFIED",
+                Frames = 1 => "FRAMES",
+                Audio = 2 => "AUDIO",
+                Transcript = 3 => "TRANSCRIPT",
+            }
+        }
+    }
+    #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase", default)]
     pub struct MediaProcessing {
         #[serde(
@@ -351,7 +582,7 @@ pub mod video_content {
     }
     /// Nested message and enum types in `MediaProcessing`.
     pub mod media_processing {
-        #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         pub enum Type {
             Static(super::StaticMediaProcessing),
@@ -387,7 +618,7 @@ pub mod video_content {
         Data(#[serde(with = "crate::proto::serde_helpers::base64_bytes")] Vec<u8>),
         Uri(String),
     }
-    #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub enum ProcessingOneof {
         #[serde(alias = "processing_type")]

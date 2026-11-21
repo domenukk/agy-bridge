@@ -6,13 +6,16 @@
 # so `just lint`/`just test` behave the same locally and in CI.
 [project]
 name = "agy-bridge-devtools"
-version = "0.0.0"
+version = "0.16.8"
 description = "Dev-only tooling environment for the agy-bridge repository"
 requires-python = ">=3.11"
 dependencies = [
   # Needed by `cargo test --features python`: the embedded interpreter imports
   # `google.antigravity.*`, and the SDK pulls in `watchfiles` for triggers.
-  "google-antigravity>=0.1.23",
+  # Pinned to match `TARGET_ANTIGRAVITY_SDK_VERSION` in `crates/agy-bridge/build.rs`.
+  "google-antigravity==0.1.24",
+  "protobuf>=7.35",
+  "uvicorn>=0.46",
   "watchfiles",
 ]
 

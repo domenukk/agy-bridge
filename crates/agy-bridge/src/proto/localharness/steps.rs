@@ -305,11 +305,41 @@ pub mod step_update {
 #[serde(rename_all = "camelCase", default)]
 pub struct ActionSkillLookup {
     #[serde(
-        alias = "skill_name",
+        with = "crate::proto::serde_helpers::ProtoEnumField::<action_skill_lookup::Operation>",
+        skip_serializing_if = "crate::proto::serde_helpers::is_default",
+        default
+    )]
+    pub operation: i32,
+    #[serde(
+        alias = "requested_skill_names",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub requested_skill_names: Vec<String>,
+    #[serde(
+        alias = "resolved_skill_names",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub resolved_skill_names: Vec<String>,
+    #[serde(
+        alias = "error_message",
         skip_serializing_if = "String::is_empty",
         default
     )]
-    pub skill_name: String,
+    pub error_message: String,
+}
+/// Nested message and enum types in `ActionSkillLookup`.
+pub mod action_skill_lookup {
+    crate::proto::serde_helpers::define_proto_enum! {
+        pub enum Operation {
+            #[default]
+            Unspecified = 0 => "OPERATION_UNSPECIFIED",
+            ListSkills = 1 => "OPERATION_LIST_SKILLS",
+            LookupSkills = 2 => "OPERATION_LOOKUP_SKILLS",
+            GetSkillResources = 3 => "OPERATION_GET_SKILL_RESOURCES",
+        }
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]

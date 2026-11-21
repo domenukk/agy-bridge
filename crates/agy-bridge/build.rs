@@ -3,19 +3,56 @@
 //! When the `native` feature is enabled:
 //! 1. Stages the test mock harness binary (`mock_localharness`).
 //! 2. Ensures the local proxy runtime binary (`localharness`) is available for the target platform,
-//!    downloading and extracting it from the official Google Antigravity SDK wheel on `PyPI` if not already present.
+//!    downloading, SHA-256 verifying, and extracting it from the official Google Antigravity SDK
+//!    wheel on `PyPI` if not already present.
 
 #[cfg(feature = "native")]
 use std::{
     env,
-    fs::File,
+    fs::OpenOptions,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 use serde as _;
 
-const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.23";
+const TARGET_ANTIGRAVITY_SDK_VERSION: &str = "0.1.24";
+
+#[cfg(feature = "native")]
+const VERSION_STAMP_FILE: &str = "localharness.version";
+#[cfg(feature = "native")]
+const SHA256_STAMP_FILE: &str = "localharness.sha256";
+
+#[cfg(feature = "native")]
+const MAX_PYPI_JSON_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "native")]
+const MAX_WHEEL_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(feature = "native")]
+const MAX_HARNESS_BIN_BYTES: u64 = 512 * 1024 * 1024;
+
+#[cfg(feature = "native")]
+const PINNED_WHEEL_SHA256_MACOS_ARM64: &str =
+    "9c359bfa7b752ad3417da1a455a114dca643d02bdea7281e8de8d0d0f44c9cca";
+#[cfg(feature = "native")]
+const PINNED_WHEEL_SHA256_MACOS_X86_64: &str =
+    "ff368c84cc712b822c87dd2ac99b8fac47716c44ffa39bd1caf823e62f00a18f";
+#[cfg(feature = "native")]
+const PINNED_WHEEL_SHA256_LINUX_AARCH64: &str =
+    "55c95c04b00c417667d37a000931638c23479d0f1fa0fbe6e89abb8c60057cda";
+#[cfg(feature = "native")]
+const PINNED_WHEEL_SHA256_LINUX_X86_64: &str =
+    "678c5c56a4efa8d94b90df808a93b339cf3ead498b01898272d5833c8c9ad13f";
+#[cfg(feature = "native")]
+const PINNED_WHEEL_SHA256_WIN_AMD64: &str =
+    "cc2d2af2cbc260d9a9f6c95e7b844185dad29b44760c1e3884d2cb001f55adb8";
+#[cfg(feature = "native")]
+const PINNED_WHEEL_SHA256_WIN_ARM64: &str =
+    "28837e53cf361fca8c63edee1d3cc0ba22c08eae3dec594d7f332e320fdcc9b7";
+
+#[cfg(feature = "native")]
+const HARNESS_ZIP_ENTRY_UNIX: &str = "google/antigravity/bin/localharness";
+#[cfg(feature = "native")]
+const HARNESS_ZIP_ENTRY_WINDOWS: &str = "google/antigravity/bin/localharness.exe";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
@@ -121,7 +158,6 @@ fn configure_python_dll_search_path() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
 
     let mut target_dirs = vec![out_dir.clone()];
-    // OUT_DIR is target/<profile>/build/<crate>-<hash>/out -> 3 levels up is target/<profile>
     if let Some(profile_dir) = out_dir
         .parent()
         .and_then(|p| p.parent())
@@ -138,8 +174,13 @@ fn configure_python_dll_search_path() {
 
     if let Result::Ok(entries) = std::fs::read_dir(&base_prefix) {
         let dll_files: Vec<std::path::PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
+            .filter_map(|entry_res| match entry_res {
+                Ok(e) => Some(e.path()),
+                Err(err) => {
+                    println!("cargo:warning=Failed reading directory entry in base_prefix: {err}");
+                    None
+                }
+            })
             .filter(|p| {
                 p.is_file()
                     && p.extension()
@@ -182,6 +223,7 @@ fn emit_mock_harness_bin(current_exe: &Path) -> Result<(), Box<dyn std::error::E
         "mock_localharness"
     };
     let mock_bin_path = out_dir.join(mock_bin_name);
+    remove_stale_temp_path(&mock_bin_path)?;
     std::fs::copy(current_exe, &mock_bin_path)?;
     #[cfg(unix)]
     set_executable_permission(&mock_bin_path)?;
@@ -193,23 +235,73 @@ fn emit_mock_harness_bin(current_exe: &Path) -> Result<(), Box<dyn std::error::E
 }
 
 #[cfg(feature = "native")]
-const VERSION_STAMP_FILE: &str = "localharness.version";
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        if let Err(err) = write!(out, "{b:02x}") {
+            unreachable!("formatting hex byte into String cannot fail: {err}");
+        }
+    }
+    out
+}
 
 #[cfg(feature = "native")]
-fn is_cached_binary_valid(out_dir: &Path, bin_path: &Path) -> bool {
-    if !bin_path.is_file() {
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    bytes_to_lower_hex(&digest)
+}
+
+#[cfg(feature = "native")]
+const IO_CHUNK_BYTES: usize = 64 * 1024;
+
+#[cfg(feature = "native")]
+fn sha256_file_hex(path: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() || meta.len() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cached localharness binary must be a non-empty regular file",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; IO_CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(bytes_to_lower_hex(&hasher.finalize()))
+}
+
+#[cfg(feature = "native")]
+fn is_cached_binary_valid(cache_dir: &Path, bin_path: &Path) -> bool {
+    let version_path = cache_dir.join(VERSION_STAMP_FILE);
+    let sha256_path = cache_dir.join(SHA256_STAMP_FILE);
+    let Ok(version_text) = std::fs::read_to_string(&version_path) else {
+        return false;
+    };
+    if version_text.trim() != TARGET_ANTIGRAVITY_SDK_VERSION {
         return false;
     }
-    let version_path = out_dir.join(VERSION_STAMP_FILE);
-    if !version_path.is_file() {
+    let Ok(expected_sha_raw) = std::fs::read_to_string(&sha256_path) else {
+        return false;
+    };
+    let expected_sha = expected_sha_raw.trim();
+    if expected_sha.len() != 64 || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
-    match std::fs::read_to_string(&version_path) {
-        Ok(content) => content.trim() == TARGET_ANTIGRAVITY_SDK_VERSION,
+    match sha256_file_hex(bin_path) {
+        Ok(actual_sha) => actual_sha.eq_ignore_ascii_case(expected_sha),
         Err(err) => {
             println!(
-                "cargo:warning=Failed to read version stamp {}: {err}",
-                version_path.display()
+                "cargo:warning=Cached localharness verification failed at {}: {err}",
+                bin_path.display()
             );
             false
         }
@@ -217,9 +309,27 @@ fn is_cached_binary_valid(out_dir: &Path, bin_path: &Path) -> bool {
 }
 
 #[cfg(feature = "native")]
-fn write_version_stamp(out_dir: &Path) -> io::Result<()> {
-    let version_path = out_dir.join(VERSION_STAMP_FILE);
-    std::fs::write(version_path, TARGET_ANTIGRAVITY_SDK_VERSION)
+fn write_cache_stamps(cache_dir: &Path, binary_sha256: &str) -> io::Result<()> {
+    std::fs::write(
+        cache_dir.join(VERSION_STAMP_FILE),
+        TARGET_ANTIGRAVITY_SDK_VERSION,
+    )?;
+    std::fs::write(cache_dir.join(SHA256_STAMP_FILE), binary_sha256)
+}
+
+#[cfg(feature = "native")]
+fn remove_stale_temp_path(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(feature = "native")]
@@ -240,7 +350,7 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     };
     let target_bin_path = out_dir.join(bin_name);
 
-    // 1. Check if already extracted in OUT_DIR with matching version stamp
+    // 1. Check if already extracted in OUT_DIR with matching version + SHA-256 stamps
     if is_cached_binary_valid(&out_dir, &target_bin_path) {
         println!(
             "cargo:rustc-env=NATIVE_HARNESS_PATH={}",
@@ -249,9 +359,7 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if target_bin_path.exists()
-        && let Err(e) = std::fs::remove_file(&target_bin_path)
-    {
+    if let Err(e) = remove_stale_temp_path(&target_bin_path) {
         println!(
             "cargo:warning=Failed to remove stale harness binary at {}: {e}",
             target_bin_path.display()
@@ -267,9 +375,7 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. Check ~/.gemini/antigravity/bin/v<VERSION> cache (version-isolated so
-    //    older crates.io build scripts never fight over the shared binary or
-    //    hit ETXTBSY when localharness is running)
+    // 3. Check ~/.gemini/antigravity/bin/v<VERSION> cache
     let home_bin_dir = env::var_os(ENV_HOME)
         .or_else(|| env::var_os(ENV_USERPROFILE))
         .map(PathBuf::from)
@@ -313,8 +419,9 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "cargo:warning=Downloading local proxy binary from PyPI for {target_os}-{target_arch} v{TARGET_ANTIGRAVITY_SDK_VERSION}..."
     );
-    download_and_extract_wheel(&target_os, &target_arch, &dest_bin_path)?;
-    write_version_stamp(&dest_dir)?;
+    let binary_sha256 =
+        download_and_extract_wheel(&target_os, &target_arch, is_windows, &dest_bin_path)?;
+    write_cache_stamps(&dest_dir, &binary_sha256)?;
     if let Some(ref shared_bin_dir) = home_bin_dir {
         sync_shared_bin(&dest_bin_path, &shared_bin_dir.join(bin_name));
     }
@@ -328,22 +435,48 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "native")]
 fn sync_shared_bin(versioned_bin: &Path, shared_bin: &Path) {
+    if let Some(parent) = shared_bin.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        println!(
+            "cargo:warning=Failed to create shared harness directory {}: {e}",
+            parent.display()
+        );
+        return;
+    }
     let tmp = shared_bin.with_extension(format!("tmp.{}", std::process::id()));
-    if std::fs::copy(versioned_bin, &tmp).is_ok() {
-        #[cfg(unix)]
-        if let Err(e) = set_executable_permission(&tmp) {
-            println!(
-                "cargo:warning=Failed to set executable permissions on {}: {e}",
-                tmp.display()
-            );
-        }
-        // Atomic rename avoids ETXTBSY even when shared_bin is currently executing
-        if let Err(e) = std::fs::rename(&tmp, shared_bin) {
-            println!(
-                "cargo:warning=Failed to atomically update shared harness {}: {e}",
-                shared_bin.display()
-            );
-        }
+    if let Err(e) = remove_stale_temp_path(&tmp) {
+        println!(
+            "cargo:warning=Failed to remove stale shared temp {}: {e}",
+            tmp.display()
+        );
+        return;
+    }
+    let copy_result = (|| -> io::Result<()> {
+        let mut src = std::fs::File::open(versioned_bin)?;
+        let mut dst = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        io::copy(&mut src, &mut dst)?;
+        dst.flush()
+    })();
+    if let Err(e) = copy_result {
+        println!(
+            "cargo:warning=Failed to stage shared harness temp {}: {e}",
+            tmp.display()
+        );
+        return;
+    }
+    #[cfg(unix)]
+    if let Err(e) = set_executable_permission(&tmp) {
+        println!(
+            "cargo:warning=Failed to set executable permissions on {}: {e}",
+            tmp.display()
+        );
+    }
+    if let Err(e) = std::fs::rename(&tmp, shared_bin) {
+        println!(
+            "cargo:warning=Failed to atomically update shared harness {}: {e}",
+            shared_bin.display()
+        );
     }
 }
 
@@ -355,37 +488,90 @@ struct PypiReleaseResponse {
 }
 
 #[cfg(feature = "native")]
+#[derive(Default, serde::Deserialize)]
+struct PypiDigests {
+    #[serde(default)]
+    sha256: String,
+}
+
+#[cfg(feature = "native")]
 #[derive(serde::Deserialize)]
 struct PypiFileEntry {
     #[serde(default)]
     filename: String,
     #[serde(default)]
     url: String,
+    #[serde(default)]
+    digests: PypiDigests,
 }
 
 #[cfg(feature = "native")]
-fn download_and_extract_wheel(
+fn validate_allowed_pypi_url(url: &str) -> Result<(), String> {
+    let Some(after_scheme) = url.strip_prefix("https://") else {
+        return Err(format!("Refusing non-HTTPS wheel URL: {url}"));
+    };
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    if authority.is_empty()
+        || authority.contains(['@', ':', '?', '#', '\\'])
+        || authority.bytes().any(|b| b.is_ascii_whitespace())
+    {
+        return Err(format!("Invalid authority in PyPI URL: {url}"));
+    }
+    if !authority.eq_ignore_ascii_case("pypi.org")
+        && !authority.eq_ignore_ascii_case("files.pythonhosted.org")
+    {
+        return Err(format!(
+            "Refusing untrusted download host '{authority}' in URL: {url}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn read_bounded_bytes<R: Read>(
+    reader: R,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    let read_len = reader.take(max_bytes + 1).read_to_end(&mut buf)?;
+    if read_len as u64 > max_bytes {
+        return Err(format!("{label} exceeded maximum allowed size of {max_bytes} bytes").into());
+    }
+    Ok(buf)
+}
+
+#[cfg(feature = "native")]
+fn platform_tag_and_pinned_sha256(
     target_os: &str,
     target_arch: &str,
-    dest_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let platform_tag = match (target_os, target_arch) {
-        ("linux", "x86_64") => "manylinux_2_17_x86_64",
-        ("linux", "aarch64") => "manylinux_2_17_aarch64",
-        ("macos", "aarch64") => "macosx_11_0_arm64",
-        ("macos", "x86_64") => "macosx_11_0_x86_64",
-        ("windows", "x86_64") => "win_amd64",
-        ("windows", "aarch64") => "win_arm64",
-        (os, arch) => {
-            return Err(format!("Unsupported target platform: {os}-{arch}").into());
-        }
-    };
+) -> Result<(&'static str, &'static str), String> {
+    match (target_os, target_arch) {
+        ("linux", "x86_64") => Ok(("manylinux_2_17_x86_64", PINNED_WHEEL_SHA256_LINUX_X86_64)),
+        ("linux", "aarch64") => Ok(("manylinux_2_17_aarch64", PINNED_WHEEL_SHA256_LINUX_AARCH64)),
+        ("macos", "aarch64") => Ok(("macosx_11_0_arm64", PINNED_WHEEL_SHA256_MACOS_ARM64)),
+        ("macos", "x86_64") => Ok(("macosx_11_0_x86_64", PINNED_WHEEL_SHA256_MACOS_X86_64)),
+        ("windows", "x86_64") => Ok(("win_amd64", PINNED_WHEEL_SHA256_WIN_AMD64)),
+        ("windows", "aarch64") => Ok(("win_arm64", PINNED_WHEEL_SHA256_WIN_ARM64)),
+        (os, arch) => Err(format!("Unsupported target platform: {os}-{arch}")),
+    }
+}
 
-    // Query PyPI JSON API specifically for TARGET_ANTIGRAVITY_SDK_VERSION
+#[cfg(feature = "native")]
+fn download_verified_wheel_bytes(
+    platform_tag: &str,
+    pinned_sha256: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let pypi_url =
         format!("https://pypi.org/pypi/google-antigravity/{TARGET_ANTIGRAVITY_SDK_VERSION}/json");
+    validate_allowed_pypi_url(&pypi_url)?;
     let pypi_resp = ureq::get(&pypi_url).call()?;
-    let release: PypiReleaseResponse = pypi_resp.into_body().read_json()?;
+    let json_bytes = read_bounded_bytes(
+        pypi_resp.into_body().into_reader(),
+        MAX_PYPI_JSON_BYTES,
+        "PyPI release JSON",
+    )?;
+    let release: PypiReleaseResponse = serde_json::from_slice(&json_bytes)?;
 
     if release.urls.is_empty() {
         return Err(format!("No files found for version {TARGET_ANTIGRAVITY_SDK_VERSION}").into());
@@ -409,52 +595,125 @@ fn download_and_extract_wheel(
     if wheel_file.url.is_empty() {
         return Err("Missing download URL for wheel".into());
     }
+    validate_allowed_pypi_url(&wheel_file.url)?;
+
+    if !wheel_file
+        .digests
+        .sha256
+        .eq_ignore_ascii_case(pinned_sha256)
+    {
+        return Err(format!(
+            "PyPI metadata SHA-256 mismatch for {}: expected pinned {pinned_sha256}, PyPI reported {}",
+            wheel_file.filename, wheel_file.digests.sha256
+        )
+        .into());
+    }
 
     let wheel_resp = ureq::get(&wheel_file.url).call()?;
-    let mut wheel_bytes = Vec::new();
-    wheel_resp
-        .into_body()
-        .into_reader()
-        .read_to_end(&mut wheel_bytes)?;
+    let wheel_bytes = read_bounded_bytes(
+        wheel_resp.into_body().into_reader(),
+        MAX_WHEEL_BYTES,
+        &wheel_file.filename,
+    )?;
+
+    let actual_sha256 = sha256_bytes_hex(&wheel_bytes);
+    if !actual_sha256.eq_ignore_ascii_case(pinned_sha256) {
+        return Err(format!(
+            "Downloaded wheel SHA-256 mismatch for {}: expected {pinned_sha256}, computed {actual_sha256}",
+            wheel_file.filename
+        )
+        .into());
+    }
+    Ok(wheel_bytes)
+}
+
+#[cfg(feature = "native")]
+fn download_and_extract_wheel(
+    target_os: &str,
+    target_arch: &str,
+    is_windows: bool,
+    dest_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (platform_tag, pinned_sha256) = platform_tag_and_pinned_sha256(target_os, target_arch)?;
+    let wheel_bytes = download_verified_wheel_bytes(platform_tag, pinned_sha256)?;
+    let expected_entry = if is_windows {
+        HARNESS_ZIP_ENTRY_WINDOWS
+    } else {
+        HARNESS_ZIP_ENTRY_UNIX
+    };
 
     let reader = io::Cursor::new(wheel_bytes);
     let mut zip_archive = zip::ZipArchive::new(reader)?;
 
-    let mut found = false;
     for i in 0..zip_archive.len() {
         let mut file = zip_archive.by_index(i)?;
-        let name = file.name()?.replace('\\', "/");
-        if name.ends_with("google/antigravity/bin/localharness")
-            || name.ends_with("google/antigravity/bin/localharness.exe")
-        {
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let tmp_path = dest_path.with_extension(format!("tmp.{}", std::process::id()));
-            {
-                let mut out = File::create(&tmp_path)?;
-                io::copy(&mut file, &mut out)?;
-                out.flush()?;
-            }
-            #[cfg(unix)]
-            set_executable_permission(&tmp_path)?;
-            std::fs::rename(&tmp_path, dest_path)?;
-            found = true;
-            break;
+        if !file.is_file() {
+            continue;
         }
+        let normalized_entry = file
+            .name()?
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_owned();
+        if normalized_entry != expected_entry {
+            continue;
+        }
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = dest_path.with_extension(format!("tmp.{}", std::process::id()));
+        remove_stale_temp_path(&tmp_path)?;
+        let binary_sha256 = {
+            use sha2::{Digest, Sha256};
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            let mut limited = (&mut file).take(MAX_HARNESS_BIN_BYTES + 1);
+            let mut hasher = Sha256::new();
+            let mut total_written = 0u64;
+            let mut chunk = vec![0u8; IO_CHUNK_BYTES];
+            loop {
+                let n = limited.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                total_written += n as u64;
+                if total_written > MAX_HARNESS_BIN_BYTES {
+                    drop(out);
+                    remove_stale_temp_path(&tmp_path)?;
+                    return Err(format!(
+                        "Extracted localharness binary exceeded {MAX_HARNESS_BIN_BYTES} bytes"
+                    )
+                    .into());
+                }
+                hasher.update(&chunk[..n]);
+                out.write_all(&chunk[..n])?;
+            }
+            out.flush()?;
+            bytes_to_lower_hex(&hasher.finalize())
+        };
+        #[cfg(unix)]
+        set_executable_permission(&tmp_path)?;
+        remove_stale_temp_path(dest_path)?;
+        std::fs::rename(&tmp_path, dest_path)?;
+        return Ok(binary_sha256);
     }
 
-    if !found {
-        return Err("Could not find localharness binary inside downloaded wheel".into());
-    }
-
-    Ok(())
+    Err(format!("Could not find exact entry '{expected_entry}' inside downloaded wheel").into())
 }
 
 #[cfg(all(feature = "native", unix))]
 fn set_executable_permission(path: &Path) -> Result<(), io::Error> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to chmod non-regular file",
+        ));
+    }
+    let mut perms = meta.permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms)?;
     Ok(())

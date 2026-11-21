@@ -266,6 +266,8 @@ pub enum MockResponse {
         name: String,
         args: serde_json::Value,
     },
+    /// Return multiple parallel `functionCall` parts in a single candidate.
+    ParallelFunctionCalls(Vec<(String, serde_json::Value)>),
     /// Return a final text response.
     Text(String),
     /// Return a candidate with empty content — no text, no tool calls.
@@ -347,6 +349,9 @@ impl MockGeminiServer {
                             MockResponse::FunctionCall { name, args } => {
                                 sse_response(&function_call_json(name, args))
                             }
+                            MockResponse::ParallelFunctionCalls(calls) => {
+                                sse_response(&parallel_function_calls_json(calls))
+                            }
                             MockResponse::Text(text) => sse_response(&text_response_json(text)),
                             MockResponse::EmptyCandidate => sse_response(&empty_candidate_json()),
                             MockResponse::HttpError { status, message } => {
@@ -359,6 +364,9 @@ impl MockGeminiServer {
                                         MockResponse::Text(t) => text_response_json(t),
                                         MockResponse::FunctionCall { name, args } => {
                                             function_call_json(name, args)
+                                        }
+                                        MockResponse::ParallelFunctionCalls(calls) => {
+                                            parallel_function_calls_json(calls)
                                         }
                                         MockResponse::EmptyCandidate => empty_candidate_json(),
                                         MockResponse::HttpError { .. }
@@ -600,12 +608,20 @@ fn model_list_json() -> String {
 }
 
 fn function_call_json(name: &str, args: &serde_json::Value) -> String {
+    parallel_function_calls_json(&[(name.to_owned(), args.clone())])
+}
+
+fn parallel_function_calls_json(calls: &[(String, serde_json::Value)]) -> String {
+    let parts: Vec<MockFunctionCallPart<'_>> = calls
+        .iter()
+        .map(|(name, args)| MockFunctionCallPart {
+            function_call: MockFunctionCall { name, args },
+        })
+        .collect();
     serde_json::to_string(&MockGenerateResponse {
         candidates: [MockCandidate {
             content: MockCandidateContent {
-                parts: vec![MockFunctionCallPart {
-                    function_call: MockFunctionCall { name, args },
-                }],
+                parts,
                 role: "model",
             },
             finish_reason: "STOP",
@@ -617,7 +633,7 @@ fn function_call_json(name: &str, args: &serde_json::Value) -> String {
             total: 15,
         },
     })
-    .expect("MockGenerateResponse function call serializes")
+    .expect("MockGenerateResponse parallel function calls serialize")
 }
 
 fn text_response_json(text: &str) -> String {
@@ -700,6 +716,7 @@ pub fn agent_config(base_url: &str, system: &str) -> agy_bridge::config::AgentCo
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url.to_string()),
             models: agy_bridge::config::ModelConfig::default(),
+            ..Default::default()
         })
         .capabilities(agy_bridge::config::CapabilitiesConfig::custom_tools_only())
         .policies([PolicyRule::AllowAll])

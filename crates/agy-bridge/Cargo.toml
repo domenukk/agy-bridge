@@ -14,6 +14,7 @@ exclude = [
   ".recovered/",
   "blank.png",
   ".markdownlint.jsonc",
+  "**/__pycache__",
 ]
 
 [dependencies]
@@ -42,9 +43,11 @@ tokio-tungstenite = { workspace = true, optional = true }
 md-tmpl = { workspace = true, optional = true }
 
 [build-dependencies]
+sha2 = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 agy-bridge-test-support.workspace = true
@@ -59,7 +62,7 @@ workspace = true
 [features]
 default = ["native"]
 python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:pythonize"]
-native = ["dep:tokio-tungstenite", "dep:ureq", "dep:zip"]
+native = ["dep:tokio-tungstenite", "dep:ureq", "dep:zip", "dep:sha2"]
 md-tmpl = ["dep:md-tmpl", "llm-tool/md-tmpl"]
 
 [[example]]

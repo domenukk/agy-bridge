@@ -71,6 +71,18 @@ impl SystemInstructions {
             title: Some(title.into()),
         }
     }
+
+    /// Create templated system instructions overriding the identity and/or appending sections.
+    #[must_use]
+    pub fn templated<S: Into<String>>(
+        identity: Option<S>,
+        sections: impl IntoIterator<Item = SystemInstructionSection>,
+    ) -> Self {
+        Self::Templated {
+            identity: identity.map(Into::into),
+            sections: sections.into_iter().collect(),
+        }
+    }
 }
 
 impl From<&str> for SystemInstructions {
@@ -333,6 +345,34 @@ pub struct AgentConfig {
     #[serde(default)]
     #[builder(default)]
     pub tool_output_floor: crate::tools::OutputSanitization,
+    /// Per-agent environment variable overrides forwarded to `localharness` (`0.1.24`+).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    #[builder(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Optional Vertex AI model backend configuration (`0.1.24`+).
+    #[serde(
+        default,
+        rename = "vertex_config",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[builder(default, setter(strip_option))]
+    pub vertex: Option<super::backends::VertexConfig>,
+    /// Optional external OpenAI-compatible server configuration (Ollama, LM Studio, vLLM; `0.1.24`+).
+    #[serde(
+        default,
+        rename = "local_openai_config",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[builder(default, setter(strip_option))]
+    pub local_openai: Option<super::backends::LocalOpenAIConfig>,
+    /// Optional local LiteRT-LM model configuration (`0.1.24`+; Python runtime only).
+    #[serde(
+        default,
+        rename = "litert_config",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[builder(default, setter(strip_option))]
+    pub litert: Option<super::backends::LiteRTConfig>,
 }
 
 /// Controls whether an agent session resumes an existing conversation or starts fresh.
@@ -533,16 +573,31 @@ impl AgentConfig {
             .or_else(|| crate::env_var(super::ENV_GEMINI_API_KEY))
     }
 
-    /// Resolve the effective base URL using the priority chain:
+    /// Resolve the effective base URL using the `0.1.24` priority chain:
     ///
     /// 1. Explicit `GeminiConfig` base URL (`gemini.base_url`)
-    /// 2. `$GEMINI_API_BASE_URL` environment variable or `.env` fallback
+    /// 2. Per-agent `env["GOOGLE_GEMINI_BASE_URL"]`, then `env["GEMINI_API_BASE_URL"]`
+    /// 3. Process `$GOOGLE_GEMINI_BASE_URL`, then `$GEMINI_API_BASE_URL` (or cached `.env`)
     #[must_use]
     pub fn effective_base_url(&self) -> Option<String> {
         self.gemini
             .as_ref()
             .and_then(|g| g.base_url.clone())
-            .or_else(|| crate::env_var(super::ENV_GEMINI_API_BASE_URL))
+            .filter(|u| !u.is_empty())
+            .or_else(|| {
+                self.env
+                    .get(super::ENV_GOOGLE_GEMINI_BASE_URL)
+                    .cloned()
+                    .filter(|u| !u.is_empty())
+            })
+            .or_else(|| {
+                self.env
+                    .get(super::ENV_GEMINI_API_BASE_URL)
+                    .cloned()
+                    .filter(|u| !u.is_empty())
+            })
+            .or_else(|| crate::env_var(super::ENV_GOOGLE_GEMINI_BASE_URL).filter(|u| !u.is_empty()))
+            .or_else(|| crate::env_var(super::ENV_GEMINI_API_BASE_URL).filter(|u| !u.is_empty()))
     }
 
     /// Returns the names of all explicitly registered custom tools.

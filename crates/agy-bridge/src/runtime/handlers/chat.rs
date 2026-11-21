@@ -4,7 +4,11 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use tokio::sync::oneshot;
 
-use super::super::{AgentId, command_loop::lookup_agent_instance, py_scripts::decode_prompt_py};
+use super::super::{
+    AgentId,
+    command_loop::lookup_agent_instance,
+    py_scripts::{PyPromptPayload, decode_prompt_payload_py},
+};
 use crate::{error::Error, types::UsageMetadata};
 
 /// Rate limiter for successive chat commands across agents.
@@ -47,7 +51,7 @@ impl ChatRateLimiter {
 pub(in crate::runtime) fn dispatch_chat_command(
     registry: &super::super::command_loop::AgentRegistry,
     agent_id: AgentId,
-    prompt: String,
+    prompt: PyPromptPayload,
     reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
     rate_limiter: ChatRateLimiter,
     stream_limits: super::super::streaming::StreamLimits,
@@ -136,13 +140,18 @@ fn extract_response_metadata(
     response_py: &Py<PyAny>,
     agent_instance: &Py<PyAny>,
     agent_id: AgentId,
-) -> Result<(Option<UsageMetadata>, Option<serde_json::Value>), String> {
+) -> Result<
+    (
+        Option<UsageMetadata>,
+        Option<serde_json::Value>,
+        crate::types::StopReason,
+    ),
+    String,
+> {
     Python::attach(|py| {
         let response_bound = response_py.bind(py);
         let agent_bound = agent_instance.bind(py);
 
-        // The conversation carries both usage and structured output. It can be
-        // absent very early in an agent's life; that is not an error.
         let conversation = match agent_bound.getattr("conversation") {
             Ok(conv) if !conv.is_none() => Some(conv),
             Ok(_) => None,
@@ -154,8 +163,44 @@ fn extract_response_metadata(
 
         let usage = extract_usage_metadata(response_bound, conversation.as_ref(), agent_id);
         let structured = extract_structured_output(conversation.as_ref())?;
-        Ok((usage, structured))
+        let stop_reason = extract_stop_reason(response_bound, conversation.as_ref());
+        Ok((usage, structured, stop_reason))
     })
+}
+
+fn extract_stop_reason(
+    response_bound: &Bound<'_, PyAny>,
+    conversation: Option<&Bound<'_, PyAny>>,
+) -> crate::types::StopReason {
+    let candidate = match response_bound.getattr("stop_reason") {
+        Ok(val) if !val.is_none() => Some(val),
+        _ => conversation.and_then(|conv| match conv.getattr("_last_turn_stop_reason") {
+            Ok(val) if !val.is_none() => Some(val),
+            _ => None,
+        }),
+    };
+    let Some(raw_obj) = candidate else {
+        return crate::types::StopReason::Unspecified;
+    };
+    let str_opt = match raw_obj.getattr("value") {
+        Ok(v) => v.extract::<String>().unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed extracting stop_reason.value as String");
+            String::new()
+        }),
+        Err(_no_val) => raw_obj.extract::<String>().unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "Failed extracting stop_reason as String");
+            String::new()
+        }),
+    };
+    if str_opt.is_empty() {
+        return crate::types::StopReason::Unspecified;
+    }
+    str_opt
+        .parse::<crate::types::StopReason>()
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, raw = %str_opt, "Unrecognized Python stop_reason; mapping to Unknown");
+            crate::types::StopReason::Unknown
+        })
 }
 
 /// Read accumulated token usage for the turn.
@@ -247,6 +292,7 @@ fn apply_response_metadata(
     writer: &crate::streaming::ChatResponseWriter,
     usage: Option<UsageMetadata>,
     structured: Option<serde_json::Value>,
+    stop_reason: crate::types::StopReason,
 ) {
     if let Some(u) = usage {
         writer.set_usage(u);
@@ -254,6 +300,7 @@ fn apply_response_metadata(
     if let Some(s) = structured {
         writer.set_structured_output(s);
     }
+    writer.set_stop_reason(stop_reason);
 }
 
 /// Invoke `agent.chat()` via Python, then iterate the response's async chunk
@@ -262,7 +309,7 @@ fn apply_response_metadata(
 pub(crate) async fn handle_chat(
     agent_instance: std::sync::Arc<Py<PyAny>>,
     agent_id: AgentId,
-    prompt: String,
+    prompt: PyPromptPayload,
     reply: oneshot::Sender<Result<crate::streaming::ChatResponseHandle, Error>>,
     rate_limiter: ChatRateLimiter,
     stream_limits: super::super::streaming::StreamLimits,
@@ -276,9 +323,9 @@ pub(crate) async fn handle_chat(
     // Phase 1: Start the chat in Python and get the response object.
     let start_fut = match prepare_chat_start(&agent_instance, &prompt) {
         Ok(fut) => fut,
-        Err(err_msg) => {
-            tracing::error!(agent_id = ?agent_id, error = %err_msg, "Failed to create chat coroutine");
-            if let Err(e) = reply.send(Err(Error::BackendError { message: err_msg })) {
+        Err(err) => {
+            tracing::error!(agent_id = ?agent_id, error = %err, "Failed to create chat coroutine");
+            if let Err(e) = reply.send(Err(err)) {
                 tracing::warn!(error = ?e, "Chat reply receiver dropped (start coro error)");
             }
             return;
@@ -323,7 +370,9 @@ pub(crate) async fn handle_chat(
 
     // Phase 5: Extract final metadata and apply to the writer.
     match extract_response_metadata(&response_py, &agent_instance, agent_id) {
-        Ok((usage, structured)) => apply_response_metadata(&writer, usage, structured),
+        Ok((usage, structured, stop_reason)) => {
+            apply_response_metadata(&writer, usage, structured, stop_reason);
+        }
         Err(e) => {
             // Never ignore: a metadata-extraction failure is surfaced both in the
             // logs and to the consumer via the stream's error channel, so it is
@@ -345,19 +394,30 @@ pub(crate) async fn handle_chat(
     }
 }
 
+fn classify_prompt_py_err(py: Python<'_>, err: &PyErr) -> Error {
+    let msg = err.to_string();
+    if msg.contains("SUPPORTED_DOCUMENT_MIMES") {
+        Error::InvalidConfig { message: msg }
+    } else {
+        crate::error::classify_py_error(py, err)
+    }
+}
+
 fn prepare_chat_start(
     agent_instance: &Py<PyAny>,
-    prompt: &str,
-) -> Result<impl std::future::Future<Output = PyResult<Py<PyAny>>>, String> {
+    prompt: &PyPromptPayload,
+) -> Result<impl std::future::Future<Output = PyResult<Py<PyAny>>>, Error> {
     Python::attach(|py| {
         let agent_bound = agent_instance.bind(py);
         let decoded =
-            decode_prompt_py(py, prompt).map_err(|e| format!("Failed to decode prompt: {e}"))?;
+            decode_prompt_payload_py(py, prompt).map_err(|e| classify_prompt_py_err(py, &e))?;
         let coro = agent_bound
             .call_method1("chat", (decoded,))
-            .map_err(|e| format!("Failed to call agent.chat: {e}"))?;
+            .map_err(|e| crate::error::classify_py_error(py, &e))?;
         tracing::debug!("agent.chat coroutine created, converting to future");
-        pyo3_async_runtimes::tokio::into_future(coro).map_err(|e| format!("{e}"))
+        pyo3_async_runtimes::tokio::into_future(coro).map_err(|e| Error::BackendError {
+            message: e.to_string(),
+        })
     })
 }
 
@@ -513,10 +573,11 @@ class Agent:
                 .unbind();
             let agent = module.getattr("Agent").unwrap().call0().unwrap().unbind();
 
-            let (usage, structured) =
+            let (usage, structured, stop_reason) =
                 extract_response_metadata(&response, &agent, AgentId(1)).expect("extraction ok");
             assert!(usage.is_none(), "no usage configured");
             assert_eq!(structured, Some(serde_json::json!({"verdict": "ok"})));
+            assert_eq!(stop_reason, crate::types::StopReason::Unspecified);
         });
     }
 
@@ -555,9 +616,10 @@ class Agent:
                 .unbind();
             let agent = module.getattr("Agent").unwrap().call0().unwrap().unbind();
 
-            let (usage, structured) =
+            let (usage, structured, stop_reason) =
                 extract_response_metadata(&response, &agent, AgentId(2)).expect("extraction ok");
             assert!(structured.is_none(), "no structured output configured");
+            assert_eq!(stop_reason, crate::types::StopReason::Unspecified);
             let usage = usage.expect("usage present");
             assert_eq!(usage.prompt_token_count, Some(10));
             assert_eq!(usage.candidates_token_count, Some(5));

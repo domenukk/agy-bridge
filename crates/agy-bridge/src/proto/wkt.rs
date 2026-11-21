@@ -9,6 +9,9 @@ use serde::{
 
 use super::serde_helpers::ProtoEnum;
 
+const MAX_DURATION_SECONDS: i64 = 315_576_000_000;
+const MAX_DURATION_NANOS: i32 = 999_999_999;
+
 /// A signed, fixed-length span of time (`google.protobuf.Duration`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Duration {
@@ -18,11 +21,43 @@ pub struct Duration {
     pub nanos: i32,
 }
 
+impl Duration {
+    /// Validates `seconds` bounds (`±315,576,000,000`), `nanos` bounds (`±999,999,999`),
+    /// and sign consistency per the `google.protobuf.Duration` specification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive error string when out of range or when `seconds` and `nanos`
+    /// have opposite non-zero signs.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.seconds < -MAX_DURATION_SECONDS || self.seconds > MAX_DURATION_SECONDS {
+            return Err(format!(
+                "duration seconds {} out of valid range [{}, {}]",
+                self.seconds, -MAX_DURATION_SECONDS, MAX_DURATION_SECONDS
+            ));
+        }
+        if self.nanos < -MAX_DURATION_NANOS || self.nanos > MAX_DURATION_NANOS {
+            return Err(format!(
+                "duration nanos {} out of valid range [{}, {}]",
+                self.nanos, -MAX_DURATION_NANOS, MAX_DURATION_NANOS
+            ));
+        }
+        if (self.seconds > 0 && self.nanos < 0) || (self.seconds < 0 && self.nanos > 0) {
+            return Err(format!(
+                "duration seconds ({}) and nanos ({}) must have the same sign",
+                self.seconds, self.nanos
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Serialize for Duration {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        self.validate().map_err(serde::ser::Error::custom)?;
         if self.nanos == 0 {
             return serializer.serialize_str(&format!("{}s", self.seconds));
         }
@@ -71,7 +106,12 @@ impl<'de> Deserialize<'de> for Duration {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "seconds" => {
-                            seconds = map.next_value()?;
+                            seconds = crate::proto::serde_helpers::i64_str::deserialize(
+                                serde::de::value::MapAccessDeserializer::new(&mut map),
+                            )
+                            .map_err(|e| {
+                                de::Error::custom(format!("invalid duration seconds field: {e}"))
+                            })?;
                         }
                         "nanos" => {
                             nanos = map.next_value()?;
@@ -81,7 +121,9 @@ impl<'de> Deserialize<'de> for Duration {
                         }
                     }
                 }
-                Ok(Duration { seconds, nanos })
+                let duration = Duration { seconds, nanos };
+                duration.validate().map_err(de::Error::custom)?;
+                Ok(duration)
             }
         }
 
@@ -98,10 +140,16 @@ fn parse_duration_str(value: &str) -> Result<Duration, String> {
     } else {
         (false, body)
     };
+    if unsigned_body.is_empty() || unsigned_body == "." {
+        return Err(format!("duration string has no digits: {value}"));
+    }
     let (sec_str, frac_str) = match unsigned_body.split_once('.') {
         Some((s, f)) => (s, Some(f)),
         None => (unsigned_body, None),
     };
+    if !sec_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid duration seconds '{sec_str}'"));
+    }
     let abs_secs: u64 = if sec_str.is_empty() {
         0
     } else {
@@ -110,8 +158,8 @@ fn parse_duration_str(value: &str) -> Result<Duration, String> {
             .map_err(|e| format!("invalid duration seconds '{sec_str}': {e}"))?
     };
     let abs_nanos: u32 = if let Some(frac) = frac_str {
-        if frac.len() > 9 {
-            return Err(format!("duration fractional digits exceed 9: {frac}"));
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("invalid duration fractional digits: '{frac}'"));
         }
         let padded = format!("{frac:0<9}");
         padded
@@ -124,17 +172,19 @@ fn parse_duration_str(value: &str) -> Result<Duration, String> {
         i64::try_from(abs_secs).map_err(|e| format!("duration seconds out of range: {e}"))?;
     let nanos_i32 =
         i32::try_from(abs_nanos).map_err(|e| format!("duration nanos out of range: {e}"))?;
-    if negative {
-        Ok(Duration {
+    let duration = if negative {
+        Duration {
             seconds: -secs_i64,
             nanos: -nanos_i32,
-        })
+        }
     } else {
-        Ok(Duration {
+        Duration {
             seconds: secs_i64,
             nanos: nanos_i32,
-        })
-    }
+        }
+    };
+    duration.validate()?;
+    Ok(duration)
 }
 
 /// Singleton enum representing JSON `null` (`google.protobuf.NullValue`).

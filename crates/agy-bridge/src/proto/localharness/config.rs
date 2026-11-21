@@ -34,12 +34,6 @@ pub struct InputConfig {
     pub client_info: Option<ClientInfo>,
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty", default)]
     pub env: std::collections::HashMap<String, String>,
-    #[serde(
-        alias = "use_interactions_api",
-        skip_serializing_if = "crate::proto::serde_helpers::is_default",
-        default
-    )]
-    pub use_interactions_api: bool,
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]

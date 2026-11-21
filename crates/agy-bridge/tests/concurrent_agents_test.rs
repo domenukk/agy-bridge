@@ -268,6 +268,7 @@ fn multiple_concurrent_agents_no_deadlock() {
                     api_key: Some(format!("key-{i}")),
                     base_url: Some(base_url),
                     models: agy_bridge::config::ModelConfig::default(),
+                    ..Default::default()
                 };
 
                 let config = agy_bridge::config::AgentConfig::builder()
@@ -336,6 +337,7 @@ fn test_simultaneous_turns_across_agents_barrier() {
                     api_key: Some(format!("key-{i}")),
                     base_url: Some(base_url),
                     models: agy_bridge::config::ModelConfig::default(),
+                    ..Default::default()
                 };
                 let config = agy_bridge::config::AgentConfig::builder()
                     .system_instructions(format!("Agent {i}"))

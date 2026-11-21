@@ -167,13 +167,13 @@ fn evaluate_empty_policy_set_denies() {
 }
 
 #[test]
-fn evaluate_deny_all_first_blocks_everything() {
+fn evaluate_specific_allow_overrides_wildcard_deny_regardless_of_order() {
     let set = PolicySet::from(vec![
         PolicyRule::DenyAll,
         PolicyRule::Allow("view_file".to_owned()),
     ]);
-    // DenyAll is first, so even explicitly allowed tools are denied.
-    assert!(set.evaluate("view_file").is_denied());
+    // Specific Allow takes precedence over Wildcard DenyAll (matching SDK & localharness).
+    assert!(set.evaluate("view_file").is_allowed());
     assert!(set.evaluate("run_command").is_denied());
 }
 
@@ -331,19 +331,34 @@ fn security_policy_bypass_attempts() {
         "non-denied tool should be allowed"
     );
 
-    // Scenario 2: DenyAll overrides later specific Allow.
+    // Scenario 2: Specific Deny overrides Specific Allow even when Allow comes first.
     let set = PolicySet::from(vec![
-        PolicyRule::DenyAll,
         PolicyRule::Allow("run_command".to_owned()),
+        PolicyRule::Deny("run_command".to_owned()),
+        PolicyRule::AllowAll,
     ]);
     assert!(
         set.evaluate("run_command").is_denied(),
-        "DenyAll must shadow later Allow"
+        "Specific Deny must beat Specific Allow regardless of insertion order"
     );
     assert!(
-        set.evaluate("view_file").is_denied(),
-        "DenyAll must block everything"
+        set.evaluate("view_file").is_allowed(),
+        "AllowAll still permits non-denied tools"
     );
+
+    // Scenario 2b: MCP 9-bucket precedence (Specific > ServerPrefix > Wildcard, Deny > Ask > Allow).
+    let mcp_set = PolicySet::from(vec![
+        PolicyRule::DenyAll,
+        PolicyRule::allow("gh/*"),
+        super::ask_user("gh/*", "ask_gh_prefix"),
+        PolicyRule::deny("gh/delete_repo"),
+        PolicyRule::allow("gh/delete_repo"),
+        PolicyRule::allow("gh/read_issue"),
+    ]);
+    assert!(mcp_set.evaluate("gh/delete_repo").is_denied());
+    assert!(mcp_set.evaluate("gh/read_issue").is_allowed());
+    assert!(mcp_set.evaluate("gh/create_pr").needs_confirmation());
+    assert!(mcp_set.evaluate("other/tool").is_denied());
 
     // Scenario 3: Only specific tools allowed, unlisted tools denied.
     let set = PolicySet::from(vec![
