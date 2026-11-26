@@ -6,7 +6,7 @@
 # so `just lint`/`just test` behave the same locally and in CI.
 [project]
 name = "agy-bridge-devtools"
-version = "0.16.8"
+version = "0.16.9"
 description = "Dev-only tooling environment for the agy-bridge repository"
 requires-python = ">=3.11"
 dependencies = [
@@ -31,6 +31,7 @@ package = false
 python-preference = "system"
 
 [tool.black]
+target-version = ["py311"]
 # The only Python we own lives in the crate; keep black off vendored trees.
 extend-exclude = '''
 /(
@@ -53,6 +54,8 @@ module = [
   "google",
   "google.antigravity",
   "google.antigravity.*",
+  "google.protobuf",
+  "google.protobuf.*",
   "websockets.*",
 ]
 ignore_missing_imports = true

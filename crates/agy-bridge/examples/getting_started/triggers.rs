@@ -21,9 +21,10 @@ async fn main() -> Result<(), agy_bridge::error::Error> {
         "Check threads for new updates",
     );
 
+    let watch_dir = std::env::temp_dir().join("agy-bridge-demo");
     let file_trigger = TriggerEntry::new(
         "watch_workspace",
-        TriggerConfig::try_on_file_change("/tmp/agy-bridge-demo")?,
+        TriggerConfig::try_on_file_change(&watch_dir)?,
         "Files changed in workspace: {changes}",
     );
 

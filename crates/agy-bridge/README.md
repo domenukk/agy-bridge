@@ -1,1 +1,602 @@
-../../README.md
+# agy-bridge
+
+Rust client for the
+[Google Antigravity SDK](https://github.com/Google-Antigravity/antigravity-sdk-python).
+
+Supports three backend modes with the same API:
+
+- **`native` (default)**: Pure Rust client that talks directly to the
+  `localharness` binary. No Python or `protoc` required.
+- **`python`**: Calls the Python `google-antigravity` package via
+  [PyO3](https://pyo3.rs).
+- **Custom `Runtime` (`default-features = false`)**: Plug in an external
+  `Runtime` crate (such as `flm-agy-bridge`) via `AgyBridge::with_runtime`.
+
+## Installation
+
+### Option 1: Native Backend (Pure Rust, default)
+
+Add `agy-bridge` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+agy-bridge = "0.16"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+This is the `native` feature, enabled by default. It talks to the
+`localharness` binary directly over WebSocket + protobuf and needs no
+Python interpreter.
+
+### Option 2: Python Backend
+
+Drives the Python `google-antigravity` SDK in-process via `PyO3`. Both `native`
+and `python` backends support the full agent, tool, hook, policy, subagent,
+skill, trigger, and initial-history API surface:
+
+```toml
+[dependencies]
+agy-bridge = { version = "0.16", default-features = false, features = ["python"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Install the Python SDK alongside it:
+
+```bash
+pip install "google-antigravity>=0.1.24,<0.2.0" watchfiles
+```
+
+> `watchfiles` is only needed for file-change triggers; timer triggers
+> work without it.
+
+### Option 3: Custom Runtime (`default-features = false`)
+
+Disable both built-in backends when supplying an external
+`agy_bridge::agent::Runtime` implementation (such as `flm-agy-bridge`):
+
+```toml
+[dependencies]
+agy-bridge = { version = "0.16", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Construct the bridge with `AgyBridge::with_runtime(...)`:
+
+```rust,no_run
+use agy_bridge::{AgyBridge, agent::Runtime, error::Error};
+
+async fn run_with_backend<R: Runtime + 'static>(runtime: R) -> Result<(), Error> {
+    let bridge = AgyBridge::with_runtime(runtime);
+    let agent = bridge.default_agent().await?;
+    let reply = agent.chat_text("Hello!").await?;
+    println!("{reply}");
+    agent.shutdown().await
+}
+```
+
+### API Key & Endpoint Setup
+
+Set your API key (or put it in a `.env` file):
+
+```bash
+export GEMINI_API_KEY="your-key-here"
+```
+
+For custom gateways or local proxies:
+
+```bash
+export GEMINI_API_BASE_URL="http://127.0.0.1:8642"
+```
+
+## Quick Start
+
+```rust,no_run
+use agy_bridge::AgyBridge;
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+    let agent = bridge.default_agent().await?;
+
+    // Send a message and get the full reply text.
+    let text = agent
+        .chat("Reply with 'Hello!' and nothing else.")
+        .await?
+        .text()
+        .await?;
+    println!("{text}");
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+### Streaming Responses
+
+```rust,no_run
+use agy_bridge::{AgyBridge, config::AgentConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+
+    // bridge.agent() returns an AgentBuilder — chain .tools() / .hooks()
+    // before .await, or .await directly for a bare agent.
+    let agent = bridge
+        .agent(
+            AgentConfig::builder()
+                .system_instructions("You are a poet.")
+                .build(),
+        )
+        .await?;
+
+    let mut response = agent.chat("Write a short poem about space.").await?;
+
+    if let Some(mut stream) = response.take_text_stream() {
+        while let Some(chunk) = stream.recv().await {
+            print!("{chunk}");
+        }
+    }
+    println!();
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+## Features
+
+### Multimodal Content
+
+Pass text, images, audio, video, and documents in a single chat turn:
+
+```rust,no_run
+use agy_bridge::{
+    AgyBridge,
+    content::{Content, ContentPrimitive, Image},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+    let agent = bridge.default_agent().await?;
+
+    // Load an image from a file path (auto-detects MIME type):
+    let image = Image::from_file("blank.png")?;
+
+    let content = Content::Multi {
+        parts: vec![
+            ContentPrimitive::Text { text: "Describe this image.".into() },
+            ContentPrimitive::Image(image),
+        ],
+    };
+
+    let text = agent.chat(content).await?.text().await?;
+    println!("{text}");
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+### Custom Tools
+
+Define tools with the `#[llm_tool]` proc macro — doc comments become descriptions:
+
+```rust,no_run
+use agy_bridge::{AgyBridge, config::AgentConfig, prelude::*, tools::ToolRegistry};
+
+/// Gets the current weather for a city.
+#[llm_tool]
+fn get_weather(
+    /// The city to look up.
+    city: &str,
+) -> Result<String, String> {
+    Ok(format!("It's sunny in {city}."))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(GetWeather);
+
+    let agent = bridge
+        .agent(AgentConfig::builder().build())
+        .tools(registry)
+        .await?;
+
+    let text = agent.chat("What's the weather in Tokyo?").await?.text().await?;
+    println!("{text}");
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+For full control, implement the `RustTool` trait directly:
+
+```rust
+use agy_bridge::tools::{JsonSchema, RustTool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+struct SearchParams {
+    /// The search query string.
+    query: String,
+}
+
+struct SearchTool;
+
+impl RustTool for SearchTool {
+    type Params = SearchParams;
+    const NAME: &'static str = "search";
+    const DESCRIPTION: &'static str = "Search a knowledge base";
+
+    async fn call(&self, params: Self::Params, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(format!("Results for: {}", params.query).into())
+    }
+}
+
+let registry = ToolRegistry::new().with_tool(SearchTool);
+assert_eq!(registry.definitions().len(), 1);
+```
+
+#### Output Sanitization & Secret Tokens
+
+Tool output is sanitized by default. `AgentConfig::tool_output_floor` (default
+`OutputSanitization::SanitizeTokens`) applies to every custom tool call. Set
+`#[llm_tool(provenance = "...")]` to mark external tools (`external_mcp` and
+`untrusted_network` wrap output in `<tool_output_quarantine>` tags by default),
+and use `SurrogateVault` to replace secret values with placeholders:
+
+```rust
+use agy_bridge::{
+    config::AgentConfig,
+    tools::{OutputSanitization, SurrogateVault, ToolContext, ToolProvenance},
+};
+
+let config = AgentConfig::builder()
+    .tool_output_floor(OutputSanitization::Quarantine)
+    .build();
+assert_eq!(config.tool_output_floor, OutputSanitization::Quarantine);
+assert_eq!(
+    ToolProvenance::ExternalMcp.default_output_sanitization(),
+    OutputSanitization::Quarantine
+);
+
+let vault = SurrogateVault::new();
+let ctx = ToolContext::new().with_surrogate_vault(vault);
+let handle = ctx.mint_surrogate("api_key", "sk-live-secret").unwrap();
+assert!(handle.token().starts_with("<surrogate:api_key:"));
+assert_eq!(
+    ctx.redact_surrogates("Bearer sk-live-secret").unwrap(),
+    format!("Bearer {handle}")
+);
+```
+
+To end the turn as soon as a submit tool succeeds (native runtime), name it by
+type so it can't drift from the registered tool: `.finish_on::<SubmitReport>()`.
+Unknown names and unsupported backends fail agent creation instead of being
+ignored.
+
+#### Tool Discovery
+
+After agent creation, inspect all available tools — custom Rust tools,
+MCP server tools, and SDK builtins — with source, description, and schema:
+
+```rust,no_run
+use agy_bridge::AgyBridge;
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+    let agent = bridge.default_agent().await?;
+
+    // `tool.source` is a `ToolSource` (Builtin / Custom / Mcp).
+    for tool in agent.available_tools() {
+        println!("  [{}] {} — {}", tool.source, tool.name, tool.description);
+    }
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+### Structured Output
+
+Constrain agent responses to a typed Rust struct:
+
+```rust
+use agy_bridge::config::{AgentConfig, JsonSchema};
+use schemars::JsonSchema as JsonSchemaTrait;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchemaTrait)]
+struct Summary {
+    title: String,
+    bullet_points: Vec<String>,
+}
+
+let schema = JsonSchema::from_schema::<Summary>()
+    .expect("schema serialization");
+
+let config = AgentConfig::builder()
+    .response_schema(schema)
+    .build();
+
+// The agent's response will be valid JSON matching `Summary`.
+assert!(config.response_schema.is_some());
+```
+
+### MCP Integration
+
+Connect external [MCP](https://modelcontextprotocol.io/) servers:
+
+```rust
+use agy_bridge::config::{AgentConfig, McpServer};
+
+let server = McpServer::stdio("npx")
+    .args([
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://postgres:postgres@localhost:5432/postgres",
+    ])
+    .name("postgres")
+    .build();
+
+// Same name on both runtimes; used as `ServerName` in `call_mcp_tool`.
+assert_eq!(server.server_name(), "postgres");
+let config = AgentConfig::builder().mcp_servers([server]).build();
+assert_eq!(config.mcp_servers.len(), 1);
+```
+
+### Hooks
+
+Register lifecycle callbacks for logging, safety gates, and middleware:
+
+```rust,no_run
+use agy_bridge::{
+    AgyBridge,
+    config::AgentConfig,
+    hooks::{HookResult, Hooks},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+
+    let mut hooks = Hooks::new();
+
+    hooks.on_pre_turn("turn_logger", |ctx| {
+        println!("[turn {}] {}", ctx.turn_number, ctx.prompt);
+        HookResult::allow()
+    });
+
+    hooks.on_pre_tool_call_decide("safety_gate", |ctx| {
+        if ctx.tool_name == "dangerous_tool" {
+            HookResult::deny("blocked by policy")
+        } else {
+            HookResult::allow()
+        }
+    });
+
+    hooks.on_stop("audit_stop", |args| {
+        println!("Agent stop requested: {:?}", args.stop_reason);
+        agy_bridge::hooks::StopHookResult::allow()
+    });
+
+    let agent = bridge
+        .agent(AgentConfig::builder().build())
+        .hooks(hooks)
+        .await?;
+
+    let text = agent.chat("What is the capital of Japan?").await?.text().await?;
+    println!("{text}");
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+### Execution Budgets & Shell Safety
+
+Enforce hard operational bounds on model calls, tool calls, and token usage,
+configure session continuation, and harden background shell commands:
+
+```rust
+use agy_bridge::config::{
+    AgentBehavior, AgentConfig, BudgetConfig, CapabilitiesConfig,
+    RunCommandConfig, SessionContinuationMode,
+};
+
+let budget = BudgetConfig::builder()
+    .max_model_calls(20)
+    .max_tool_calls(100)
+    .max_total_tokens(500_000)
+    .build();
+
+let shell_config = RunCommandConfig::builder()
+    .enable_daemons(true)
+    .timeout_seconds(60.0)
+    .enable_sandbox(true)
+    .build();
+
+let config = AgentConfig::builder()
+    .session_continuation_mode(SessionContinuationMode::CreateOrResume)
+    .budget_config(budget)
+    .capabilities(
+        CapabilitiesConfig::builder()
+            .agent_behavior(AgentBehavior::Autonomous)
+            .run_command_config(shell_config)
+            .build(),
+    )
+    .build();
+
+assert!(config.budget_config.is_some());
+```
+
+### Policies
+
+Declarative tool access control — specific rules take precedence over wildcards,
+and `Deny > AskUser > Allow`:
+
+```rust
+use agy_bridge::policies::{PolicyRule, PolicySet};
+
+let mut policies = PolicySet::new();
+policies.push(PolicyRule::allow("view_file")).unwrap();
+policies.push(PolicyRule::deny("run_command")).unwrap();
+policies.push(PolicyRule::deny_all()).unwrap();
+
+assert!(policies.evaluate("view_file").is_allowed());
+assert!(policies.evaluate("run_command").is_denied());
+assert!(policies.evaluate("unknown_tool").is_denied());
+```
+
+### Triggers
+
+Run background tasks that react to timers or file changes:
+
+```rust,no_run
+use agy_bridge::{
+    AgyBridge,
+    config::AgentConfig,
+    triggers::{TriggerConfig, TriggerEntry},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+
+    let periodic = TriggerEntry::new(
+        "poll_status",
+        TriggerConfig::try_every(std::time::Duration::from_secs(30))?,
+        "Check deployment status",
+    );
+
+    let file_watch = TriggerEntry::new(
+        "watch_workspace",
+        TriggerConfig::try_on_file_change(std::env::current_dir()?)?,
+        "Files changed: {changes}",
+    );
+
+    let config = AgentConfig::builder()
+        .triggers(vec![periodic, file_watch])
+        .build();
+
+    let agent = bridge.agent(config).await?;
+
+    // The agent will now automatically run triggers in the background.
+    let text = agent.chat("Hello!").await?.text().await?;
+    println!("{text}");
+
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+> **Note:** `on_file_change` triggers require the `watchfiles` Python package
+> (`pip install watchfiles`). Timer triggers (`every`) work without extra
+> dependencies.
+
+### Subagents
+
+Spawn child agents that share the parent's runtime:
+
+```rust,no_run
+use agy_bridge::{AgyBridge, config::AgentConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), agy_bridge::error::Error> {
+    agy_bridge::load_dotenv();
+    let bridge = AgyBridge::builder().build()?;
+
+    let parent = bridge.agent(
+        AgentConfig::builder()
+            .system_instructions("You are a coordinator.")
+            .build(),
+    ).await?;
+
+    let child = parent.spawn_subagent(
+        AgentConfig::builder()
+            .system_instructions("You are a math specialist.")
+            .model("gemini-3.5-flash")
+            .build(),
+        None,
+    ).await?;
+
+    let text = child.chat("What is 17 * 23?").await?.text().await?;
+    println!("{text}");
+
+    child.shutdown().await?;
+    parent.shutdown().await?;
+    Ok(())
+}
+```
+
+## Examples
+
+The [`examples/`](crates/agy-bridge/examples/) directory has runnable demos:
+
+### Getting Started
+
+| Example                                                                                        | Description                            |
+| :--------------------------------------------------------------------------------------------- | :------------------------------------- |
+| [`hello_world`](crates/agy-bridge/examples/getting_started/hello_world.rs)                     | Minimal agent — create, prompt, print  |
+| [`streaming`](crates/agy-bridge/examples/getting_started/streaming.rs)                         | Stream text tokens as they arrive      |
+| [`custom_tools`](crates/agy-bridge/examples/getting_started/custom_tools.rs)                   | `#[llm_tool]` proc macro               |
+| [`multimodal`](crates/agy-bridge/examples/getting_started/multimodal.rs)                       | Text + image input                     |
+| [`mcp_tools`](crates/agy-bridge/examples/getting_started/mcp_tools.rs)                         | MCP server integration                 |
+| [`structured_output`](crates/agy-bridge/examples/getting_started/structured_output.rs)         | JSON schema–constrained responses      |
+| [`hooks`](crates/agy-bridge/examples/getting_started/hooks.rs)                                 | Lifecycle hooks                        |
+| [`policies`](crates/agy-bridge/examples/getting_started/policies.rs)                           | Declarative tool access control        |
+| [`triggers`](crates/agy-bridge/examples/getting_started/triggers.rs)                           | Periodic and file-change triggers      |
+| [`subagents`](crates/agy-bridge/examples/getting_started/subagents.rs)                         | Parent/child agent spawning            |
+| [`human_in_the_loop`](crates/agy-bridge/examples/getting_started/human_in_the_loop.rs)         | Human-in-the-loop chat patterns        |
+| [`persistence`](crates/agy-bridge/examples/getting_started/persistence.rs)                     | Conversation persistence               |
+| [`observability`](crates/agy-bridge/examples/getting_started/observability.rs)                 | Tracing and usage metadata             |
+| [`error_handler`](crates/agy-bridge/examples/getting_started/error_handler.rs)                 | Structured error handling patterns     |
+| [`autonomous_shell`](crates/agy-bridge/examples/getting_started/autonomous_shell.rs)           | Autonomous shell command execution     |
+| [`persona_config`](crates/agy-bridge/examples/getting_started/persona_config.rs)               | Custom persona and model configuration |
+| [`agent_skills`](crates/agy-bridge/examples/getting_started/agent_skills.rs)                   | Agent skill registration               |
+| [`app_data_dir_override`](crates/agy-bridge/examples/getting_started/app_data_dir_override.rs) | Custom app data directory              |
+| [`template_tools`](crates/agy-bridge/examples/getting_started/template_tools.rs)               | `md-tmpl` prompt/response templates    |
+
+### Deep Dives
+
+| Example                                                                                               | Description                          |
+| :---------------------------------------------------------------------------------------------------- | :----------------------------------- |
+| [`async_chat`](crates/agy-bridge/examples/deep_dives/async_chat.rs)                                   | Advanced async chat patterns         |
+| [`round_based_chat`](crates/agy-bridge/examples/deep_dives/round_based_chat.rs)                       | Multi-round structured conversations |
+| [`agent_middleware`](crates/agy-bridge/examples/deep_dives/agent_middleware.rs)                       | Hook-based middleware pipeline       |
+| [`host_tool_hooks`](crates/agy-bridge/examples/deep_dives/host_tool_hooks.rs)                         | Host-side tool interception hooks    |
+| [`interactive_cli`](crates/agy-bridge/examples/deep_dives/interactive_cli.rs)                         | Multi-turn CLI chat application      |
+| [`multimodal_pipeline`](crates/agy-bridge/examples/deep_dives/multimodal_pipeline.rs)                 | Multi-stage multimodal processing    |
+| [`doc_maintenance_agent`](crates/agy-bridge/examples/deep_dives/doc_maintenance_agent.rs)             | Documentation maintenance agent      |
+| [`docstring_maintenance_agent`](crates/agy-bridge/examples/deep_dives/docstring_maintenance_agent.rs) | Code docstring maintenance agent     |
+
+```bash
+cargo run --example getting_started_hello_world
+```
+
+## License
+
+Licensed under either of:
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
+
+---
+
+_This is not a Google product. Use at your own risk._

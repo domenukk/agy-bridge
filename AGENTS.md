@@ -4,9 +4,9 @@
 >
 > - **`README.md` (`crates/agy-bridge/src/lib.rs` crate rustdoc)** is the
 >   normative user-facing specification and API reference for `agy-bridge`.
-> - **`AGENTS.md` (and `AGENT.md` symlink)** is the **enforceable operational
->   summary** of architecture, domain invariants, and multi-language code
->   quality standards.
+> - **`AGENTS.md`** is the **enforceable operational summary** of architecture,
+>   domain invariants, and multi-language code quality standards. (No git
+>   symlinks are tracked so clones work on Windows without `core.symlinks`.)
 > - **`scripts/lint_hygiene.py` and `justfile`** are the **Single Source of
 >   Truth** for automated hygiene, formatting, linting, and test gates. Every
 >   rule in `AGENTS.md` must have a corresponding automated check in

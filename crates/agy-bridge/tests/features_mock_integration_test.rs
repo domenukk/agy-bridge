@@ -29,10 +29,16 @@ fn python_cmd() -> String {
     {
         return py.to_string_lossy().into_owned();
     }
-    let venv_win =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.venv/Scripts/python.exe");
-    if venv_win.is_file() {
-        return venv_win.to_string_lossy().into_owned();
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "../../.venv/Scripts/python.exe",
+        "../../.venv/bin/python3",
+        "../../.venv/bin/python",
+    ] {
+        let candidate = workspace_root.join(rel);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
     }
     if cfg!(windows) {
         "python".to_string()

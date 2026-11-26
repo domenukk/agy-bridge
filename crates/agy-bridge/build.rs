@@ -87,12 +87,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "python")]
+fn query_python_base_prefix(py_bin: &std::path::Path) -> Option<std::path::PathBuf> {
+    let output_res = std::process::Command::new(py_bin)
+        .args(["-c", "import sys; print(sys.base_prefix)"])
+        .output();
+    if let Result::Ok(out) = output_res
+        && out.status.success()
+    {
+        let parsed = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        if parsed.is_dir() {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "python")]
 fn discover_windows_python_base_prefix() -> Option<std::path::PathBuf> {
-    let mut candidate_python_bins: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(pyo3_py) = std::env::var_os("PYO3_PYTHON") {
-        candidate_python_bins.push(std::path::PathBuf::from(pyo3_py));
+    // Respect explicit `PYO3_PYTHON` before inspecting any repository `.venv` so
+    // developers/CI using a different Python version get the matching DLLs.
+    if let Some(pyo3_py) = std::env::var_os("PYO3_PYTHON")
+        && !pyo3_py.is_empty()
+        && let Some(prefix) = query_python_base_prefix(&std::path::PathBuf::from(pyo3_py))
+    {
+        return Some(prefix);
     }
 
+    let mut candidate_python_bins: Vec<std::path::PathBuf> = Vec::new();
     if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from)
     {
         let mut current = manifest_dir;
@@ -125,16 +146,8 @@ fn discover_windows_python_base_prefix() -> Option<std::path::PathBuf> {
 
     candidate_python_bins.push(std::path::PathBuf::from("python"));
     for py_bin in candidate_python_bins {
-        let output_res = std::process::Command::new(&py_bin)
-            .args(["-c", "import sys; print(sys.base_prefix)"])
-            .output();
-        if let Result::Ok(out) = output_res
-            && out.status.success()
-        {
-            let parsed = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-            if parsed.is_dir() {
-                return Some(parsed);
-            }
+        if let Some(prefix) = query_python_base_prefix(&py_bin) {
+            return Some(prefix);
         }
     }
     None
@@ -434,7 +447,24 @@ fn resolve_or_download_binary() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "native")]
+fn files_have_matching_sha256(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else {
+        return false;
+    };
+    if !ma.file_type().is_file() || !mb.file_type().is_file() || ma.len() != mb.len() {
+        return false;
+    }
+    match (sha256_file_hex(a), sha256_file_hex(b)) {
+        (Ok(ha), Ok(hb)) => ha.eq_ignore_ascii_case(&hb),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "native")]
 fn sync_shared_bin(versioned_bin: &Path, shared_bin: &Path) {
+    if files_have_matching_sha256(versioned_bin, shared_bin) {
+        return;
+    }
     if let Some(parent) = shared_bin.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -463,6 +493,12 @@ fn sync_shared_bin(versioned_bin: &Path, shared_bin: &Path) {
             "cargo:warning=Failed to stage shared harness temp {}: {e}",
             tmp.display()
         );
+        if let Err(rm_err) = remove_stale_temp_path(&tmp) {
+            println!(
+                "cargo:warning=Failed cleaning up staged harness temp {}: {rm_err}",
+                tmp.display()
+            );
+        }
         return;
     }
     #[cfg(unix)]
@@ -477,6 +513,12 @@ fn sync_shared_bin(versioned_bin: &Path, shared_bin: &Path) {
             "cargo:warning=Failed to atomically update shared harness {}: {e}",
             shared_bin.display()
         );
+        if let Err(rm_err) = remove_stale_temp_path(&tmp) {
+            println!(
+                "cargo:warning=Failed cleaning up staged harness temp {}: {rm_err}",
+                tmp.display()
+            );
+        }
     }
 }
 

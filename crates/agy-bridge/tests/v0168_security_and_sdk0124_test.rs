@@ -690,9 +690,14 @@ mod native_security_tests {
             .with_transform_tool_input("rewrite_mode", |ctx| {
                 let mut map = ctx.tool_args.as_object()?.clone();
                 if map.get("mode").and_then(serde_json::Value::as_str) == Some("raw") {
+                    let expected_path = if cfg!(windows) {
+                        r"\etc\passwd"
+                    } else {
+                        "/etc/passwd"
+                    };
                     assert_eq!(
                         map.get("path").and_then(serde_json::Value::as_str),
-                        Some("/etc/passwd")
+                        Some(expected_path)
                     );
                     map.insert(
                         "mode".to_string(),

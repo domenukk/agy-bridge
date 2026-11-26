@@ -38,7 +38,8 @@ pub const ENV_GEMINI_API_BASE_URL: &str = "GEMINI_API_BASE_URL";
 /// Secondary SDK environment variable name for the Gemini API base URL (`0.1.24`+).
 pub const ENV_GOOGLE_GEMINI_BASE_URL: &str = "GOOGLE_GEMINI_BASE_URL";
 /// Sentinel API key value used when routing through a proxy or gateway
-/// that handles authentication externally (e.g. via LOAS/gcert or mTLS).
+/// that handles authentication externally (e.g. via OAuth, workload identity,
+/// or mTLS).
 pub const PROXY_AUTH_SENTINEL: &str = "__agy_proxy_auth__";
 
 const DEFAULT_MCP_TIMEOUT_SECS: f64 = 30.0;

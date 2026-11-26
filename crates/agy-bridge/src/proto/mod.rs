@@ -62,7 +62,7 @@ mod tests {
             bind_address: "127.0.0.1".to_string(),
             client_info: Some(ClientInfo {
                 language: "rust".to_string(),
-                version: "0.16.8".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 language_version: "1.95".to_string(),
                 os: "linux".to_string(),
                 os_version: "6.12".to_string(),

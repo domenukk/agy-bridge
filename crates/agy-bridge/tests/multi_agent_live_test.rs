@@ -112,6 +112,30 @@ fn live_subagent_spawn() {
     });
 }
 
+fn python_cmd() -> String {
+    if let Some(py) = std::env::var_os("PYO3_PYTHON")
+        && std::path::Path::new(&py).is_file()
+    {
+        return py.to_string_lossy().into_owned();
+    }
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "../../.venv/Scripts/python.exe",
+        "../../.venv/bin/python3",
+        "../../.venv/bin/python",
+    ] {
+        let candidate = manifest_dir.join(rel);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    if cfg!(windows) {
+        "python".to_string()
+    } else {
+        "python3".to_string()
+    }
+}
+
 #[test]
 fn live_mcp_server_config_passes_to_python() {
     common::run_live_test("live_mcp_server_config_passes_to_python", || {
@@ -124,7 +148,7 @@ fn live_mcp_server_config_passes_to_python() {
             let bridge = common::create_bridge();
 
             // A mock stdio MCP server that handles the initialization handshake and capability aggregation.
-            let server = McpServer::stdio("python3")
+            let server = McpServer::stdio(python_cmd())
                 .args([
                     "-c",
                     r"

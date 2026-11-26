@@ -62,9 +62,14 @@ fn test_to_domain_step_states_and_sources() {
     assert_eq!(step.depth, 1);
     assert_eq!(step.tool_calls.len(), 1);
     assert_eq!(step.tool_calls[0].name, "view_file");
+    let expected_foo = if cfg!(windows) {
+        r"\tmp\foo.rs"
+    } else {
+        "/tmp/foo.rs"
+    };
     assert_eq!(
         step.tool_calls[0].canonical_path.as_deref(),
-        Some("/tmp/foo.rs")
+        Some(expected_foo)
     );
 
     let workflow_step = proto::localharness::StepUpdate {
@@ -91,7 +96,12 @@ fn test_to_domain_step_states_and_sources() {
     assert_eq!(step.tool_calls[0].name, "skill_lookup");
     assert_eq!(step.tool_calls[1].name, "run_workflow");
     let wf = step.workflow_progress.expect("workflow_progress");
-    assert_eq!(wf.script_path, "/tmp/wf.py");
+    let expected_wf = if cfg!(windows) {
+        r"\tmp\wf.py"
+    } else {
+        "/tmp/wf.py"
+    };
+    assert_eq!(wf.script_path, expected_wf);
     assert_eq!(wf.script, "print('hi')");
     assert_eq!(wf.description, "Run test workflow");
     assert_eq!(wf.output, "hi\n");

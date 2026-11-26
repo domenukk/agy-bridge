@@ -81,11 +81,34 @@ const ALLOWLISTED_HOST_ENV_KEYS: &[&str] = &[
     "HOMEPATH",
 ];
 
-fn is_allowlisted_host_env_key(key: &str) -> bool {
-    !crate::config::validation::is_dangerous_env_key(key)
-        && (ALLOWLISTED_HOST_ENV_KEYS.contains(&key)
+fn is_allowlisted_host_env_key_with_casing(key: &str, case_insensitive: bool) -> bool {
+    if crate::config::validation::is_dangerous_env_key(key) {
+        return false;
+    }
+    if case_insensitive {
+        ALLOWLISTED_HOST_ENV_KEYS
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(key))
+            || key
+                .as_bytes()
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"LC_"))
+            || key
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"SSL_"))
+    } else {
+        ALLOWLISTED_HOST_ENV_KEYS.contains(&key)
             || key.starts_with("LC_")
-            || key.starts_with("SSL_"))
+            || key.starts_with("SSL_")
+    }
+}
+
+fn is_allowlisted_host_env_key(key: &str) -> bool {
+    // Windows environment variable names are case-insensitive (e.g. `Path`,
+    // `Temp`, `ComSpec`, `SystemRoot`), so exact-case matching would drop
+    // required system keys like `Path`.
+    is_allowlisted_host_env_key_with_casing(key, cfg!(windows))
 }
 
 /// Verify that `binary_path` exists, is a non-empty regular file, and is executable.
@@ -608,5 +631,20 @@ mod tests {
         assert!(!is_allowlisted_host_env_key("AWS_SECRET_ACCESS_KEY"));
         assert!(!is_allowlisted_host_env_key("GITHUB_TOKEN"));
         assert!(!is_allowlisted_host_env_key("SSH_AUTH_SOCK"));
+        // Case-insensitive matching (used on Windows where `PATH` is commonly `Path`).
+        assert!(is_allowlisted_host_env_key_with_casing("Path", true));
+        assert!(is_allowlisted_host_env_key_with_casing("Temp", true));
+        assert!(is_allowlisted_host_env_key_with_casing("UserProfile", true));
+        assert!(is_allowlisted_host_env_key_with_casing(
+            "ssl_cert_file",
+            true
+        ));
+        assert!(is_allowlisted_host_env_key_with_casing("lc_all", true));
+        assert!(!is_allowlisted_host_env_key_with_casing("ld_preload", true));
+        assert!(!is_allowlisted_host_env_key_with_casing("pythonpath", true));
+        assert!(!is_allowlisted_host_env_key_with_casing(
+            "aws_secret_access_key",
+            true
+        ));
     }
 }

@@ -3,14 +3,11 @@
 //! Demonstrates:
 //! - An interactive stdin loop for multi-turn conversation
 //! - A custom `#[llm_tool]` that reverses lines of a file
-//! - `PolicyRule::WorkspaceOnly` to sandbox file access to `/tmp`
+//! - `PolicyRule::WorkspaceOnly` to sandbox file access to the OS temp directory
 //!
 //! Type `exit` or `quit` to end the session.
 
-use std::{
-    io::{BufRead, Write},
-    path::PathBuf,
-};
+use std::io::{BufRead, Write};
 
 use agy_bridge::prelude::*;
 
@@ -58,13 +55,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileUpsideDown);
 
+    let sandbox_dir = std::env::temp_dir();
     let config = AgentConfig::builder()
         .system_instructions(
             "You are a helpful assistant with file reading capabilities.".to_string(),
         )
         .capabilities(CapabilitiesConfig::default())
         .policies(vec![
-            PolicyRule::WorkspaceOnly(vec![PathBuf::from("/tmp")]),
+            PolicyRule::WorkspaceOnly(vec![sandbox_dir.clone()]),
             PolicyRule::AllowAll,
         ])
         .build();
@@ -72,7 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = bridge.agent(config).tools(registry).await?;
 
     println!("\n  Interactive CLI (type \"exit\" or \"quit\" to stop)");
-    println!("  File access is sandboxed to /tmp via WorkspaceOnly policy.\n");
+    println!(
+        "  File access is sandboxed to {} via WorkspaceOnly policy.\n",
+        sandbox_dir.display()
+    );
 
     loop {
         let Some(input) = read_user_input() else {

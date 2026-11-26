@@ -30,14 +30,43 @@ fn is_pid_alive(pid_str: &str) -> bool {
     }
     #[cfg(windows)]
     {
+        let pid: u32 = pid_str
+            .trim()
+            .parse()
+            .expect("harness PID file must contain a valid decimal u32");
         let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid_str}"), "/NH"])
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .output()
             .expect("run tasklist");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        stdout.split_whitespace().any(|tok| tok == pid_str)
+        if out.status.success() {
+            let pid_text = pid.to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return stdout.split_whitespace().any(|tok| tok == pid_text);
+        }
+        // `tasklist` fails with exit code 1 ("ERROR: Access denied") in some
+        // restricted Windows environments where WMI process queries are
+        // blocked; fall back to built-in PowerShell `Get-Process -Id`.
+        let ps_out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Write-Output 'ALIVE' }}"
+                ),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("run powershell Get-Process fallback");
+        assert!(
+            ps_out.status.success(),
+            "both tasklist and powershell Get-Process failed checking PID {pid}: {}",
+            String::from_utf8_lossy(&ps_out.stderr)
+        );
+        String::from_utf8_lossy(&ps_out.stdout).trim() == "ALIVE"
     }
 }
 

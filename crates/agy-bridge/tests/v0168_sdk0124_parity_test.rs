@@ -155,101 +155,42 @@ fn sdk_0124_office_mimes_and_base_url_precedence_work() {
     );
 }
 
+/// Canonical `google.protobuf.json_format.MessageToJson(...)` payloads emitted
+/// by `google-antigravity==0.1.24` (`localharness_pb2`, `content_pb2`,
+/// `steps_pb2`, and `agent_tools_pb2`).
+///
+/// Cross-checked against the live installed protobuf definitions in
+/// `crates/agy-bridge/tests/python/test_v0168_sdk0124_conformance.py` (and in
+/// `protojson_0124_live_pb2_roundtrip` when both `native` and `python` are
+/// enabled) so the pure-Rust `native` test suite runs cleanly on any OS with
+/// zero Python / `.venv` dependency.
 #[cfg(feature = "native")]
-fn emit_sdk_0124_wire_samples(
-    venv_py: &std::path::Path,
-) -> std::collections::HashMap<String, String> {
-    let emit_script = r#"
-import json
-from google.protobuf import json_format
-from google.antigravity.proto import localharness_pb2, content_pb2, steps_pb2, agent_tools_pb2
-
-tsu = localharness_pb2.TrajectoryStateUpdate(
-    trajectory_id="root-1",
-    state=localharness_pb2.TrajectoryStateUpdate.STATE_FULLY_IDLE,
-    error="Rate limited",
-    error_code="RESOURCE_EXHAUSTED",
-    stop_reason=localharness_pb2.TrajectoryStateUpdate.STOP_REASON_QUOTA_EXHAUSTED,
-)
-sa = localharness_pb2.StopArgs(
-    response_text="done",
-    trajectory_id="root-1",
-    continuation_count=2,
-    stop_reason=localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_MODEL_CALLS_EXCEEDED,
-)
-sl = localharness_pb2.ActionSkillLookup(
-    operation=localharness_pb2.ActionSkillLookup.OPERATION_LOOKUP_SKILLS,
-    requested_skill_names=["sec"],
-    resolved_skill_names=["sec"],
-)
-doc = content_pb2.DocumentContent(
-    mime_type=content_pb2.DocumentContent.TYPE_XLSX,
-    processing_config=content_pb2.DocumentContent.MediaProcessing(
-        static=content_pb2.DocumentContent.StaticMediaProcessing(
-            spreadsheet_options=content_pb2.DocumentContent.SpreadsheetProcessingOptions(
-                visible_cells="A1:B5",
-                sheet_index=1,
-            )
-        )
-    ),
-)
-vf = steps_pb2.ViewFileResultStep(start_line=10, end_line=20, total_lines=100)
-mt = steps_pb2.ManageTaskCallStep(
-    action=steps_pb2.ManageTaskCallStep.ACTION_STATUS,
-    call_id="task-9",
-)
-atc = agent_tools_pb2.AgentToolCallStep(
-    invoke_subagent=agent_tools_pb2.InvokeSubagentCall(type_name="research", role="Auditor")
-)
-fc = steps_pb2.FinishCallStep()
-fc.arguments.fields.add(
-    name="ok",
-    value=content_pb2.Value(number_value=1.0),
-)
-fc.arguments.fields.add(
-    name="ratio",
-    value=content_pb2.Value(number_value=1.5),
-)
-ve = localharness_pb2.VertexEndpoint(
-    project="proj-1",
-    location="us-central1",
-    base_url="https://us-central1-aiplatform.googleapis.com",
-    http_headers={"X-Vertex": "1"},
-)
-print(json.dumps({
-    "tsu": json_format.MessageToJson(tsu),
-    "sa": json_format.MessageToJson(sa),
-    "sl": json_format.MessageToJson(sl),
-    "doc": json_format.MessageToJson(doc),
-    "vf": json_format.MessageToJson(vf),
-    "mt": json_format.MessageToJson(mt),
-    "atc": json_format.MessageToJson(atc),
-    "fc": json_format.MessageToJson(fc),
-    "ve": json_format.MessageToJson(ve),
-}))
-"#;
-    let emit_out = std::process::Command::new(venv_py)
-        .args(["-c", emit_script])
-        .output()
-        .expect("spawn .venv/bin/python3");
-    assert!(
-        emit_out.status.success(),
-        "emit_script stderr: {}",
-        String::from_utf8_lossy(&emit_out.stderr)
-    );
-    serde_json::from_slice(&emit_out.stdout).expect("parse map")
-}
+const SDK_0124_TSU_JSON: &str = r#"{"trajectoryId":"root-1","state":"STATE_FULLY_IDLE","error":"Rate limited","stopReason":"STOP_REASON_QUOTA_EXHAUSTED","errorCode":"RESOURCE_EXHAUSTED"}"#;
+#[cfg(feature = "native")]
+const SDK_0124_STOP_ARGS_JSON: &str = r#"{"responseText":"done","trajectoryId":"root-1","continuationCount":2,"stopReason":"STOP_REASON_MAX_MODEL_CALLS_EXCEEDED"}"#;
+#[cfg(feature = "native")]
+const SDK_0124_SKILL_LOOKUP_JSON: &str = r#"{"operation":"OPERATION_LOOKUP_SKILLS","requestedSkillNames":["sec"],"resolvedSkillNames":["sec"]}"#;
+#[cfg(feature = "native")]
+const SDK_0124_DOC_CONTENT_JSON: &str = r#"{"legacy_mime_type_enum":"TYPE_XLSX","processingConfig":{"static":{"spreadsheetOptions":{"visibleCells":"A1:B5","sheetIndex":1}}}}"#;
+#[cfg(feature = "native")]
+const SDK_0124_VIEW_FILE_JSON: &str = r#"{"startLine":10,"endLine":20,"totalLines":100}"#;
+#[cfg(feature = "native")]
+const SDK_0124_MANAGE_TASK_JSON: &str = r#"{"action":"ACTION_STATUS","callId":"task-9"}"#;
+#[cfg(feature = "native")]
+const SDK_0124_AGENT_TOOL_CALL_JSON: &str =
+    r#"{"invokeSubagent":{"typeName":"research","role":"Auditor"}}"#;
+#[cfg(feature = "native")]
+const SDK_0124_FINISH_CALL_JSON: &str = r#"{"arguments":{"fields":[{"name":"ok","value":{"numberValue":1.0}},{"name":"ratio","value":{"numberValue":1.5}}]}}"#;
+#[cfg(feature = "native")]
+const SDK_0124_VERTEX_ENDPOINT_JSON: &str = r#"{"baseUrl":"https://us-central1-aiplatform.googleapis.com","httpHeaders":{"X-Vertex":"1"},"project":"proj-1","location":"us-central1"}"#;
 
 #[cfg(feature = "native")]
 #[test]
 fn protojson_0124_cross_language_pb2_wire_conformance() {
     use agy_bridge::proto;
 
-    let venv_py = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.venv/bin/python3");
-    let samples = emit_sdk_0124_wire_samples(&venv_py);
-
     let tsu: proto::localharness::TrajectoryStateUpdate =
-        serde_json::from_str(&samples["tsu"]).expect("parse tsu");
+        serde_json::from_str(SDK_0124_TSU_JSON).expect("parse tsu");
     assert_eq!(tsu.error_code, "RESOURCE_EXHAUSTED");
     assert_eq!(
         StopReason::from_proto_i32(tsu.stop_reason),
@@ -257,7 +198,7 @@ fn protojson_0124_cross_language_pb2_wire_conformance() {
     );
 
     let sa: proto::localharness::StopArgs =
-        serde_json::from_str(&samples["sa"]).expect("parse StopArgs");
+        serde_json::from_str(SDK_0124_STOP_ARGS_JSON).expect("parse StopArgs");
     assert_eq!(
         StopReason::from_proto_i32(sa.stop_reason),
         StopReason::MaxModelCallsExceeded
@@ -270,20 +211,20 @@ fn protojson_0124_cross_language_pb2_wire_conformance() {
     );
 
     let sl: proto::localharness::ActionSkillLookup =
-        serde_json::from_str(&samples["sl"]).expect("parse ActionSkillLookup");
+        serde_json::from_str(SDK_0124_SKILL_LOOKUP_JSON).expect("parse ActionSkillLookup");
     assert_eq!(sl.requested_skill_names, vec!["sec"]);
 
     let _doc: proto::genai::DocumentContent =
-        serde_json::from_str(&samples["doc"]).expect("parse DocumentContent");
+        serde_json::from_str(SDK_0124_DOC_CONTENT_JSON).expect("parse DocumentContent");
     let vf: proto::genai::ViewFileResultStep =
-        serde_json::from_str(&samples["vf"]).expect("parse ViewFileResultStep");
+        serde_json::from_str(SDK_0124_VIEW_FILE_JSON).expect("parse ViewFileResultStep");
     assert_eq!((vf.start_line, vf.end_line, vf.total_lines), (10, 20, 100));
     let _mt: proto::genai::ManageTaskCallStep =
-        serde_json::from_str(&samples["mt"]).expect("parse ManageTaskCallStep");
+        serde_json::from_str(SDK_0124_MANAGE_TASK_JSON).expect("parse ManageTaskCallStep");
     let _atc: proto::genai::AgentToolCallStep =
-        serde_json::from_str(&samples["atc"]).expect("parse AgentToolCallStep");
+        serde_json::from_str(SDK_0124_AGENT_TOOL_CALL_JSON).expect("parse AgentToolCallStep");
     let fc: proto::genai::FinishCallStep =
-        serde_json::from_str(&samples["fc"]).expect("parse FinishCallStep");
+        serde_json::from_str(SDK_0124_FINISH_CALL_JSON).expect("parse FinishCallStep");
     assert_eq!(
         fc.arguments
             .as_ref()
@@ -291,7 +232,7 @@ fn protojson_0124_cross_language_pb2_wire_conformance() {
         Some(serde_json::json!({"ok": 1, "ratio": 1.5}))
     );
     let ve: proto::localharness::VertexEndpoint =
-        serde_json::from_str(&samples["ve"]).expect("parse VertexEndpoint");
+        serde_json::from_str(SDK_0124_VERTEX_ENDPOINT_JSON).expect("parse VertexEndpoint");
     assert_eq!(
         (ve.project.as_str(), ve.location.as_str()),
         ("proj-1", "us-central1")
@@ -301,30 +242,100 @@ fn protojson_0124_cross_language_pb2_wire_conformance() {
         Some("1")
     );
 
-    let verify_script = r"
-import sys
-from google.protobuf import json_format
-from google.antigravity.proto import localharness_pb2
+    // Re-serialize back to ProtoJSON and confirm round-trip preserves fields and camelCase keys.
+    let trajectory_round: proto::localharness::TrajectoryStateUpdate =
+        serde_json::from_str(&serde_json::to_string(&tsu).expect("serialize tsu"))
+            .expect("round-trip tsu");
+    assert_eq!(trajectory_round.error_code, "RESOURCE_EXHAUSTED");
+    assert_eq!(trajectory_round.stop_reason, tsu.stop_reason);
+    let stop_args_round: proto::localharness::StopArgs =
+        serde_json::from_str(&serde_json::to_string(&sa).expect("serialize sa"))
+            .expect("round-trip sa");
+    assert_eq!(stop_args_round.stop_reason, sa.stop_reason);
+    assert_eq!(stop_args_round.continuation_count, 2);
+    let skill_lookup_round: proto::localharness::ActionSkillLookup =
+        serde_json::from_str(&serde_json::to_string(&sl).expect("serialize sl"))
+            .expect("round-trip sl");
+    assert_eq!(skill_lookup_round.requested_skill_names, vec!["sec"]);
+}
 
-json_format.Parse(sys.argv[1], localharness_pb2.TrajectoryStateUpdate())
-json_format.Parse(sys.argv[2], localharness_pb2.StopArgs())
-json_format.Parse(sys.argv[3], localharness_pb2.ActionSkillLookup())
-";
-    let verify_out = std::process::Command::new(&venv_py)
-        .args([
-            "-c",
-            verify_script,
-            &serde_json::to_string(&tsu).expect("tsu json"),
-            &serde_json::to_string(&sa).expect("sa json"),
-            &serde_json::to_string(&sl).expect("sl json"),
-        ])
-        .output()
-        .expect("spawn verify python3");
-    assert!(
-        verify_out.status.success(),
-        "verify_script stderr: {}",
-        String::from_utf8_lossy(&verify_out.stderr)
-    );
+#[cfg(all(feature = "native", feature = "python"))]
+fn locate_python_venv_site_packages(py: pyo3::Python<'_>) -> Option<std::path::PathBuf> {
+    use pyo3::types::PyAnyMethods;
+
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let venv = manifest_path.ancestors().find_map(|dir| {
+        let candidate = dir.join(".venv");
+        candidate.is_dir().then_some(candidate)
+    })?;
+    let sys = py.import("sys").expect("import sys");
+    let vi = sys.getattr("version_info").expect("version_info");
+    let major: u32 = vi.getattr("major").expect("major").extract().expect("u32");
+    let minor: u32 = vi.getattr("minor").expect("minor").extract().expect("u32");
+    let unix_sp = venv
+        .join("lib")
+        .join(format!("python{major}.{minor}"))
+        .join("site-packages");
+    if unix_sp.is_dir() {
+        return Some(unix_sp);
+    }
+    let win_sp = venv.join("Lib").join("site-packages");
+    win_sp.is_dir().then_some(win_sp)
+}
+
+#[cfg(all(feature = "native", feature = "python"))]
+#[test]
+fn protojson_0124_live_pb2_roundtrip() {
+    use agy_bridge::proto;
+    use pyo3::types::PyAnyMethods;
+
+    let tsu: proto::localharness::TrajectoryStateUpdate =
+        serde_json::from_str(SDK_0124_TSU_JSON).expect("parse tsu");
+    let sa: proto::localharness::StopArgs =
+        serde_json::from_str(SDK_0124_STOP_ARGS_JSON).expect("parse StopArgs");
+    let sl: proto::localharness::ActionSkillLookup =
+        serde_json::from_str(SDK_0124_SKILL_LOOKUP_JSON).expect("parse ActionSkillLookup");
+    let trajectory_json = serde_json::to_string(&tsu).expect("serialize tsu");
+    let stop_args_json = serde_json::to_string(&sa).expect("serialize sa");
+    let skill_lookup_json = serde_json::to_string(&sl).expect("serialize sl");
+
+    pyo3::Python::attach(|py| {
+        if let Some(sp) = locate_python_venv_site_packages(py) {
+            let site = py.import("site").expect("import site");
+            site.call_method1("addsitedir", (sp.to_string_lossy().as_ref(),))
+                .expect("addsitedir");
+        }
+        let json_format = py
+            .import("google.protobuf.json_format")
+            .expect("import google.protobuf.json_format");
+        let pb2 = py
+            .import("google.antigravity.proto.localharness_pb2")
+            .expect("import localharness_pb2");
+        let trajectory_msg = pb2
+            .getattr("TrajectoryStateUpdate")
+            .expect("TrajectoryStateUpdate")
+            .call0()
+            .expect("construct TrajectoryStateUpdate");
+        json_format
+            .call_method1("Parse", (trajectory_json.as_str(), trajectory_msg))
+            .expect("Parse TrajectoryStateUpdate");
+        let stop_args_msg = pb2
+            .getattr("StopArgs")
+            .expect("StopArgs")
+            .call0()
+            .expect("construct StopArgs");
+        json_format
+            .call_method1("Parse", (stop_args_json.as_str(), stop_args_msg))
+            .expect("Parse StopArgs");
+        let skill_lookup_msg = pb2
+            .getattr("ActionSkillLookup")
+            .expect("ActionSkillLookup")
+            .call0()
+            .expect("construct ActionSkillLookup");
+        json_format
+            .call_method1("Parse", (skill_lookup_json.as_str(), skill_lookup_msg))
+            .expect("Parse ActionSkillLookup");
+    });
 }
 
 #[cfg(feature = "native")]

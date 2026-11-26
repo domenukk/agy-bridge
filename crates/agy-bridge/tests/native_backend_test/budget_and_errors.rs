@@ -600,7 +600,12 @@ async fn test_native_backend_v0_1_22_features_e2e() {
     let mut saw_skill_lookup = false;
     while let Some(step) = step_rx.recv().await {
         if let Some(ref wf) = step.workflow_progress {
-            assert_eq!(wf.script_path, "/tmp/audit_wf.py");
+            let expected_wf_path = if cfg!(windows) {
+                r"\tmp\audit_wf.py"
+            } else {
+                "/tmp/audit_wf.py"
+            };
+            assert_eq!(wf.script_path, expected_wf_path);
             assert_eq!(wf.output, "Triage phase complete");
             saw_wf_progress = true;
         }

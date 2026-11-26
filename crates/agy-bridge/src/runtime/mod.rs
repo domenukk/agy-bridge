@@ -639,6 +639,36 @@ impl Drop for PythonRuntime {
     }
 }
 
+#[cfg(all(feature = "python", windows))]
+fn disable_windows_wmi_platform_query(py: Python<'_>) -> Result<(), String> {
+    // CPython 3.12's `_wmi` extension (`PC/_wmimodule.cpp`) can raise
+    // STATUS_ACCESS_VIOLATION (0xc0000005) when a WMI query returns
+    // `WBEM_E_ACCESS_DENIED` (0x80041003) or times out across concurrent
+    // worker threads. Blocking `_wmi` via `sys.modules` directs `platform.py`
+    // to use its built-in `sys.getwindowsversion()` fallback without spawning
+    // a WMI query thread, and pre-populating `platform.uname()` keeps all
+    // worker threads off the lazy uncached path.
+    let sys = py.import("sys").map_err(|e| e.to_string())?;
+    let modules = sys.getattr("modules").map_err(|e| e.to_string())?;
+    if !modules.contains("_wmi").map_err(|e| e.to_string())? {
+        modules
+            .set_item("_wmi", py.None())
+            .map_err(|e| e.to_string())?;
+    }
+    if modules.contains("platform").map_err(|e| e.to_string())? {
+        let globals = pyo3::types::PyDict::new(py);
+        py.run(
+            c"import platform\ndef _disabled_wmi_query(*_args, **_kwargs):\n    raise OSError('WMI query disabled for embedded thread safety')\nif hasattr(platform, '_wmi_query'):\n    platform._wmi_query = _disabled_wmi_query\n",
+            Some(&globals),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let platform = py.import("platform").map_err(|e| e.to_string())?;
+    drop(platform.call_method0("uname").map_err(|e| e.to_string())?);
+    Ok(())
+}
+
 /// Initialize `CPython` and import `threading`/`asyncio` on a dedicated bootstrap
 /// thread so that `threading.main_thread()` is never an `agy-bridge-python-runtime`
 /// worker thread (preventing `ProactorEventLoop` on Windows from calling
@@ -652,6 +682,8 @@ fn ensure_python_initialized() -> Result<(), Error> {
             .spawn(|| -> Result<(), String> {
                 Python::initialize();
                 Python::attach(|py| -> Result<(), String> {
+                    #[cfg(windows)]
+                    disable_windows_wmi_platform_query(py)?;
                     let threading = py.import("threading").map_err(|e| e.to_string())?;
                     let current = threading
                         .call_method0("current_thread")

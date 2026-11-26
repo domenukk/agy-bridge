@@ -366,3 +366,134 @@ def test_env_validation_vertex_standard_vs_express_and_base_url_precedence(
     local_cfg: dict[str, Any] = {}
     chosen = agent_init._setup_base_url_routing(local_cfg)
     assert chosen == "http://127.0.0.1:18001"
+
+
+def test_protojson_0124_wire_fixtures_match_pb2() -> None:
+    """Keep the golden SDK 0.1.24 ProtoJSON fixtures in `v0168_sdk0124_parity_test.rs` synced with `pb2`."""
+    from google.antigravity.proto import (
+        agent_tools_pb2,
+        content_pb2,
+        localharness_pb2,
+        steps_pb2,
+    )
+    from google.protobuf import json_format
+
+    cases = [
+        (
+            localharness_pb2.TrajectoryStateUpdate(
+                trajectory_id="root-1",
+                state=localharness_pb2.TrajectoryStateUpdate.STATE_FULLY_IDLE,
+                error="Rate limited",
+                error_code="RESOURCE_EXHAUSTED",
+                stop_reason=localharness_pb2.TrajectoryStateUpdate.STOP_REASON_QUOTA_EXHAUSTED,
+            ),
+            {
+                "trajectoryId": "root-1",
+                "state": "STATE_FULLY_IDLE",
+                "error": "Rate limited",
+                "stopReason": "STOP_REASON_QUOTA_EXHAUSTED",
+                "errorCode": "RESOURCE_EXHAUSTED",
+            },
+        ),
+        (
+            localharness_pb2.StopArgs(
+                response_text="done",
+                trajectory_id="root-1",
+                continuation_count=2,
+                stop_reason=localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_MODEL_CALLS_EXCEEDED,
+            ),
+            {
+                "responseText": "done",
+                "trajectoryId": "root-1",
+                "continuationCount": 2,
+                "stopReason": "STOP_REASON_MAX_MODEL_CALLS_EXCEEDED",
+            },
+        ),
+        (
+            localharness_pb2.ActionSkillLookup(
+                operation=localharness_pb2.ActionSkillLookup.OPERATION_LOOKUP_SKILLS,
+                requested_skill_names=["sec"],
+                resolved_skill_names=["sec"],
+            ),
+            {
+                "operation": "OPERATION_LOOKUP_SKILLS",
+                "requestedSkillNames": ["sec"],
+                "resolvedSkillNames": ["sec"],
+            },
+        ),
+        (
+            content_pb2.DocumentContent(
+                mime_type=content_pb2.DocumentContent.TYPE_XLSX,
+                processing_config=content_pb2.DocumentContent.MediaProcessing(
+                    static=content_pb2.DocumentContent.StaticMediaProcessing(
+                        spreadsheet_options=content_pb2.DocumentContent.SpreadsheetProcessingOptions(
+                            visible_cells="A1:B5",
+                            sheet_index=1,
+                        )
+                    )
+                ),
+            ),
+            {
+                "legacy_mime_type_enum": "TYPE_XLSX",
+                "processingConfig": {
+                    "static": {
+                        "spreadsheetOptions": {
+                            "visibleCells": "A1:B5",
+                            "sheetIndex": 1,
+                        }
+                    }
+                },
+            },
+        ),
+        (
+            steps_pb2.ViewFileResultStep(start_line=10, end_line=20, total_lines=100),
+            {"startLine": 10, "endLine": 20, "totalLines": 100},
+        ),
+        (
+            steps_pb2.ManageTaskCallStep(
+                action=steps_pb2.ManageTaskCallStep.ACTION_STATUS,
+                call_id="task-9",
+            ),
+            {"action": "ACTION_STATUS", "callId": "task-9"},
+        ),
+        (
+            agent_tools_pb2.AgentToolCallStep(
+                invoke_subagent=agent_tools_pb2.InvokeSubagentCall(
+                    type_name="research", role="Auditor"
+                )
+            ),
+            {"invokeSubagent": {"typeName": "research", "role": "Auditor"}},
+        ),
+        (
+            localharness_pb2.VertexEndpoint(
+                project="proj-1",
+                location="us-central1",
+                base_url="https://us-central1-aiplatform.googleapis.com",
+                http_headers={"X-Vertex": "1"},
+            ),
+            {
+                "baseUrl": "https://us-central1-aiplatform.googleapis.com",
+                "httpHeaders": {"X-Vertex": "1"},
+                "project": "proj-1",
+                "location": "us-central1",
+            },
+        ),
+    ]
+    for msg, expected in cases:
+        emitted = json.loads(json_format.MessageToJson(msg))
+        assert emitted == expected
+        reparsed = type(msg)()
+        json_format.Parse(json.dumps(expected), reparsed)
+        assert reparsed == msg
+
+    fc = steps_pb2.FinishCallStep()
+    fc.arguments.fields.add(name="ok", value=content_pb2.Value(number_value=1.0))
+    fc.arguments.fields.add(name="ratio", value=content_pb2.Value(number_value=1.5))
+    assert json.loads(json_format.MessageToJson(fc)) == {
+        "arguments": {
+            "fields": [
+                {"name": "ok", "value": {"numberValue": 1.0}},
+                {"name": "ratio", "value": {"numberValue": 1.5}},
+            ]
+        }
+    }

@@ -39,7 +39,16 @@ EXCLUDED_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    "test-logs",
+    ".agents",
+    "node_modules",
 }
+
+MIRRORED_FILES: tuple[tuple[str, str], ...] = (
+    ("README.md", "crates/agy-bridge/README.md"),
+    ("LICENSE-APACHE", "crates/agy-bridge/LICENSE-APACHE"),
+    ("LICENSE-MIT", "crates/agy-bridge/LICENSE-MIT"),
+)
 
 SELF_AND_HYGIENE_TEST_PATH = re.compile(
     r"(^|/)scripts/lint_hygiene\.py$|(^|/)test_lint_hygiene\.py$"
@@ -408,10 +417,76 @@ def run_long_file_check(
     return False
 
 
+def run_symlink_and_mirror_check(root_dir: Path | None = None) -> bool:
+    """Reject tracked-tree symlinks and verify crate doc/license mirrors stay synced."""
+    base = root_dir if root_dir is not None else Path()
+    failed = False
+
+    print("=== Symlinks (Windows clone compatibility) ===")
+    symlinks: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dir_path = Path(dirpath)
+        kept_dirs: list[str] = []
+        for name in sorted(dirnames):
+            if name in EXCLUDED_DIRS:
+                continue
+            candidate = dir_path / name
+            if candidate.is_symlink():
+                symlinks.append(candidate.relative_to(base).as_posix())
+            else:
+                kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+        for name in sorted(filenames):
+            candidate = dir_path / name
+            if candidate.is_symlink():
+                symlinks.append(candidate.relative_to(base).as_posix())
+    if symlinks:
+        for rel in sorted(symlinks):
+            print(f"  {rel}: symbolic link breaks Windows clones without core.symlinks")
+        print(
+            "^^^ Replace symlinks with plain files and keep copies synced via `just sync-crate-docs`."
+        )
+        failed = True
+    else:
+        print("  ✓ clean")
+
+    print("=== Mirrored crate README / LICENSE copies ===")
+    drift: list[str] = []
+    for src_rel, dst_rel in MIRRORED_FILES:
+        src = base / src_rel
+        dst = base / dst_rel
+        if not src.is_file() or src.is_symlink():
+            continue
+        if dst.is_symlink():
+            drift.append(
+                f"  {dst_rel} is a symlink (must be a regular copy of {src_rel})"
+            )
+            continue
+        if not dst.is_file():
+            drift.append(f"  {dst_rel} is missing (must be a copy of {src_rel})")
+            continue
+        src_bytes = src.read_bytes().replace(b"\r\n", b"\n")
+        dst_bytes = dst.read_bytes().replace(b"\r\n", b"\n")
+        if src_bytes != dst_bytes:
+            drift.append(f"  {dst_rel} differs from {src_rel}")
+    if drift:
+        for msg in drift:
+            print(msg)
+        print(
+            "^^^ Run `just sync-crate-docs` (or copy the root files into crates/agy-bridge/)."
+        )
+        failed = True
+    else:
+        print("  ✓ clean")
+
+    return failed
+
+
 def check_workspace(root_dir: Path) -> bool:
     """Run all hygiene checks on `root_dir`. Returns True if any violation is found."""
     failed = run_pattern_checks(root_dir)
     failed = run_long_file_check(root_dir) or failed
+    failed = run_symlink_and_mirror_check(root_dir) or failed
     return failed
 
 

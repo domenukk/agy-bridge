@@ -100,5 +100,28 @@ def test_gate_r_rejects_oversized_files(
     assert "crates/demo/src/big.rs" in captured
 
 
+def test_gate_r_rejects_drifted_and_missing_mirror_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "README.md").write_text("# Root\n", encoding="utf-8")
+    crate_dir = tmp_path / "crates" / "agy-bridge"
+    crate_dir.mkdir(parents=True, exist_ok=True)
+
+    # Missing mirror copy must fail.
+    assert LINT.run_symlink_and_mirror_check(tmp_path) is True
+    out = capsys.readouterr().out
+    assert "crates/agy-bridge/README.md is missing" in out
+
+    # Drifted content must fail.
+    (crate_dir / "README.md").write_text("# Stale\n", encoding="utf-8")
+    assert LINT.run_symlink_and_mirror_check(tmp_path) is True
+    out = capsys.readouterr().out
+    assert "crates/agy-bridge/README.md differs from README.md" in out
+
+    # Matching content (even with CRLF vs LF) passes cleanly.
+    (crate_dir / "README.md").write_bytes(b"# Root\r\n")
+    assert LINT.run_symlink_and_mirror_check(tmp_path) is False
+
+
 def test_real_workspace_passes_zero_bypass_hygiene_gate() -> None:
     assert LINT.check_workspace(REPO_ROOT) is False

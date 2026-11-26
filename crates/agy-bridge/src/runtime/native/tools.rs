@@ -752,86 +752,150 @@ mod tests {
         );
     }
 
+    fn native_posix_path(posix: &str) -> String {
+        if cfg!(windows) {
+            posix.replace('/', "\\")
+        } else {
+            posix.to_owned()
+        }
+    }
+
     #[test]
     fn test_normalize_wire_path_and_in_place_arg_normalization() {
         assert_eq!(
             normalize_wire_path("file:///dev/shm/workspace/foo.py"),
-            "/dev/shm/workspace/foo.py"
+            native_posix_path("/dev/shm/workspace/foo.py")
         );
         assert_eq!(
             normalize_wire_path("file://localhost/tmp/with%20space.rs"),
-            "/tmp/with space.rs"
+            native_posix_path("/tmp/with space.rs")
         );
         assert_eq!(
             normalize_wire_path("FILE:///var/tmp/workspace/notes.md"),
-            "/var/tmp/workspace/notes.md"
+            native_posix_path("/var/tmp/workspace/notes.md")
         );
-        assert_eq!(normalize_wire_path("/tmp/clean-path"), "/tmp/clean-path");
+        assert_eq!(
+            normalize_wire_path("/tmp/clean-path"),
+            native_posix_path("/tmp/clean-path")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize_wire_path("file:///C:/Users/example/workspace/foo.py"),
+                r"C:\Users\example\workspace\foo.py"
+            );
+            assert_eq!(
+                normalize_wire_path("file:///C:/ws/%2e%2e/secret.txt"),
+                r"C:\secret.txt"
+            );
+        }
+    }
 
+    #[test]
+    fn test_parse_and_normalize_tool_args_priority_and_null_preservation() {
         // Exact 0.1.23 WIRE_PATH_ARGUMENT_KEYS priority order:
         // ("path", "file_path", "directory_path", "TargetFile", "output_path", "script_path", "ScriptPath")
         let p1 = parse_and_normalize_tool_args(
             r#"{"file_path":"file:///b","path":"file:///tmp/a","extra":42}"#,
             "test",
         );
-        assert_eq!(p1.canonical_path.as_deref(), Some("/tmp/a"));
+        assert_eq!(
+            p1.canonical_path.as_deref(),
+            Some(native_posix_path("/tmp/a").as_str())
+        );
         assert_eq!(
             p1.args,
-            serde_json::json!({"path": "/tmp/a", "file_path": "/b", "extra": 42})
+            serde_json::json!({
+                "path": native_posix_path("/tmp/a"),
+                "file_path": native_posix_path("/b"),
+                "extra": 42
+            })
         );
 
         let p2 = parse_and_normalize_tool_args(
             r#"{"TargetFile":"file:///d","directory_path":"file:///c"}"#,
             "test",
         );
-        assert_eq!(p2.canonical_path.as_deref(), Some("/c"));
+        assert_eq!(
+            p2.canonical_path.as_deref(),
+            Some(native_posix_path("/c").as_str())
+        );
         assert_eq!(
             p2.args,
-            serde_json::json!({"directory_path": "/c", "TargetFile": "/d"})
+            serde_json::json!({
+                "directory_path": native_posix_path("/c"),
+                "TargetFile": native_posix_path("/d")
+            })
         );
 
         let p3 = parse_and_normalize_tool_args(
             r#"{"output_path":"file:///e","TargetFile":"file:///tmp/d"}"#,
             "test",
         );
-        assert_eq!(p3.canonical_path.as_deref(), Some("/tmp/d"));
+        assert_eq!(
+            p3.canonical_path.as_deref(),
+            Some(native_posix_path("/tmp/d").as_str())
+        );
         assert_eq!(
             p3.args,
-            serde_json::json!({"TargetFile": "/tmp/d", "output_path": "/e"})
+            serde_json::json!({
+                "TargetFile": native_posix_path("/tmp/d"),
+                "output_path": native_posix_path("/e")
+            })
         );
 
         let p4 = parse_and_normalize_tool_args(
             r#"{"ScriptPath":"file:///g","script_path":"file:///f","output_path":"file:///e"}"#,
             "test",
         );
-        assert_eq!(p4.canonical_path.as_deref(), Some("/e"));
+        assert_eq!(
+            p4.canonical_path.as_deref(),
+            Some(native_posix_path("/e").as_str())
+        );
         assert_eq!(
             p4.args,
-            serde_json::json!({"output_path": "/e", "script_path": "/f", "ScriptPath": "/g"})
+            serde_json::json!({
+                "output_path": native_posix_path("/e"),
+                "script_path": native_posix_path("/f"),
+                "ScriptPath": native_posix_path("/g")
+            })
         );
 
         let p5 = parse_and_normalize_tool_args(r#"{"ScriptPath":"file:///g"}"#, "test");
-        assert_eq!(p5.canonical_path.as_deref(), Some("/g"));
-        assert_eq!(p5.args, serde_json::json!({"ScriptPath": "/g"}));
+        assert_eq!(
+            p5.canonical_path.as_deref(),
+            Some(native_posix_path("/g").as_str())
+        );
+        assert_eq!(
+            p5.args,
+            serde_json::json!({"ScriptPath": native_posix_path("/g")})
+        );
+    }
 
+    #[test]
+    fn test_parse_and_normalize_tool_args_null_and_empty_inputs() {
         // Explicit null path keys must be preserved verbatim (never stripped).
         let p_null = parse_and_normalize_tool_args(
             r#"{"file_path":null,"ScriptPath":"file:///g","count":3}"#,
             "test",
         );
-        assert_eq!(p_null.canonical_path.as_deref(), Some("/g"));
+        assert_eq!(
+            p_null.canonical_path.as_deref(),
+            Some(native_posix_path("/g").as_str())
+        );
         assert_eq!(
             p_null.args,
-            serde_json::json!({"file_path": null, "ScriptPath": "/g", "count": 3})
+            serde_json::json!({
+                "file_path": null,
+                "ScriptPath": native_posix_path("/g"),
+                "count": 3
+            })
         );
         let reparsed: serde_json::Value = serde_json::from_str(
             &serde_json::to_string(&p_null.args).expect("serialize normalized args"),
         )
         .expect("valid normalized_json");
-        assert_eq!(
-            reparsed,
-            serde_json::json!({"file_path": null, "ScriptPath": "/g", "count": 3})
-        );
+        assert_eq!(reparsed, p_null.args);
 
         assert_eq!(
             parse_and_normalize_tool_args(r#"{"path":""}"#, "test").canonical_path,
@@ -894,33 +958,51 @@ mod tests {
         assert_eq!(calls[0].name, "read_target");
         assert_eq!(
             calls[0].args,
-            serde_json::json!({"arg1": "val1", "file_path": "/tmp/target.rs"})
+            serde_json::json!({"arg1": "val1", "file_path": native_posix_path("/tmp/target.rs")})
         );
-        assert_eq!(calls[0].canonical_path.as_deref(), Some("/tmp/target.rs"));
+        assert_eq!(
+            calls[0].canonical_path.as_deref(),
+            Some(native_posix_path("/tmp/target.rs").as_str())
+        );
 
         assert_eq!(calls[1].name, tool_names::VIEW_FILE);
-        assert_eq!(calls[1].args["file_path"], "/dev/shm/workspace/foo.py");
+        assert_eq!(
+            calls[1].args["file_path"],
+            native_posix_path("/dev/shm/workspace/foo.py")
+        );
         assert_eq!(
             calls[1].canonical_path.as_deref(),
-            Some("/dev/shm/workspace/foo.py")
+            Some(native_posix_path("/dev/shm/workspace/foo.py").as_str())
         );
 
         assert_eq!(calls[2].name, tool_names::CREATE_FILE);
-        assert_eq!(calls[2].args["file_path"], "/var/tmp/workspace/notes.md");
+        assert_eq!(
+            calls[2].args["file_path"],
+            native_posix_path("/var/tmp/workspace/notes.md")
+        );
         assert_eq!(
             calls[2].canonical_path.as_deref(),
-            Some("/var/tmp/workspace/notes.md")
+            Some(native_posix_path("/var/tmp/workspace/notes.md").as_str())
         );
 
         assert_eq!(calls[3].name, tool_names::RUN_COMMAND);
-        assert_eq!(calls[3].args["working_dir"], "/tmp/ws");
-        assert_eq!(calls[3].canonical_path.as_deref(), Some("/tmp/ws"));
+        assert_eq!(calls[3].args["working_dir"], native_posix_path("/tmp/ws"));
+        assert_eq!(
+            calls[3].canonical_path.as_deref(),
+            Some(native_posix_path("/tmp/ws").as_str())
+        );
 
         assert_eq!(calls[4].name, "ghidra/analyze");
         assert_eq!(
             calls[4].args,
-            serde_json::json!({"TargetFile": "/tmp/bin.elf", "ScriptPath": "/tmp/script.py"})
+            serde_json::json!({
+                "TargetFile": native_posix_path("/tmp/bin.elf"),
+                "ScriptPath": native_posix_path("/tmp/script.py")
+            })
         );
-        assert_eq!(calls[4].canonical_path.as_deref(), Some("/tmp/bin.elf"));
+        assert_eq!(
+            calls[4].canonical_path.as_deref(),
+            Some(native_posix_path("/tmp/bin.elf").as_str())
+        );
     }
 }
